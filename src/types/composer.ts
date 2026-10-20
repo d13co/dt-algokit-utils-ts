@@ -579,6 +579,12 @@ export class TransactionComposer {
   /** Whether the validity window was explicitly set on construction */
   private defaultValidityWindowIsExplicit = false
 
+  /**
+   * The validity window to build with, while building for a simulate at past rounds: transactions that don't set
+   * `firstValidRound` / `lastValidRound` get it instead of one based on the suggested params.
+   */
+  private validityOverride?: { firstValid: bigint; lastValid: bigint }
+
   private appManager: AppManager
 
   private errorTransformers: ErrorTransformer[]
@@ -1476,21 +1482,27 @@ export class TransactionComposer {
     if (params.note)
       txnParams.note = (typeof params.note === 'string' ? encoder.encode(params.note) : params.note) satisfies algosdk.Transaction['note']
 
-    if (params.firstValidRound) {
-      txnParams.suggestedParams.firstValid = params.firstValidRound
-    }
-
-    if (params.lastValidRound) {
-      txnParams.suggestedParams.lastValid = params.lastValidRound
+    if (this.validityOverride && !params.firstValidRound && !params.lastValidRound) {
+      // Building for a simulate at past rounds: the transactions must be valid at those rounds
+      txnParams.suggestedParams.firstValid = this.validityOverride.firstValid
+      txnParams.suggestedParams.lastValid = this.validityOverride.lastValid
     } else {
-      // If the validity window isn't set in this transaction or by default and we are pointing at
-      //  LocalNet set a bigger window to avoid dead transactions
-      const window = params.validityWindow
-        ? BigInt(params.validityWindow)
-        : !this.defaultValidityWindowIsExplicit && genesisIdIsLocalNet(txnParams.suggestedParams.genesisID ?? 'unknown')
-          ? 1000n
-          : this.defaultValidityWindow
-      txnParams.suggestedParams.lastValid = BigInt(txnParams.suggestedParams.firstValid) + window
+      if (params.firstValidRound) {
+        txnParams.suggestedParams.firstValid = params.firstValidRound
+      }
+
+      if (params.lastValidRound) {
+        txnParams.suggestedParams.lastValid = params.lastValidRound
+      } else {
+        // If the validity window isn't set in this transaction or by default and we are pointing at
+        //  LocalNet set a bigger window to avoid dead transactions
+        const window = params.validityWindow
+          ? BigInt(params.validityWindow)
+          : !this.defaultValidityWindowIsExplicit && genesisIdIsLocalNet(txnParams.suggestedParams.genesisID ?? 'unknown')
+            ? 1000n
+            : this.defaultValidityWindow
+        txnParams.suggestedParams.lastValid = BigInt(txnParams.suggestedParams.firstValid) + window
+      }
     }
 
     if (params.staticFee !== undefined && params.extraFee !== undefined) {
@@ -1955,6 +1967,47 @@ export class TransactionComposer {
   }
 
   /**
+   * Compose all of the transactions without signers, like `buildTransactions`, but valid from `firstValidRound` to
+   * `lastValidRound`: transactions that set their own `firstValidRound` or `lastValidRound` keep them, the others get
+   * this window. Use this to build transactions for a simulate at past rounds, which needs them valid at those rounds
+   * (a simulate at round R runs the transactions in round R + 1).
+   *
+   * Transactions added already built (`addTransaction`, `addAtc`) keep their own validity.
+   *
+   * @param validity The validity window to build with
+   * @returns The built transactions, method calls and signers
+   * @example
+   * ```typescript
+   * const { transactions } = await composer.buildTransactionsWithValidity({ firstValidRound: 1001n, lastValidRound: 1011n })
+   * ```
+   */
+  async buildTransactionsWithValidity(validity: { firstValidRound: bigint; lastValidRound: bigint }): Promise<BuiltTransactions> {
+    if (validity.lastValidRound < validity.firstValidRound) {
+      throw new Error(`lastValidRound ${validity.lastValidRound} is before firstValidRound ${validity.firstValidRound}`)
+    }
+    const previous = this.validityOverride
+    this.validityOverride = { firstValid: validity.firstValidRound, lastValid: validity.lastValidRound }
+    try {
+      return await this.buildTransactions()
+    } finally {
+      this.validityOverride = previous
+    }
+  }
+
+  /** Runs `build` with transactions valid at the given simulate round, unless it's 0 / undefined (the latest round). */
+  private async withValidityForSimulateRound<T>(round: number | bigint | undefined, build: () => Promise<T>): Promise<T> {
+    if (!round) return await build()
+    const firstValid = BigInt(round) + 1n
+    const previous = this.validityOverride
+    this.validityOverride = { firstValid, lastValid: firstValid + this.defaultValidityWindow }
+    try {
+      return await build()
+    } finally {
+      this.validityOverride = previous
+    }
+  }
+
+  /**
    * Get the number of transactions currently added to this composer.
    * @returns The number of transactions currently added to this composer
    */
@@ -2120,14 +2173,14 @@ export class TransactionComposer {
       rawOptions.allowEmptySignatures = true
       rawOptions.fixSigners = true
       // Build transactions uses empty signers
-      const transactions = await this.buildTransactions()
+      const transactions = await this.withValidityForSimulateRound(rawOptions.round, () => this.buildTransactions())
       for (const txn of transactions.transactions) {
         atc.addTransaction({ txn, signer: TransactionComposer.NULL_SIGNER })
       }
       atc['methodCalls'] = transactions.methodCalls
     } else {
       // Build creates real signatures
-      await this.build()
+      await this.withValidityForSimulateRound(rawOptions.round, () => this.build())
     }
 
     const { methodResults, simulateResponse } = await atc.simulate(

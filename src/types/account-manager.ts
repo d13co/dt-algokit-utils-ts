@@ -7,6 +7,7 @@ import { ClientManager } from './client-manager'
 import { CommonTransactionParams, TransactionComposer } from './composer'
 import { TestNetDispenserApiClient } from './dispenser-client'
 import { KmdAccountManager } from './kmd-account-manager'
+import { AtRoundOptions, timeTravelAlgodForRead } from './time-travel-support'
 import { SendParams, SendSingleTransactionResult } from './transaction'
 import LogicSigAccount = algosdk.LogicSigAccount
 import Account = algosdk.Account
@@ -236,38 +237,21 @@ export class AccountManager {
    * ```
    *
    * @param sender The account / address to look up
+   * @param options Optional `round` to read the account as of the end of a past round (needs dtalgod time travel)
    * @returns The account information
    */
-  public async getInformation(sender: string | Address): Promise<AccountInformation> {
-    const {
-      round,
-      lastHeartbeat = undefined,
-      lastProposed = undefined,
-      address,
-      ...account
-    } = await this._clientManager.algod.accountInformation(sender).do()
-
-    return {
-      ...account,
-      // None of the Number types can practically overflow 2^53
-      address: Address.fromString(address),
-      balance: AlgoAmount.MicroAlgo(Number(account.amount)),
-      amountWithoutPendingRewards: AlgoAmount.MicroAlgo(Number(account.amountWithoutPendingRewards)),
-      minBalance: AlgoAmount.MicroAlgo(Number(account.minBalance)),
-      pendingRewards: AlgoAmount.MicroAlgo(Number(account.pendingRewards)),
-      rewards: AlgoAmount.MicroAlgo(Number(account.rewards)),
-      validAsOfRound: BigInt(round),
-      totalAppsOptedIn: Number(account.totalAppsOptedIn),
-      totalAssetsOptedIn: Number(account.totalAssetsOptedIn),
-      totalCreatedApps: Number(account.totalCreatedApps),
-      totalCreatedAssets: Number(account.totalCreatedAssets),
-      appsTotalExtraPages: account.appsTotalExtraPages !== undefined ? Number(account.appsTotalExtraPages) : undefined,
-      rewardBase: account.rewardBase !== undefined ? Number(account.rewardBase) : undefined,
-      totalBoxBytes: account.totalBoxBytes !== undefined ? Number(account.totalBoxBytes) : undefined,
-      totalBoxes: account.totalBoxes !== undefined ? Number(account.totalBoxes) : undefined,
-      lastHeartbeatRound: lastHeartbeat !== undefined ? BigInt(lastHeartbeat) : undefined,
-      lastProposedRound: lastProposed !== undefined ? BigInt(lastProposed) : undefined,
-    }
+  public async getInformation(sender: string | Address, options?: AtRoundOptions): Promise<AccountInformation> {
+    const round = options?.round
+    const account =
+      round === undefined
+        ? await this._clientManager.algod.accountInformation(sender).do()
+        : await (
+            await timeTravelAlgodForRead(this._clientManager.algod, 'Reading account information', round, false)
+          )
+            .accountInformation(sender)
+            .round(round)
+            .do()
+    return accountInformationFromAlgod(account)
   }
 
   /**
@@ -698,5 +682,36 @@ export class AccountManager {
       amountFunded: AlgoAmount.MicroAlgo(result.amount),
       transactionId: result.txId,
     }
+  }
+}
+
+/**
+ * Converts an algod account response into an `AccountInformation`.
+ * @param accountResponse The account from algod
+ * @returns The account information
+ */
+export function accountInformationFromAlgod(accountResponse: algosdk.modelsv2.Account): AccountInformation {
+  const { round, lastHeartbeat = undefined, lastProposed = undefined, address, ...account } = accountResponse
+
+  return {
+    ...account,
+    // None of the Number types can practically overflow 2^53
+    address: Address.fromString(address),
+    balance: AlgoAmount.MicroAlgo(Number(account.amount)),
+    amountWithoutPendingRewards: AlgoAmount.MicroAlgo(Number(account.amountWithoutPendingRewards)),
+    minBalance: AlgoAmount.MicroAlgo(Number(account.minBalance)),
+    pendingRewards: AlgoAmount.MicroAlgo(Number(account.pendingRewards)),
+    rewards: AlgoAmount.MicroAlgo(Number(account.rewards)),
+    validAsOfRound: BigInt(round),
+    totalAppsOptedIn: Number(account.totalAppsOptedIn),
+    totalAssetsOptedIn: Number(account.totalAssetsOptedIn),
+    totalCreatedApps: Number(account.totalCreatedApps),
+    totalCreatedAssets: Number(account.totalCreatedAssets),
+    appsTotalExtraPages: account.appsTotalExtraPages !== undefined ? Number(account.appsTotalExtraPages) : undefined,
+    rewardBase: account.rewardBase !== undefined ? Number(account.rewardBase) : undefined,
+    totalBoxBytes: account.totalBoxBytes !== undefined ? Number(account.totalBoxBytes) : undefined,
+    totalBoxes: account.totalBoxes !== undefined ? Number(account.totalBoxes) : undefined,
+    lastHeartbeatRound: lastHeartbeat !== undefined ? BigInt(lastHeartbeat) : undefined,
+    lastProposedRound: lastProposed !== undefined ? BigInt(lastProposed) : undefined,
   }
 }

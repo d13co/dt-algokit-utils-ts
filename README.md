@@ -8,6 +8,91 @@ Note: If you prefer Python there's an equivalent [Python utility library](https:
 
 [Install](#install) | [Documentation](./docs/README.md)
 
+## dtalgod fork
+
+This fork adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel (state at any past round, and the rounds at which objects changed) and extended simulate (several transaction groups and several rounds per request). It is additive: existing APIs, types and generated typed clients work unchanged, and it runs on stock algosdk, where the new features throw a `TimeTravelNotAvailableError`.
+
+The new features need the time-travel fork of algosdk (`algosdk@3.8.0-timetravel.1`, with `TimeTravelAlgodClient`). algokit-utils and your code must load the same copy of algosdk, so replace `algosdk` everywhere with a package-manager override, e.g. with pnpm:
+
+```yaml
+overrides:
+  algosdk: file:./vendor/algosdk-3.8.0-timetravel.1.tgz
+```
+
+`pnpm why algosdk` should then list only the fork.
+
+### Reads at a past round
+
+Pass `{ round }` to the usual reads to get the state as of the end of that round:
+
+```typescript
+const account = await algorand.account.getInformation(address, { round: 45_000_000n })
+const holding = await algorand.asset.getAccountInformation(address, assetId, { round: 45_000_000n })
+const globalState = await algorand.app.getGlobalState(appId, { round: 45_000_000n })
+const box = await algorand.app.getBoxValue(appId, 'config', { round: 45_000_000n })
+```
+
+The same option is on `getById`, `getLocalState`, `getBoxNames`, `getBoxValues`, `getBoxValue(s)FromABIType` and the `AppClient` state methods. A node that can't serve the round throws (`isTimeTravelUnsupportedError(e)`) rather than returning the latest state.
+
+An `AppClient` pinned to a round reads state and simulates readonly ABI calls at that round, and can't send transactions. Generated typed clients take an `AppClient`, so they can be pinned too:
+
+```typescript
+const past = appClient.atRound(45_000_000n)
+await past.state.global.getAll()
+await past.send.call({ method: 'get_price' })
+
+const typedPast = new MyAppClient(myAppClient.appClient.atRound(45_000_000n))
+await typedPast.state.global.counter()
+```
+
+`composer.simulate({ round })` now builds transactions that don't set their own validity so they are valid at that round.
+
+### Versions: when objects changed
+
+`algorand.timeTravel` lists the rounds at which a box, all of an app's boxes, an app, an asset or an account changed, optionally with the values, a page at a time (`get…Versions`) or as an async iterator (`iterate…Versions`):
+
+```typescript
+const { versions, nextToken } = await algorand.timeTravel.getBoxVersions(appId, 'counter', {
+  order: 'desc',
+  limit: 10,
+  includeValues: true,
+})
+
+for await (const { round, boxes } of algorand.timeTravel.iterateBoxesVersions(appId, { minRound: 45_000_000n })) {
+  // the boxes that changed in each round
+}
+
+const { versions: appVersions } = await algorand.timeTravel.getAppVersions(appId, { includeValues: true })
+appVersions.map((v) => v.app?.globalState)
+```
+
+Also `getAssetVersions`, `getAccountVersions` (with `exclude`), `getAccountAssetVersions` and `getAccountAppVersions`. `algorand.timeTravel.supported()` tells whether the node has time travel.
+
+### Extended simulate
+
+`algorand.simulate` simulates without signatures, for reads and dry runs:
+
+```typescript
+// Several groups in one request: one after the other in one block, or each on its own with `parallel`
+const [funded, spent] = await algorand.simulate.groups([fundComposer, spendComposer], { allowUnnamedResources: true })
+
+// The same groups at many rounds: packed into as few requests as the node's limits allow, with the transactions built valid at each window of rounds
+const composer = algorand.newGroup().addAppCallMethodCall(await appClient.params.call({ method: 'get_price' }))
+for (const {
+  round,
+  groups: [g],
+} of await algorand.simulate.rounds(composer, rounds, { allowUnnamedResources: true })) {
+  if (g.ok) console.log(round, g.result.returns?.[0]?.returnValue)
+  else console.log(round, g.error.kind, g.error.message)
+}
+```
+
+Each outcome is `{ ok: true, result }`, with the same result shape as `composer.simulate()`, or `{ ok: false, error }`.
+
+### Tests
+
+`src/types/time-travel.spec.ts` runs offline against a stub algod. `src/types/time-travel.live.spec.ts` runs against a MainNet dtalgod: `DT_ALGOD_SERVER=http://host:port npx vitest run src/types/time-travel.live.spec.ts`.
+
 ## Install
 
 Before installing, you'll need to decide on the version you want to target. Version 7 and 8 have the same feature set, however v7 leverages algosdk@>=2.9.0<3.0, whereas v8 leverages algosdk@>=3.0.0. Your project and it's dependencies will help you decide which version to target.

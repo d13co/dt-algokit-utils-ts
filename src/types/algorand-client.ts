@@ -9,6 +9,8 @@ import { AssetManager } from './asset-manager'
 import { AlgoSdkClients, ClientManager } from './client-manager'
 import { ErrorTransformer, TransactionComposer } from './composer'
 import { AlgoConfig } from './network-client'
+import { SimulateManager } from './simulate-manager'
+import { TimeTravelManager } from './time-travel-manager'
 import Account = algosdk.Account
 import LogicSigAccount = algosdk.LogicSigAccount
 
@@ -23,6 +25,8 @@ export class AlgorandClient {
   private _assetManager: AssetManager
   private _transactionSender: AlgorandClientTransactionSender
   private _transactionCreator: AlgorandClientTransactionCreator
+  private _timeTravelManager: TimeTravelManager
+  private _simulateManager: SimulateManager
 
   private _cachedSuggestedParams?: algosdk.SuggestedParams
   private _cachedSuggestedParamsExpiry?: Date
@@ -45,6 +49,8 @@ export class AlgorandClient {
     this._transactionSender = new AlgorandClientTransactionSender(() => this.newGroup(), this._assetManager, this._appManager)
     this._transactionCreator = new AlgorandClientTransactionCreator(() => this.newGroup())
     this._appDeployer = new AppDeployer(this._appManager, this._transactionSender, this._clientManager.indexerIfPresent)
+    this._timeTravelManager = new TimeTravelManager(this._clientManager)
+    this._simulateManager = new SimulateManager(this._clientManager)
   }
 
   /**
@@ -211,6 +217,30 @@ export class AlgorandClient {
    */
   public get appDeployer() {
     return this._appDeployer
+  }
+
+  /**
+   * Time travel on dtalgod (a time-travel algod): the rounds at which boxes, apps, assets and accounts changed.
+   *
+   * To read state at a past round, pass `{ round }` to the usual reads, or use `appClient.atRound(round)`.
+   * Needs the time-travel fork of algosdk.
+   * @returns The `TimeTravelManager` instance.
+   * @example
+   * const { versions } = await algorand.timeTravel.getBoxVersions(appId, 'counter', { includeValues: true });
+   */
+  public get timeTravel() {
+    return this._timeTravelManager
+  }
+
+  /**
+   * Extended simulate on dtalgod: several transaction groups per request, and the same groups at several rounds.
+   * Needs the time-travel fork of algosdk.
+   * @returns The `SimulateManager` instance.
+   * @example
+   * const outcomes = await algorand.simulate.rounds(composer, [45_000_000n, 45_001_000n]);
+   */
+  public get simulate() {
+    return this._simulateManager
   }
 
   /**

@@ -58,6 +58,7 @@ import {
 import { AppLookup } from './app-deployer'
 import { AppManager, BoxIdentifier } from './app-manager'
 import { AppSpec, arc32ToArc56 } from './app-spec'
+import { AtRoundOptions, Round } from './time-travel-support'
 import {
   AppCallMethodCall,
   AppCallParams,
@@ -343,6 +344,12 @@ export interface AppClientParams {
   approvalSourceMap?: SourceMap
   /** Optional source map for the clear state program */
   clearSourceMap?: SourceMap
+  /**
+   * Optional round to pin the client to (needs dtalgod time travel): state reads (`state.*`, `getGlobalState`,
+   * `getBoxValue`, ...) read the state as of the end of this round, and readonly ABI calls are simulated at this round.
+   * A pinned client can't send transactions. See `AppClient.atRound`.
+   */
+  round?: Round
 }
 
 /** Parameters to clone an app client */
@@ -483,6 +490,7 @@ export class AppClient {
   private _algorand: AlgorandClient
   private _defaultSender?: Address
   private _defaultSigner?: TransactionSigner
+  private _round?: bigint
 
   private _approvalSourceMap: SourceMap | undefined
   private _clearSourceMap: SourceMap | undefined
@@ -523,6 +531,7 @@ export class AppClient {
     this._algorand.registerErrorTransformer!(this.handleCallErrors)
     this._defaultSender = typeof params.defaultSender === 'string' ? Address.fromString(params.defaultSender) : params.defaultSender
     this._defaultSigner = params.defaultSigner
+    this._round = params.round === undefined ? undefined : BigInt(params.round)
     this._lastCompiled = {}
 
     this._approvalSourceMap = params.approvalSourceMap
@@ -552,11 +561,66 @@ export class AppClient {
       bare: this.getBareCreateTransactionMethods(),
     }
     this._sendMethods = {
-      ...this.getMethodCallSendMethods(),
+      ...this.guardPinnedSends(this.getMethodCallSendMethods(), ['call']),
 
       /** Send bare (raw) transactions to the current app */
-      bare: this.getBareSendMethods(),
+      bare: this.guardPinnedSends(this.getBareSendMethods(), []),
     }
+  }
+
+  /** Wraps send methods so that they throw on a client pinned to a round, except the `allowed` ones, which check themselves. */
+  private guardPinnedSends<T extends object>(methods: T, allowed: (keyof T)[]): T {
+    const guarded = { ...methods }
+    for (const [name, method] of Object.entries(methods) as [keyof T, unknown][]) {
+      if (allowed.includes(name) || typeof method !== 'function') continue
+      guarded[name] = (async (...args: unknown[]) => {
+        this.assertNotPinned(`send ${String(name)}`)
+        return await method(...args)
+      }) as T[keyof T]
+    }
+    return guarded
+  }
+
+  private assertNotPinned(action: string) {
+    if (this._round !== undefined) {
+      throw new Error(
+        `Can't ${action}: this app client is pinned to round ${this._round}, so it can only read state and make readonly calls`,
+      )
+    }
+  }
+
+  /** The round reads use: the one in `options`, else the round this client is pinned to, if any. */
+  private readOptions(options?: AtRoundOptions): AtRoundOptions | undefined {
+    const round = options?.round ?? this._round
+    return round === undefined ? undefined : { round }
+  }
+
+  /**
+   * The round this client is pinned to, if any (see `atRound`).
+   */
+  public get round(): bigint | undefined {
+    return this._round
+  }
+
+  /**
+   * Returns a clone of this app client pinned to a past round (needs dtalgod time travel and the time-travel fork of
+   * algosdk): state reads (`state.global|local|box`, `getGlobalState`, `getBoxValue`, ...) read the state as of the end
+   * of that round, and readonly ABI calls are simulated at that round. The pinned client can't send transactions.
+   *
+   * Generated typed clients take an `AppClient`, so `new MyAppClient(myAppClient.appClient.atRound(round))` gives
+   * typed state and readonly calls at that round.
+   *
+   * @param round The round to pin to, or `undefined` for a client that reads the latest state
+   * @returns The pinned app client
+   * @example
+   * ```typescript
+   * const past = appClient.atRound(45_000_000n)
+   * const counter = await past.state.global.getValue('counter')
+   * const result = await past.send.call({ method: 'get_counter' })
+   * ```
+   */
+  public atRound(round: Round | undefined): AppClient {
+    return this.clone({ round })
   }
 
   /**
@@ -579,6 +643,7 @@ export class AppClient {
       defaultSigner: this._defaultSigner,
       approvalSourceMap: this._approvalSourceMap,
       clearSourceMap: this._clearSourceMap,
+      round: this._round,
       ...params,
     })
   }
@@ -755,22 +820,24 @@ export class AppClient {
    * ```typescript
    * const globalState = await appClient.getGlobalState()
    * ```
+   * @param options Optional `round` to read the state as of the end of a past round (defaults to the client's pinned round, if any)
    */
-  public async getGlobalState(): Promise<AppState> {
-    return await this._algorand.app.getGlobalState(this.appId)
+  public async getGlobalState(options?: AtRoundOptions): Promise<AppState> {
+    return await this._algorand.app.getGlobalState(this.appId, this.readOptions(options))
   }
 
   /**
    * Returns raw local state for the given account address.
    * @param address The address of the account to get the local state for
+   * @param options Optional `round` to read the state as of the end of a past round (defaults to the client's pinned round, if any)
    * @returns The local state
    * @example
    * ```typescript
    * const localState = await appClient.getLocalState('ACCOUNT_ADDRESS')
    * ```
    */
-  public async getLocalState(address: Address | string): Promise<AppState> {
-    return await this._algorand.app.getLocalState(this.appId, address)
+  public async getLocalState(address: Address | string, options?: AtRoundOptions): Promise<AppState> {
+    return await this._algorand.app.getLocalState(this.appId, address, this.readOptions(options))
   }
 
   /**
@@ -780,39 +847,43 @@ export class AppClient {
    * ```typescript
    * const boxNames = await appClient.getBoxNames()
    * ```
+   * @param options Optional `round` to list the boxes as of the end of a past round (defaults to the client's pinned round, if any)
    */
-  public async getBoxNames(): Promise<BoxName[]> {
-    return await this._algorand.app.getBoxNames(this.appId)
+  public async getBoxNames(options?: AtRoundOptions): Promise<BoxName[]> {
+    return await this._algorand.app.getBoxNames(this.appId, this.readOptions(options))
   }
 
   /**
    * Returns the value of the given box for the current app.
    * @param name The identifier of the box to return
+   * @param options Optional `round` to read the box as of the end of a past round (defaults to the client's pinned round, if any)
    * @returns The current box value as a byte array
    * @example
    * ```typescript
    * const boxValue = await appClient.getBoxValue('boxName')
    * ```
    */
-  public async getBoxValue(name: BoxIdentifier): Promise<Uint8Array> {
-    return await this._algorand.app.getBoxValue(this.appId, name)
+  public async getBoxValue(name: BoxIdentifier, options?: AtRoundOptions): Promise<Uint8Array> {
+    return await this._algorand.app.getBoxValue(this.appId, name, this.readOptions(options))
   }
 
   /**
    * Returns the value of the given box for the current app.
    * @param name The identifier of the box to return
    * @param type
+   * @param options Optional `round` to read the box as of the end of a past round (defaults to the client's pinned round, if any)
    * @returns The current box value as a byte array
    * @example
    * ```typescript
    * const boxValue = await appClient.getBoxValueFromABIType('boxName', new ABIUintType(32))
    * ```
    */
-  public async getBoxValueFromABIType(name: BoxIdentifier, type: ABIType): Promise<ABIValue> {
+  public async getBoxValueFromABIType(name: BoxIdentifier, type: ABIType, options?: AtRoundOptions): Promise<ABIValue> {
     return await this._algorand.app.getBoxValueFromABIType({
       appId: this.appId,
       boxName: name,
       type,
+      ...this.readOptions(options),
     })
   }
 
@@ -820,17 +891,23 @@ export class AppClient {
    * Returns the values of all current boxes for the current app.
    * Note: This will issue multiple HTTP requests (one per box) and it's not an atomic operation so values may be out of sync.
    * @param filter Optional filter to filter which boxes' values are returned
+   * @param options Optional `round` to read the boxes as of the end of a past round (defaults to the client's pinned round, if any)
    * @returns The (name, value) pair of the boxes with values as raw byte arrays
    * @example
    * ```typescript
    * const boxValues = await appClient.getBoxValues()
    * ```
    */
-  public async getBoxValues(filter?: (name: BoxName) => boolean): Promise<{ name: BoxName; value: Uint8Array }[]> {
-    const names = (await this.getBoxNames()).filter(filter ?? ((_) => true))
+  public async getBoxValues(
+    filter?: (name: BoxName) => boolean,
+    options?: AtRoundOptions,
+  ): Promise<{ name: BoxName; value: Uint8Array }[]> {
+    const readOptions = this.readOptions(options)
+    const names = (await this.getBoxNames(readOptions)).filter(filter ?? ((_) => true))
     const values = await this._algorand.app.getBoxValues(
       this.appId,
       names.map((name) => name.nameRaw),
+      readOptions,
     )
     return names.map((name, i) => ({ name, value: values[i] }))
   }
@@ -840,18 +917,25 @@ export class AppClient {
    * Note: This will issue multiple HTTP requests (one per box) and it's not an atomic operation so values may be out of sync.
    * @param type The ABI type to decode the values with
    * @param filter Optional filter to filter which boxes' values are returned
+   * @param options Optional `round` to read the boxes as of the end of a past round (defaults to the client's pinned round, if any)
    * @returns The (name, value) pair of the boxes with values as the ABI Value
    * @example
    * ```typescript
    * const boxValues = await appClient.getBoxValuesFromABIType(new ABIUintType(32))
    * ```
    */
-  public async getBoxValuesFromABIType(type: ABIType, filter?: (name: BoxName) => boolean): Promise<{ name: BoxName; value: ABIValue }[]> {
-    const names = (await this.getBoxNames()).filter(filter ?? ((_) => true))
+  public async getBoxValuesFromABIType(
+    type: ABIType,
+    filter?: (name: BoxName) => boolean,
+    options?: AtRoundOptions,
+  ): Promise<{ name: BoxName; value: ABIValue }[]> {
+    const readOptions = this.readOptions(options)
+    const names = (await this.getBoxNames(readOptions)).filter(filter ?? ((_) => true))
     const values = await this._algorand.app.getBoxValuesFromABIType({
       appId: this.appId,
       boxNames: names.map((name) => name.nameRaw),
       type,
+      ...readOptions,
     })
     return names.map((name, i) => ({ name, value: values[i] }))
   }
@@ -869,7 +953,7 @@ export class AppClient {
     let program: Uint8Array | undefined
     if (pcOffsetMethod === 'cblocks') {
       // TODO: Cache this if we deploy the app and it's not updateable
-      const appInfo = await this._algorand.app.getById(this.appId)
+      const appInfo = await this._algorand.app.getById(this.appId, this.readOptions())
       program = isClearStateProgram ? appInfo.clearStateProgram : appInfo.approvalProgram
     }
 
@@ -1440,6 +1524,8 @@ export class AppClient {
                 skipSignatures: true,
                 // Simulate calls for a readonly method can use the max opcode budget
                 extraOpcodeBudget: MAX_SIMULATE_OPCODE_BUDGET,
+                // A client pinned to a round simulates at that round
+                ...(this._round !== undefined ? { round: this._round } : undefined),
               })
             return this.processMethodCallReturn(
               {
@@ -1462,6 +1548,7 @@ export class AppClient {
           }
         }
 
+        this.assertNotPinned('send a non-readonly call')
         return this.processMethodCallReturn(
           this._algorand.send.appCallMethodCall(await this.params.call(params)),
           getArc56Method(params.method, this._appSpec),

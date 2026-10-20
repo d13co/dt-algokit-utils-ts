@@ -3,6 +3,7 @@ import { Config } from '../config'
 import { chunkArray } from '../util'
 import { AccountAssetInformation } from './account'
 import { CommonTransactionParams, MAX_TRANSACTION_GROUP_SIZE, TransactionComposer } from './composer'
+import { AtRoundOptions, timeTravelAlgodForRead } from './time-travel-support'
 import { SendParams } from './transaction'
 
 /** Individual result from performing a bulk opt-in or bulk opt-out for an account against a series of assets. */
@@ -162,10 +163,24 @@ export class AssetManager {
    * ```
    *
    * @param assetId The ID of the asset
+   * @param options Optional `round` to read the asset as of the end of a past round (needs dtalgod time travel)
    * @returns The asset information
    */
-  public async getById(assetId: bigint): Promise<AssetInformation> {
-    const asset = await this._algod.getAssetByID(Number(assetId)).do()
+  public async getById(assetId: bigint, options?: AtRoundOptions): Promise<AssetInformation> {
+    const round = options?.round
+    const asset =
+      round === undefined
+        ? await this._algod.getAssetByID(Number(assetId)).do()
+        : await (await timeTravelAlgodForRead(this._algod, 'Reading an asset', round, true)).getAssetByID(assetId).round(round).do()
+    return AssetManager.assetInformationFromAlgod(asset)
+  }
+
+  /**
+   * Converts an algod asset into an `AssetInformation`.
+   * @param asset The asset from algod
+   * @returns The asset information
+   */
+  public static assetInformationFromAlgod(asset: algosdk.modelsv2.Asset): AssetInformation {
     const params = asset.params!
 
     return {
@@ -201,10 +216,24 @@ export class AssetManager {
    * [Response data schema details](https://dev.algorand.co/reference/rest-api/algod/operations/accountassetinformation/)
    * @param sender The address of the sender/account to look up
    * @param assetId The ID of the asset to return a holding for
+   * @param options Optional `round` to read the holding as of the end of a past round (needs dtalgod time travel)
    * @returns The account asset holding information
    */
-  public async getAccountInformation(sender: string | Address, assetId: bigint): Promise<AccountAssetInformation> {
-    const info = await this._algod.accountAssetInformation(sender, Number(assetId)).do()
+  public async getAccountInformation(
+    sender: string | Address,
+    assetId: bigint,
+    options?: AtRoundOptions,
+  ): Promise<AccountAssetInformation> {
+    const round = options?.round
+    const info =
+      round === undefined
+        ? await this._algod.accountAssetInformation(sender, Number(assetId)).do()
+        : await (
+            await timeTravelAlgodForRead(this._algod, 'Reading an account asset holding', round, false)
+          )
+            .accountAssetInformation(sender, assetId)
+            .round(round)
+            .do()
 
     return {
       assetId: BigInt(assetId),

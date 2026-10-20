@@ -10,6 +10,7 @@ import {
   type CompiledTeal,
   type TealTemplateParams,
 } from './app'
+import { AtRoundOptions, timeTravelAlgodForRead } from './time-travel-support'
 import modelsv2 = algosdk.modelsv2
 
 /** Information about an app. */
@@ -82,6 +83,8 @@ export interface BoxValueRequestParams {
   boxName: BoxIdentifier
   /** The ABI type to decode the value using */
   type: algosdk.ABIType
+  /** Read the box as of the end of this past round instead of the latest round (needs dtalgod time travel) */
+  round?: number | bigint
 }
 
 /**
@@ -94,6 +97,8 @@ export interface BoxValuesRequestParams {
   boxNames: BoxIdentifier[]
   /** The ABI type to decode the value using */
   type: algosdk.ABIType
+  /** Read the boxes as of the end of this past round instead of the latest round (needs dtalgod time travel) */
+  round?: number | bigint
 }
 
 /**
@@ -237,10 +242,24 @@ export class AppManager {
    * ```
    *
    * @param appId The ID of the app
+   * @param options Optional `round` to read the app as of the end of a past round (needs dtalgod time travel)
    * @returns The app information
    */
-  public async getById(appId: bigint): Promise<AppInformation> {
-    const app = await this._algod.getApplicationByID(Number(appId)).do()
+  public async getById(appId: bigint, options?: AtRoundOptions): Promise<AppInformation> {
+    const round = options?.round
+    const app =
+      round === undefined
+        ? await this._algod.getApplicationByID(Number(appId)).do()
+        : await (await timeTravelAlgodForRead(this._algod, 'Reading an app', round, true)).getApplicationByID(appId).round(round).do()
+    return AppManager.appInformationFromAlgod(app)
+  }
+
+  /**
+   * Converts an algod application into an `AppInformation`.
+   * @param app The application from algod
+   * @returns The app information
+   */
+  public static appInformationFromAlgod(app: modelsv2.Application): AppInformation {
     const params = app.params!
     return {
       appId: BigInt(app.id),
@@ -262,14 +281,15 @@ export class AppManager {
    * Returns the current global state values for the given app ID and account address
    *
    * @param appId The ID of the app to return global state for
+   * @param options Optional `round` to read the state as of the end of a past round (needs dtalgod time travel)
    * @returns The current global state for the given app
    * @example
    * ```typescript
    * const globalState = await appManager.getGlobalState(12353n);
    * ```
    */
-  public async getGlobalState(appId: bigint) {
-    return (await this.getById(appId)).globalState
+  public async getGlobalState(appId: bigint, options?: AtRoundOptions) {
+    return (await this.getById(appId, options)).globalState
   }
 
   /**
@@ -277,14 +297,24 @@ export class AppManager {
    *
    * @param appId The ID of the app to return local state for
    * @param address The string address of the account to get local state for the given app
+   * @param options Optional `round` to read the state as of the end of a past round (needs dtalgod time travel)
    * @returns The current local state for the given (app, account) combination
    * @example
    * ```typescript
    * const localState = await appManager.getLocalState(12353n, 'ACCOUNTADDRESS');
    * ```
    */
-  public async getLocalState(appId: bigint, address: Address | string) {
-    const appInfo = await this._algod.accountApplicationInformation(address, appId).do()
+  public async getLocalState(appId: bigint, address: Address | string, options?: AtRoundOptions) {
+    const round = options?.round
+    const appInfo =
+      round === undefined
+        ? await this._algod.accountApplicationInformation(address, appId).do()
+        : await (
+            await timeTravelAlgodForRead(this._algod, 'Reading local state', round, false)
+          )
+            .accountApplicationInformation(address, appId)
+            .round(round)
+            .do()
 
     if (!appInfo.appLocalState?.keyValue) {
       throw new Error("Couldn't find local state")
@@ -296,15 +326,30 @@ export class AppManager {
   /**
    * Returns the names of the current boxes for the given app.
    * @param appId The ID of the app return box names for
+   * @param options Optional `round` to list the boxes as of the end of a past round (needs dtalgod time travel)
    * @returns The current box names
    * @example
    * ```typescript
    * const boxNames = await appManager.getBoxNames(12353n);
    * ```
    */
-  public async getBoxNames(appId: bigint): Promise<BoxName[]> {
-    const boxResult = await this._algod.getApplicationBoxes(appId).do()
-    return boxResult.boxes.map((b) => {
+  public async getBoxNames(appId: bigint, options?: AtRoundOptions): Promise<BoxName[]> {
+    const round = options?.round
+    let boxes: modelsv2.BoxDescriptor[]
+    if (round === undefined) {
+      boxes = (await this._algod.getApplicationBoxes(appId).do()).boxes
+    } else {
+      // Listing a past round can come in pages; the pages of one round fit together because past rounds never change
+      const tt = await timeTravelAlgodForRead(this._algod, 'Listing boxes', round, false)
+      boxes = []
+      let next: string | undefined = undefined
+      do {
+        const page: modelsv2.BoxesResponse = await tt.getApplicationBoxes(appId).round(round).next(next).do()
+        boxes.push(...page.boxes)
+        next = page.nextToken
+      } while (next)
+    }
+    return boxes.map((b) => {
       return {
         nameRaw: b.name,
         nameBase64: Buffer.from(b.name).toString('base64'),
@@ -317,16 +362,26 @@ export class AppManager {
    * Returns the value of the given box name for the given app.
    * @param appId The ID of the app return box names for
    * @param boxName The name of the box to return either as a string, binary array or `BoxName`
+   * @param options Optional `round` to read the box as of the end of a past round (needs dtalgod time travel)
    * @returns The current box value as a byte array
    * @example
    * ```typescript
    * const boxValue = await appManager.getBoxValue(12353n, 'boxName');
    * ```
    */
-  public async getBoxValue(appId: bigint, boxName: BoxIdentifier | BoxName): Promise<Uint8Array> {
+  public async getBoxValue(appId: bigint, boxName: BoxIdentifier | BoxName, options?: AtRoundOptions): Promise<Uint8Array> {
     const boxId = typeof boxName === 'object' && 'nameRaw' in boxName ? boxName.nameRaw : boxName
     const name = AppManager.getBoxReference(boxId).name
-    const boxResult = await this._algod.getApplicationBoxByName(Number(appId), name).do()
+    const round = options?.round
+    const boxResult =
+      round === undefined
+        ? await this._algod.getApplicationBoxByName(Number(appId), name).do()
+        : await (
+            await timeTravelAlgodForRead(this._algod, 'Reading a box', round, false)
+          )
+            .getApplicationBoxByName(appId, name)
+            .round(round)
+            .do()
     return boxResult.value
   }
 
@@ -334,14 +389,15 @@ export class AppManager {
    * Returns the value of the given box names for the given app.
    * @param appId The ID of the app return box names for
    * @param boxNames The names of the boxes to return either as a string, binary array or `BoxName`
+   * @param options Optional `round` to read the boxes as of the end of a past round (needs dtalgod time travel)
    * @returns The current box values as a byte array in the same order as the passed in box names
    * @example
    * ```typescript
    * const boxValues = await appManager.getBoxValues(12353n, ['boxName1', 'boxName2']);
    * ```
    */
-  public async getBoxValues(appId: bigint, boxNames: (BoxIdentifier | BoxName)[]): Promise<Uint8Array[]> {
-    return await Promise.all(boxNames.map(async (boxName) => await this.getBoxValue(appId, boxName)))
+  public async getBoxValues(appId: bigint, boxNames: (BoxIdentifier | BoxName)[], options?: AtRoundOptions): Promise<Uint8Array[]> {
+    return await Promise.all(boxNames.map(async (boxName) => await this.getBoxValue(appId, boxName, options)))
   }
 
   /**
@@ -354,8 +410,8 @@ export class AppManager {
    * ```
    */
   public async getBoxValueFromABIType(request: BoxValueRequestParams): Promise<algosdk.ABIValue> {
-    const { appId, boxName, type } = request
-    const value = await this.getBoxValue(appId, boxName)
+    const { appId, boxName, type, round } = request
+    const value = await this.getBoxValue(appId, boxName, round === undefined ? undefined : { round })
     return type.decode(value)
   }
 
@@ -369,8 +425,8 @@ export class AppManager {
    * ```
    */
   public async getBoxValuesFromABIType(request: BoxValuesRequestParams): Promise<algosdk.ABIValue[]> {
-    const { appId, boxNames, type } = request
-    return await Promise.all(boxNames.map(async (boxName) => await this.getBoxValueFromABIType({ appId, boxName, type })))
+    const { appId, boxNames, type, round } = request
+    return await Promise.all(boxNames.map(async (boxName) => await this.getBoxValueFromABIType({ appId, boxName, type, round })))
   }
 
   /**
