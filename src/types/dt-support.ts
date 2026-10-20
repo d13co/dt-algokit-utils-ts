@@ -15,6 +15,7 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'reads-at-round',
   'versions',
   'simulate-groups',
+  'parallel-groups',
   'simulate-rounds',
   'from',
   'group-results',
@@ -22,12 +23,22 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'pack-rounds',
 ] as const)
 
-/** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork. */
+/** `DTAlgodClient.features` that only some algokit-utils options need, checked when they are used. */
+export type OptionalDTFeature = 'validity-window' | 'simulate-protocol'
+
+/** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork, or a version without it. */
 export class DTNotAvailableError extends Error {
-  constructor(feature: string) {
+  /**
+   * @param feature The feature that was used, for the message
+   * @param missing The optional features that a loaded fork lacks, if the fork is loaded but too old
+   */
+  constructor(feature: string, missing: readonly OptionalDTFeature[] = []) {
     super(
-      `${feature} needs the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
-        'but the loaded algosdk does not have it. Install the fork and make sure the app loads a single copy of algosdk.',
+      missing.length > 0
+        ? `${feature} needs a newer version of the time-travel fork of algosdk: the loaded one does not have the DTAlgodClient features ${missing.join(', ')}. ` +
+            'Install a newer fork and make sure the app loads a single copy of algosdk.'
+        : `${feature} needs the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
+            'but the loaded algosdk does not have it. Install the fork and make sure the app loads a single copy of algosdk.',
     )
     this.name = 'DTNotAvailableError'
   }
@@ -150,9 +161,69 @@ export type RawSimulateGroupOutcome = {
     }
 )
 
+/** A transaction that read data a {@link SimulateProtocolNote} is about. */
+export interface SimulateProtocolNoteHit {
+  /** The 0-based index of the transaction group. */
+  group: number
+  /** The path of the transaction in its group, as in `failedAt`. A logic signature's hit has the path of its top-level transaction. */
+  path: number[]
+}
+
+/**
+ * The codes of {@link SimulateProtocolNote}, as of this version. A newer node may send others.
+ * - `semantics-changed`: consensus parameters that affect transactions differ; the message lists each, old → new
+ * - `no-heartbeat-challenges`: no heartbeat challenge applies, since earlier challenge rounds ran other rules
+ * - `no-load-history`: a congestion tax computed from a load of 0
+ * - `block-incentive-fields`: `block` read an incentive field of a round without incentives, which reads as zero
+ * - `block-hash-fields`: `block` read a SHA-512 or SHA-256 header field of a round that did not compute it, which reads as zero bytes
+ * - `online-stake-includes-expired`: `online_stake` included keys that expire before the simulated round
+ * - `account-incentive-fields`: an account incentive field read before incentives, which reads as false or 0
+ * - `app-version-starts-at-upgrade`: `AppVersion` counts from the upgrade on
+ */
+export type SimulateProtocolNoteCode =
+  | 'semantics-changed'
+  | 'no-heartbeat-challenges'
+  | 'no-load-history'
+  | 'block-incentive-fields'
+  | 'block-hash-fields'
+  | 'online-stake-includes-expired'
+  | 'account-incentive-fields'
+  | 'app-version-starts-at-upgrade'
+
+/** A note about simulating under a later protocol: where the simulation differs from what the chain recorded, or read data the chain never produced. */
+export interface SimulateProtocolNote {
+  /** What the note is about: a {@link SimulateProtocolNoteCode}. */
+  code: SimulateProtocolNoteCode | (string & {})
+  /** The note, for people. */
+  message: string
+  /**
+   * The transactions that read the data the note is about: up to 16 per note from each request (more when parallel groups
+   * were split across requests). Undefined for notes about the protocol change as a whole.
+   */
+  hits?: SimulateProtocolNoteHit[]
+}
+
+/** How a simulate request's `protocol` applied to the simulated round. */
+export interface SimulateProtocolOverride {
+  /** The protocol the round after the simulated one really ran. */
+  from: string
+  /** The requested protocol, with aliases (`v42`, `latest`) resolved. */
+  to: string
+  /** False when `from` is already `to`: the round was simulated as it is. */
+  applied: boolean
+  /** Where the simulation under `to` differs from what the chain recorded, or read data the chain never produced. Only set when `applied`. */
+  notes?: SimulateProtocolNote[]
+}
+
 /** The response of an extended simulate request. */
 export interface DTSimulateResponseLike extends modelsv2.SimulateResponse {
-  roundResults?: { lastRound: bigint; txnGroups: modelsv2.SimulateTransactionGroupResult[]; error?: string }[]
+  roundResults?: {
+    lastRound: bigint
+    txnGroups: modelsv2.SimulateTransactionGroupResult[]
+    protocolOverride?: SimulateProtocolOverride
+    error?: string
+  }[]
+  protocolOverride?: SimulateProtocolOverride
   groupResult(groupIndex: number, roundIndex?: number): RawSimulateGroupOutcome
   groupResults(groupCount?: number): RawSimulateGroupOutcome[][]
 }
@@ -161,6 +232,9 @@ export interface DTSimulateResponseLike extends modelsv2.SimulateResponse {
 export interface DTSimulateRequestLike {
   parallelGroups(parallelGroups?: boolean): this
   rounds(rounds: Round[]): this
+  skipValidityWindow(skipValidityWindow?: boolean): this
+  rewriteValidityWindow(rewriteValidityWindow?: boolean): this
+  protocol(protocol: string): this
   do(): Promise<DTSimulateResponseLike>
 }
 
@@ -209,7 +283,7 @@ interface DTSdk {
   DTUnsupportedError: new (message: string, fields?: { requestedRound?: bigint; returnedRound?: bigint; cause?: unknown }) => Error
   packSimulateRounds(
     rounds: Round[],
-    options?: { maxRounds?: number; maxSpan?: number },
+    options?: { maxRounds?: number; maxSpan?: number | null },
   ): { windows: SimulateRoundsWindowLike[]; positions: { window: number; roundIndex: number }[] }
   dtModels: {
     DTSimulateRequest: {
@@ -238,6 +312,18 @@ export function getDTSdk(): DTSdk | undefined {
 export function requireDTSdk(feature: string): DTSdk {
   const tt = getDTSdk()
   if (!tt) throw new DTNotAvailableError(feature)
+  return tt
+}
+
+/**
+ * Like {@link requireDTSdk}, but also needs the given optional `DTAlgodClient.features` of a later version of the fork.
+ * @throws DTNotAvailableError if the loaded algosdk is not the time-travel fork, or a version without these features
+ */
+export function requireDTSdkFeatures(feature: string, optional: readonly OptionalDTFeature[]): DTSdk {
+  const tt = requireDTSdk(feature)
+  const features = tt.DTAlgodClient.features ?? []
+  const missing = optional.filter((f) => !features.includes(f))
+  if (missing.length > 0) throw new DTNotAvailableError(feature, missing)
   return tt
 }
 

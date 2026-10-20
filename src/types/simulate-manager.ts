@@ -3,7 +3,15 @@ import { Buffer } from 'buffer'
 import { getABIReturnValue } from '../transaction/transaction'
 import { ClientManager } from './client-manager'
 import { BuiltTransactions, RawSimulateOptions, TransactionComposer } from './composer'
-import { RawSimulateGroupOutcome, Round, DTSimulateResponseLike, requireDTSdk } from './dt-support'
+import {
+  DTSimulateResponseLike,
+  OptionalDTFeature,
+  RawSimulateGroupOutcome,
+  Round,
+  SimulateProtocolNote,
+  SimulateProtocolOverride,
+  requireDTSdkFeatures,
+} from './dt-support'
 import { SendAtomicTransactionComposerResults } from './transaction'
 import modelsv2 = algosdk.modelsv2
 
@@ -24,6 +32,19 @@ export type ExtendedSimulateOptions = Omit<RawSimulateOptions, 'allowEmptySignat
    * across requests; sequential groups can't be split, so more than this throws.
    */
   maxGroups?: number
+  /**
+   * Simulate under a later consensus protocol, as if an upgrade to it took effect right after the round simulated at:
+   * its programs, limits, fees and other parameters apply, to programs deployed earlier too. A consensus version string,
+   * `v24` to `v42` for a mainline one, `latest` (the protocol of the block after the node's latest one) or `future`
+   * (vFuture, only on a node with `EnableDeveloperAPI`). It must be a later protocol of the chain than the one the round
+   * really ran; the protocol the round really ran is simulated as it is.
+   *
+   * Each outcome's `protocolOverride` says how it applied. An unknown name, or `future` without the developer API, fails
+   * the whole request. A protocol that isn't a later one of the chain fails the request with `simulate.groups`, or that
+   * round (`kind: 'round'`) with `simulate.rounds`.
+   * Needs dtalgod and a version of the fork with the `simulate-protocol` feature.
+   */
+  protocol?: string
 }
 
 /** Options to simulate several groups at one round. */
@@ -40,6 +61,19 @@ export type SimulateGroupsOptions = ExtendedSimulateOptions & {
 export type SimulateRoundsOptions = ExtendedSimulateOptions & {
   /** The most rounds the node takes per request (`MaxAPISimulateRounds`, default 16). More rounds are split across requests. */
   maxRounds?: number
+  /**
+   * Lets the rounds of one request be more than 1,000 rounds (`MaxTxnLife`) apart, so they are packed by `maxRounds` only:
+   * - `rewrite`: at every round, each transaction's validity window is moved to the simulated block, keeping its width,
+   *   and group IDs are recomputed. Transaction IDs change, so the results' `txIds` and `transactions` are those as
+   *   built, not as simulated (the confirmations echo the rewritten ones). Transactions that differ only by their
+   *   validity window become identical, so the later one fails as a duplicate: give them distinct notes.
+   * - `skip`: the transactions are evaluated as built at every round, even outside their validity window. Leases,
+   *   duplicates and fees are still checked. Programs see the window as built, so `block`, `FirstValidTime` and inner
+   *   transactions stay tied to it.
+   *
+   * Needs dtalgod and a version of the fork with the `validity-window` feature.
+   */
+  validityWindow?: 'skip' | 'rewrite'
 }
 
 /** The result of a group that simulated without failing. */
@@ -71,6 +105,11 @@ export type SimulateGroupOutcome = {
   groupIndex: number
   /** The round the group was simulated at: the state as of the end of this round. */
   round: bigint
+  /**
+   * With `protocol`: how it applied at this round, the same for every group of the round. The notes' `hits` give the
+   * `group` as an index in the order the composers were given. Undefined when the round failed.
+   */
+  protocolOverride?: SimulateProtocolOverride
 } & ({ ok: true; result: SimulateGroupResult } | { ok: false; error: SimulateGroupError })
 
 /** The outcomes of the groups at one round. */
@@ -79,7 +118,33 @@ export interface SimulateRoundOutcome {
   round: bigint
   /** The outcome of each group, in the order the composers were given. */
   groups: SimulateGroupOutcome[]
+  /**
+   * With `protocol`: how it applied at this round (see `SimulateGroupOutcome.protocolOverride`). When parallel groups
+   * were split across requests, the notes of all of them, and set if the round failed in some of them only.
+   */
+  protocolOverride?: SimulateProtocolOverride
 }
+
+/** The optional fork features that the options need, after checking `validityWindow`. */
+const optionalFeatures = (options: { protocol?: string; validityWindow?: string }): OptionalDTFeature[] => {
+  const { validityWindow } = options
+  if (validityWindow !== undefined && validityWindow !== 'skip' && validityWindow !== 'rewrite') {
+    throw new Error(`validityWindow must be 'skip' or 'rewrite', not ${JSON.stringify(validityWindow)}`)
+  }
+  return [...(validityWindow ? (['validity-window'] as const) : []), ...(options.protocol ? (['simulate-protocol'] as const) : [])]
+}
+
+/** The order the node lists protocol notes in; codes it adds later go after these. */
+const PROTOCOL_NOTE_ORDER: readonly string[] = [
+  'semantics-changed',
+  'no-heartbeat-challenges',
+  'no-load-history',
+  'block-incentive-fields',
+  'block-hash-fields',
+  'online-stake-includes-expired',
+  'account-incentive-fields',
+  'app-version-starts-at-upgrade',
+]
 
 const chunk = <T>(items: T[], size: number): T[][] => {
   const chunks: T[][] = []
@@ -120,10 +185,39 @@ function toOutcome(
   groupIndex: number,
   built: BuiltTransactions,
   response: modelsv2.SimulateResponse,
+  protocolOverride: SimulateProtocolOverride | undefined,
 ): SimulateGroupOutcome {
-  return raw.ok
-    ? { groupIndex, round: raw.round, ok: true, result: toGroupResult(built, raw.result, response) }
-    : { groupIndex, round: raw.round, ok: false, error: raw.error }
+  const base = { groupIndex, round: raw.round, ...(protocolOverride ? { protocolOverride } : {}) }
+  return raw.ok ? { ...base, ok: true, result: toGroupResult(built, raw.result, response) } : { ...base, ok: false, error: raw.error }
+}
+
+/** The protocol override of one request at one round, with the notes' group indexes moved by `offset` (the request's first group). */
+function protocolOverrideAt(
+  response: DTSimulateResponseLike,
+  roundIndex: number | undefined,
+  offset: number,
+): SimulateProtocolOverride | undefined {
+  const o = roundIndex === undefined ? response.protocolOverride : response.roundResults?.[roundIndex]?.protocolOverride
+  if (!o || !o.notes || offset === 0) return o
+  return {
+    ...o,
+    notes: o.notes.map((n) => (n.hits ? { ...n, hits: n.hits.map((h) => ({ ...h, group: h.group + offset })) } : n)),
+  }
+}
+
+/** Merges the protocol overrides of the requests that parallel groups were split across, at the same round. */
+function mergeProtocolOverrides(overrides: (SimulateProtocolOverride | undefined)[]): SimulateProtocolOverride | undefined {
+  const present = overrides.filter((o): o is SimulateProtocolOverride => o !== undefined)
+  if (present.length <= 1) return present[0]
+  const notes: SimulateProtocolNote[] = []
+  for (const n of present.flatMap((o) => o.notes ?? [])) {
+    const same = notes.find((m) => m.code === n.code && m.message === n.message)
+    if (!same) notes.push({ ...n, ...(n.hits ? { hits: [...n.hits] } : {}) })
+    else if (n.hits) same.hits = [...(same.hits ?? []), ...n.hits]
+  }
+  const rank = (code: string) => (PROTOCOL_NOTE_ORDER.includes(code) ? PROTOCOL_NOTE_ORDER.indexOf(code) : PROTOCOL_NOTE_ORDER.length)
+  notes.sort((a, b) => rank(a.code) - rank(b.code)) // stable: unknown codes keep their order
+  return { from: present[0].from, to: present[0].to, applied: present.some((o) => o.applied), ...(notes.length ? { notes } : {}) }
 }
 
 /**
@@ -176,7 +270,9 @@ export class SimulateManager {
    *
    * The rounds are packed into windows of at most `maxRounds` rounds that span at most 1,000 rounds, and the groups are
    * built again for each window, valid at its rounds; transactions that set their own `firstValidRound` /
-   * `lastValidRound` keep them. The windows are sent in parallel.
+   * `lastValidRound` keep them. The windows are sent in parallel. With `validityWindow`, a window can span any number of
+   * rounds: the groups are built valid from its first round for at most 1,000 rounds, and the node moves (`rewrite`) or
+   * ignores (`skip`) that validity window at the later rounds.
    *
    * @param composers The groups, one composer each (or a single composer)
    * @param rounds The rounds to simulate at (each > 0): the state as of the end of each round
@@ -187,6 +283,10 @@ export class SimulateManager {
    * const composer = algorand.newGroup().addAppCallMethodCall(await appClient.params.call({ method: 'get_price' }))
    * const prices = await algorand.simulate.rounds(composer, [45_000_000n, 45_001_000n, 45_002_000n], { allowUnnamedResources: true })
    * for (const { round, groups: [g] } of prices) if (g.ok) console.log(round, g.result.returns?.[0]?.returnValue)
+   *
+   * // Years apart, under today's rules
+   * const now = await algorand.simulate.rounds(composer, [20_000_000n, 45_000_000n], { validityWindow: 'rewrite', protocol: 'latest' })
+   * for (const { round, protocolOverride } of now) console.log(round, protocolOverride?.from, '->', protocolOverride?.to)
    * ```
    */
   public async rounds(
@@ -197,8 +297,9 @@ export class SimulateManager {
     const { maxRounds = DEFAULT_MAX_SIMULATE_ROUNDS, ...rest } = options ?? {}
     const groups = Array.isArray(composers) ? composers : [composers]
     if (rounds.length === 0) return []
-    const tt = requireDTSdk('Simulating at several rounds')
-    const { windows, positions } = tt.packSimulateRounds(rounds, { maxRounds })
+    const tt = requireDTSdkFeatures('Simulating at several rounds', optionalFeatures(rest))
+    // With a validity window mode the rounds of a request needn't fit in one transaction's validity window
+    const { windows, positions } = tt.packSimulateRounds(rounds, { maxRounds, ...(rest.validityWindow ? { maxSpan: null } : {}) })
 
     // Build one after the other (a composer can only build one validity window at a time), then send in parallel
     const builtWindows: BuiltTransactions[][] = []
@@ -207,10 +308,10 @@ export class SimulateManager {
     }
     const results = await Promise.all(windows.map((w, i) => this.send(builtWindows[i], rest, { rounds: w.rounds })))
 
-    return positions.map(({ window, roundIndex }, i) => ({
-      round: BigInt(rounds[i]),
-      groups: results[window][roundIndex].groups,
-    }))
+    return positions.map(({ window, roundIndex }, i) => {
+      const { groups, protocolOverride } = results[window][roundIndex]
+      return { round: BigInt(rounds[i]), groups, ...(protocolOverride ? { protocolOverride } : {}) }
+    })
   }
 
   private async buildGroups(
@@ -232,11 +333,11 @@ export class SimulateManager {
   /** Sends the groups (split into requests if parallel), returning the outcomes per round of the request (one round without `rounds`). */
   private async send(
     built: BuiltTransactions[],
-    options: ExtendedSimulateOptions,
+    options: ExtendedSimulateOptions & Pick<SimulateRoundsOptions, 'validityWindow'>,
     at: { round?: Round; rounds?: bigint[] },
-  ): Promise<{ groups: SimulateGroupOutcome[] }[]> {
-    const tt = requireDTSdk('Simulating several groups')
-    const { parallel = false, maxGroups = DEFAULT_MAX_SIMULATE_GROUPS, ...raw } = options
+  ): Promise<{ groups: SimulateGroupOutcome[]; protocolOverride?: SimulateProtocolOverride }[]> {
+    const tt = requireDTSdkFeatures('Simulating several groups', optionalFeatures(options))
+    const { parallel = false, maxGroups = DEFAULT_MAX_SIMULATE_GROUPS, protocol, validityWindow, ...raw } = options
     if (!parallel && built.length > maxGroups) {
       throw new Error(
         `Can't simulate ${built.length} groups one after the other: the node takes at most ${maxGroups} per request (set maxGroups if the node allows more, or use parallel)`,
@@ -244,27 +345,37 @@ export class SimulateManager {
     }
     const chunks = parallel ? chunk(built, maxGroups) : [built]
     const algod = this._clientManager.dtAlgod
+    // Parallel groups split across requests must all run at the same round, even if a new block comes in between
+    let round = at.round || undefined
+    if (chunks.length > 1 && !round && !at.rounds) round = (await this._clientManager.algod.status().do()).lastRound
 
     const responses = await Promise.all(
       chunks.map(async (groups) => {
         const request = tt.dtModels.DTSimulateRequest.fromTransactions(
           groups.map((g) => g.transactions),
-          { ...raw, allowEmptySignatures: true, fixSigners: true, parallelGroups: parallel || undefined, round: at.round || undefined },
+          { ...raw, allowEmptySignatures: true, fixSigners: true, parallelGroups: parallel || undefined, round },
         )
         let call = algod.simulateTransactions(request)
         if (at.rounds) call = call.rounds(at.rounds)
+        if (validityWindow === 'skip') call = call.skipValidityWindow()
+        if (validityWindow === 'rewrite') call = call.rewriteValidityWindow()
+        if (protocol) call = call.protocol(protocol)
         return await call.do()
       }),
     )
 
+    const offsets = chunks.map((_, c) => chunks.slice(0, c).reduce((n, g) => n + g.length, 0))
     const roundCount = at.rounds ? at.rounds.length : 1
-    return Array.from({ length: roundCount }, (_, roundIndex) => ({
-      groups: chunks.flatMap((groups, c) => {
+    return Array.from({ length: roundCount }, (_, roundIndex) => {
+      const overrides = responses.map((response, c) => protocolOverrideAt(response, at.rounds ? roundIndex : undefined, offsets[c]))
+      const protocolOverride = mergeProtocolOverrides(overrides)
+      const groups = chunks.flatMap((groups, c) => {
         const response: DTSimulateResponseLike = responses[c]
         const row = response.groupResults(groups.length)[roundIndex]
-        const offset = chunks.slice(0, c).reduce((n, g) => n + g.length, 0)
-        return row.map((raw, g) => toOutcome(raw, offset + g, groups[g], response))
-      }),
-    }))
+        // A request whose round failed has no override: its groups get none either
+        return row.map((raw, g) => toOutcome(raw, offsets[c] + g, groups[g], response, overrides[c] && protocolOverride))
+      })
+      return { groups, ...(protocolOverride ? { protocolOverride } : {}) }
+    })
   }
 }

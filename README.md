@@ -89,6 +89,22 @@ for (const {
 
 Each outcome is `{ ok: true, result }`, with the same result shape as `composer.simulate()`, or `{ ok: false, error }`.
 
+#### Rounds far apart, under a later protocol
+
+A transaction is valid for at most 1,000 rounds, so `simulate.rounds` normally puts rounds more than 1,000 apart in separate requests. With `validityWindow: 'rewrite'`, the node moves each transaction's validity window to every simulated round (dropping its signature), and with `'skip'` it evaluates the transactions as built outside their window; either way rounds of any span share a request. `protocol` (on `groups` and `rounds`) simulates under a later consensus protocol (`v24` to `v42`, `latest`, `future` on a node with the developer API, or a version string), as if an upgrade took effect right after the round, and each outcome's `protocolOverride` says how it applied:
+
+```typescript
+for (const { round, protocolOverride, groups } of await algorand.simulate.rounds(composer, [20_000_000n, 45_000_000n], {
+  validityWindow: 'rewrite',
+  protocol: 'latest',
+})) {
+  console.log(round, protocolOverride?.from, '->', protocolOverride?.to, groups[0].ok)
+  for (const note of protocolOverride?.notes ?? []) console.log('  ', note.code, note.message)
+}
+```
+
+With `'rewrite'` the transaction IDs change, so the results' `txIds` are those as built; transactions that differ only by their validity window need distinct notes, or the later one fails as a duplicate. These options need a dtalgod with these features and `algosdk@3.8.0-dt.1` or later; an older fork throws a `DTNotAvailableError`, an older node a `DTUnsupportedError`.
+
 ### Tests
 
 `src/types/dt.spec.ts` runs offline against a stub algod. `src/types/dt.live.spec.ts` runs against a MainNet dtalgod: `DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts`.

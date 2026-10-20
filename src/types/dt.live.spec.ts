@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, test } from 'vitest'
 import { algo } from '../amount'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
+import { isDTUnsupportedError } from './dt-support'
 
 // Live checks against a MainNet time-travel algod (dtalgod with EnableTimeTravel). Skipped unless DT_ALGOD_SERVER is set:
 //
@@ -18,6 +19,16 @@ const XGOV = 3147789458n
 const XGOV_CREATOR = 'I7OP7WFSK57IFDHJA6DM5TJC2IFY4M3XSBV4R4PVOV4YWF7K57BZFUVQ5E'
 /** A round before the xGov app existed, after USDC was created */
 const PAST = 50_000_000n
+
+/** Runs a test of a newer dtalgod feature, skipping it on a node that doesn't support it yet. */
+const onNewerNode = (run: () => Promise<void>) => async (ctx: { skip: (note?: string) => void }) => {
+  try {
+    await run()
+  } catch (error) {
+    if (isDTUnsupportedError(error)) return ctx.skip(`the node does not support it: ${(error as Error).message}`)
+    throw error
+  }
+}
 
 describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000 }, () => {
   let algorand: AlgorandClient
@@ -113,4 +124,30 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(o.groups[0].ok).toBe(true)
     }
   })
+
+  test(
+    'simulate at rounds far apart with the validity window rewritten',
+    onNewerNode(async () => {
+      const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
+      const rounds = [latest - 200_000n, latest - 5n]
+      const outcomes = await algorand.simulate.rounds(pay, rounds, { validityWindow: 'rewrite' })
+      expect(outcomes.map((o) => [o.round, o.groups[0].ok])).toEqual(rounds.map((r) => [r, true]))
+    }),
+  )
+
+  test(
+    'simulate under a later protocol',
+    onNewerNode(async () => {
+      const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
+      const [now] = await algorand.simulate.groups([pay], { round: latest - 5n, protocol: 'latest' })
+      expect(now.protocolOverride).toMatchObject({ applied: false })
+      expect(now.protocolOverride!.from).toBe(now.protocolOverride!.to)
+
+      // Long before the latest protocol upgrade. The group may fail (the sender may not exist yet); the override is still there
+      const [old] = await algorand.simulate.groups([pay], { round: 20_000_000n, protocol: 'latest' })
+      expect(old.protocolOverride?.applied).toBe(true)
+      expect(old.protocolOverride?.from).not.toBe(old.protocolOverride?.to)
+      expect(old.protocolOverride?.to).toBe(now.protocolOverride!.to)
+    }),
+  )
 })

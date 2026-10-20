@@ -96,6 +96,17 @@ const appJson = (id: number, creator: string, counter: number) => ({
   },
 })
 
+const nodeStatus = json({
+  'catchup-time': 0,
+  'last-round': LAST_ROUND,
+  'last-version': 'future',
+  'next-version': 'future',
+  'next-version-round': LAST_ROUND + 1,
+  'next-version-supported': true,
+  'stopped-at-unsupported-round': false,
+  'time-since-last-round': 0,
+})
+
 /** Answers the time travel probe (`supportsDT`) as a time-travel node. */
 const probeOk = (stub: StubClient) => stub.on('get', '/v2/applications/0/box/versions', json({ round: LAST_ROUND, versions: [] }), true)
 
@@ -106,11 +117,23 @@ const sentSimulate = (call: Call) =>
   ) as modelsv2.SimulateRequest & {
     parallelGroups?: boolean
     rounds?: bigint[]
+    skipValidityWindow?: boolean
+    rewriteValidityWindow?: boolean
+    protocol?: string
   }
 
-/** A simulate answer with one successful result per transaction, or per round with `rounds`, logging `log(txn)`. */
+/**
+ * A simulate answer with one successful result per transaction, or per round with `rounds`, logging `log(txn)`. It echoes
+ * the validity window modes, and with `protocol` has a protocol override with a note on the request's first group.
+ * `roundError` fails a round of `rounds`.
+ */
 const echoSimulate =
-  (log?: (txn: algosdk.Transaction) => Uint8Array | undefined, fail?: (groupIndex: number) => string | undefined) => (call: Call) => {
+  (
+    log?: (txn: algosdk.Transaction) => Uint8Array | undefined,
+    fail?: (groupIndex: number) => string | undefined,
+    roundError?: (round: bigint, request: ReturnType<typeof sentSimulate>) => string | undefined,
+  ) =>
+  (call: Call) => {
     const request = sentSimulate(call)
     const groups = (lastRound: bigint) =>
       request.txnGroups.map(
@@ -132,18 +155,50 @@ const echoSimulate =
           }),
       )
     const tt = (algosdk as unknown as { dtModels: Record<string, new (args: unknown) => object> }).dtModels
+    const { skipValidityWindow, rewriteValidityWindow, protocol } = request
+    const evalOverrides =
+      skipValidityWindow || rewriteValidityWindow
+        ? new tt.DTSimulationEvalOverrides({ skipValidityWindow, rewriteValidityWindow })
+        : undefined
+    const protocolOverride = protocol
+      ? new tt.SimulateProtocolOverride({
+          from: 'v38',
+          to: protocol === 'latest' ? 'v42' : protocol,
+          applied: true,
+          notes: [
+            new tt.SimulateProtocolNote({ code: 'semantics-changed', message: 'MinTxnFee: 1000 → 1000' }),
+            new tt.SimulateProtocolNote({
+              code: 'block-incentive-fields',
+              message: 'block read an incentive field of a round without incentives',
+              hits: [new tt.SimulateProtocolNoteHit({ group: 0, path: [0] })],
+            }),
+          ],
+        })
+      : undefined
     const response = request.rounds?.length
       ? new tt.DTSimulateResponse({
           lastRound: 0,
           version: 2,
           txnGroups: [],
-          roundResults: request.rounds.map((r) => new tt.SimulateRoundResult({ lastRound: r, txnGroups: groups(r) })),
+          evalOverrides,
+          roundResults: request.rounds.map((r) =>
+            roundError?.(r, request)
+              ? new tt.SimulateRoundResult({ lastRound: r, txnGroups: [], error: roundError(r, request) })
+              : new tt.SimulateRoundResult({ lastRound: r, txnGroups: groups(r), protocolOverride }),
+          ),
         })
-      : new modelsv2.SimulateResponse({
-          lastRound: request.round ?? LAST_ROUND,
-          version: 2,
-          txnGroups: groups(BigInt(request.round ?? LAST_ROUND)),
-        })
+      : protocolOverride
+        ? new tt.DTSimulateResponse({
+            lastRound: request.round ?? LAST_ROUND,
+            version: 2,
+            txnGroups: groups(BigInt(request.round ?? LAST_ROUND)),
+            protocolOverride,
+          })
+        : new modelsv2.SimulateResponse({
+            lastRound: request.round ?? LAST_ROUND,
+            version: 2,
+            txnGroups: groups(BigInt(request.round ?? LAST_ROUND)),
+          })
     return { status: 200, body: algosdk.encodeMsgpack(response as algosdk.Encodable) }
   }
 
@@ -426,12 +481,16 @@ describe('time travel', () => {
     })
 
     test('groups: parallel groups beyond maxGroups are split across requests; sequential ones throw', async () => {
-      stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      stub
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('get', '/v2/status', nodeStatus)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
       const outcomes = await algorand.simulate.groups([payment(1), payment(2), payment(3)], { parallel: true, maxGroups: 2 })
       const requests = stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
-      expect(requests.map((r) => [r.txnGroups.length, r.parallelGroups])).toEqual([
-        [2, true],
-        [1, true],
+      // Both requests at the same round, the latest when they were sent
+      expect(requests.map((r) => [r.txnGroups.length, r.parallelGroups, r.round])).toEqual([
+        [2, true, BigInt(LAST_ROUND)],
+        [1, true, BigInt(LAST_ROUND)],
       ])
       expect(outcomes.map((o) => [o.groupIndex, o.ok])).toEqual([
         [0, true],
@@ -484,6 +543,175 @@ describe('time travel', () => {
         [1500n, 1001n],
         [5001n, 5001n],
       ])
+    })
+
+    test('rounds with a validity window mode: packs rounds far apart into one request, with a valid window', async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const outcomes = await algorand.simulate.rounds(payment(1), [20_000_000n, 1000n, 45_000_000n], { validityWindow: 'rewrite' })
+      const requests = stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toMatchObject({
+        rounds: [1000n, 20_000_000n, 45_000_000n],
+        rewriteValidityWindow: true,
+        allowEmptySignatures: true,
+      })
+      expect(requests[0].skipValidityWindow).toBeFalsy()
+      const { firstValid, lastValid } = requests[0].txnGroups[0].txns[0].txn
+      expect([firstValid, lastValid]).toEqual([1001n, 2001n])
+      expect(outcomes.map((o) => [o.round, o.groups[0].ok])).toEqual([
+        [20_000_000n, true],
+        [1000n, true],
+        [45_000_000n, true],
+      ])
+
+      const before = stub.calls.length
+      await algorand.simulate.rounds(payment(1), [1000n, 45_000_000n], { validityWindow: 'skip' })
+      const skipped = stub.calls
+        .slice(before)
+        .filter((c) => c.method === 'post')
+        .map(sentSimulate)
+      expect(skipped).toHaveLength(1)
+      expect(skipped[0]).toMatchObject({ rounds: [1000n, 45_000_000n], skipValidityWindow: true })
+      expect(skipped[0].rewriteValidityWindow).toBeFalsy()
+      const txn = skipped[0].txnGroups[0].txns[0].txn
+      expect([txn.firstValid, txn.lastValid]).toEqual([1001n, 2001n])
+
+      await expect(algorand.simulate.rounds(payment(1), [1000n], { validityWindow: 'rewrites' as 'rewrite' })).rejects.toThrow(
+        /must be 'skip' or 'rewrite'/,
+      )
+    })
+
+    test('rounds without a validity window mode still pack within 1,000 rounds', async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      await algorand.simulate.rounds(payment(1), [1000n, 45_000_000n])
+      const requests = stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
+      expect(requests.map((r) => [r.rounds, r.skipValidityWindow, r.rewriteValidityWindow])).toEqual([
+        [[1000n], undefined, undefined],
+        [[45_000_000n], undefined, undefined],
+      ])
+    })
+
+    test('a validity window mode is refused without rounds', async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams)
+      await expect(
+        algorand.simulate.groups([payment(1)], { validityWindow: 'skip' } as Parameters<typeof algorand.simulate.groups>[1]),
+      ).rejects.toThrow(/requires rounds/)
+    })
+
+    test('protocol: groups get the protocol override of the request', async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams).on('post', '/v2/transactions/simulate', echoSimulate())
+      const outcomes = await algorand.simulate.groups([payment(1), payment(2)], { protocol: 'latest' })
+      expect(sentSimulate(stub.calls.at(-1)!).protocol).toBe('latest')
+      expect(outcomes[0].protocolOverride).toMatchObject({ from: 'v38', to: 'v42', applied: true })
+      expect(outcomes[1].protocolOverride).toBe(outcomes[0].protocolOverride)
+      expect(outcomes[0].protocolOverride?.notes?.map((n) => [n.code, n.hits])).toEqual([
+        ['semantics-changed', undefined],
+        ['block-incentive-fields', [{ group: 0, path: [0] }]],
+      ])
+    })
+
+    test('protocol: parallel groups split across requests get merged notes with group indexes in input order', async () => {
+      stub
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('get', '/v2/status', nodeStatus)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const outcomes = await algorand.simulate.groups([payment(1), payment(2), payment(3)], {
+        parallel: true,
+        maxGroups: 2,
+        protocol: 'v42',
+      })
+      expect(stub.calls.filter((c) => c.method === 'post')).toHaveLength(2)
+      const notes = outcomes[2].protocolOverride?.notes
+      expect(notes?.map((n) => [n.code, n.hits])).toEqual([
+        ['semantics-changed', undefined],
+        [
+          'block-incentive-fields',
+          [
+            { group: 0, path: [0] },
+            { group: 2, path: [0] },
+          ],
+        ],
+      ])
+    })
+
+    test('protocol: rounds get the protocol override of each round, none for a failed round', async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on(
+        'post',
+        '/v2/transactions/simulate',
+        echoSimulate(undefined, undefined, (r) => (r === 1500n ? 'protocol v42 is not a later protocol' : undefined)),
+        true,
+      )
+      const outcomes = await algorand.simulate.rounds(payment(1), [1000n, 1500n], { protocol: 'v42' })
+      expect(outcomes[0].protocolOverride).toMatchObject({ to: 'v42', applied: true })
+      expect(outcomes[0].groups[0].protocolOverride).toBe(outcomes[0].protocolOverride)
+      expect(outcomes[1].protocolOverride).toBeUndefined()
+      expect(outcomes[1].groups[0]).toMatchObject({ ok: false, error: { kind: 'round' } })
+    })
+
+    test('protocol and validity window modes need a fork version with those features', async () => {
+      const DT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
+      const features = DT.features
+      Object.defineProperty(DT, 'features', {
+        value: features.filter((f) => f !== 'validity-window' && f !== 'simulate-protocol'),
+        configurable: true,
+        writable: true,
+      })
+      try {
+        stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+        await expect(algorand.simulate.groups([payment(1)], { protocol: 'v42' })).rejects.toThrow(/simulate-protocol/)
+        await expect(algorand.simulate.rounds(payment(1), [1000n], { validityWindow: 'skip' })).rejects.toThrow(DTNotAvailableError)
+        expect(await algorand.simulate.groups([payment(1)])).toHaveLength(1)
+      } finally {
+        Object.defineProperty(DT, 'features', { value: features, configurable: true, writable: true })
+      }
+    })
+
+    test('protocol: rounds in several windows with parallel groups split across requests', async () => {
+      // Group 2 is alone in the second request, which fails at round 1500
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on(
+        'post',
+        '/v2/transactions/simulate',
+        echoSimulate(undefined, undefined, (r, request) =>
+          r === 1500n && request.txnGroups.length === 1 ? 'not a later protocol' : undefined,
+        ),
+        true,
+      )
+      const outcomes = await algorand.simulate.rounds([payment(1), payment(2), payment(3)], [5000n, 1000n, 1500n], {
+        parallel: true,
+        maxGroups: 2,
+        protocol: 'v42',
+      })
+      const requests = stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
+      expect(requests).toHaveLength(4)
+      expect(requests.map((r) => [r.rounds, r.txnGroups.length])).toEqual(
+        expect.arrayContaining([
+          [[1000n, 1500n], 2],
+          [[1000n, 1500n], 1],
+          [[5000n], 2],
+          [[5000n], 1],
+        ]),
+      )
+      expect(outcomes.map((o) => o.round)).toEqual([5000n, 1000n, 1500n])
+      for (const o of [outcomes[0], outcomes[1]]) {
+        expect(o.protocolOverride?.notes?.[1].hits).toEqual([
+          { group: 0, path: [0] },
+          { group: 2, path: [0] },
+        ])
+        expect(o.groups.map((g) => [g.ok, g.protocolOverride === o.protocolOverride])).toEqual([
+          [true, true],
+          [true, true],
+          [true, true],
+        ])
+      }
+      // At 1500 only the first request has an override: the round's has its notes, the failed group none
+      const failed = outcomes[2]
+      expect(failed.protocolOverride?.notes?.[1].hits).toEqual([{ group: 0, path: [0] }])
+      expect(failed.groups.map((g) => [g.ok, g.protocolOverride !== undefined])).toEqual([
+        [true, true],
+        [true, true],
+        [false, false],
+      ])
+      expect(failed.groups[2]).toMatchObject({ ok: false, error: { kind: 'round' } })
     })
   })
 })
