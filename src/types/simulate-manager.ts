@@ -3,7 +3,7 @@ import { Buffer } from 'buffer'
 import { getABIReturnValue } from '../transaction/transaction'
 import { ClientManager } from './client-manager'
 import { BuiltTransactions, RawSimulateOptions, TransactionComposer } from './composer'
-import { RawSimulateGroupOutcome, Round, TimeTravelSimulateResponseLike, requireTimeTravelSdk } from './time-travel-support'
+import { RawSimulateGroupOutcome, Round, DTSimulateResponseLike, requireDTSdk } from './dt-support'
 import { SendAtomicTransactionComposerResults } from './transaction'
 import modelsv2 = algosdk.modelsv2
 
@@ -131,8 +131,8 @@ function toOutcome(
  * parallel), and the same groups at several rounds in one request.
  *
  * The groups are simulated without signatures (like `simulate({ skipSignatures: true })`), so this is for reads and
- * dry runs. Needs the time-travel fork of algosdk (without it, every method throws a `TimeTravelNotAvailableError`)
- * and dtalgod (a stock node throws the fork's `TimeTravelUnsupportedError`).
+ * dry runs. Needs the time-travel fork of algosdk (without it, every method throws a `DTNotAvailableError`)
+ * and dtalgod (a stock node throws the fork's `DTUnsupportedError`).
  */
 export class SimulateManager {
   private _clientManager: ClientManager
@@ -197,7 +197,7 @@ export class SimulateManager {
     const { maxRounds = DEFAULT_MAX_SIMULATE_ROUNDS, ...rest } = options ?? {}
     const groups = Array.isArray(composers) ? composers : [composers]
     if (rounds.length === 0) return []
-    const tt = requireTimeTravelSdk('Simulating at several rounds')
+    const tt = requireDTSdk('Simulating at several rounds')
     const { windows, positions } = tt.packSimulateRounds(rounds, { maxRounds })
 
     // Build one after the other (a composer can only build one validity window at a time), then send in parallel
@@ -235,7 +235,7 @@ export class SimulateManager {
     options: ExtendedSimulateOptions,
     at: { round?: Round; rounds?: bigint[] },
   ): Promise<{ groups: SimulateGroupOutcome[] }[]> {
-    const tt = requireTimeTravelSdk('Simulating several groups')
+    const tt = requireDTSdk('Simulating several groups')
     const { parallel = false, maxGroups = DEFAULT_MAX_SIMULATE_GROUPS, ...raw } = options
     if (!parallel && built.length > maxGroups) {
       throw new Error(
@@ -243,11 +243,11 @@ export class SimulateManager {
       )
     }
     const chunks = parallel ? chunk(built, maxGroups) : [built]
-    const algod = this._clientManager.timeTravelAlgod
+    const algod = this._clientManager.dtAlgod
 
     const responses = await Promise.all(
       chunks.map(async (groups) => {
-        const request = tt.timeTravelModels.TimeTravelSimulateRequest.fromTransactions(
+        const request = tt.dtModels.DTSimulateRequest.fromTransactions(
           groups.map((g) => g.transactions),
           { ...raw, allowEmptySignatures: true, fixSigners: true, parallelGroups: parallel || undefined, round: at.round || undefined },
         )
@@ -260,7 +260,7 @@ export class SimulateManager {
     const roundCount = at.rounds ? at.rounds.length : 1
     return Array.from({ length: roundCount }, (_, roundIndex) => ({
       groups: chunks.flatMap((groups, c) => {
-        const response: TimeTravelSimulateResponseLike = responses[c]
+        const response: DTSimulateResponseLike = responses[c]
         const row = response.groupResults(groups.length)[roundIndex]
         const offset = chunks.slice(0, c).reduce((n, g) => n + g.length, 0)
         return row.map((raw, g) => toOutcome(raw, offset + g, groups[g], response))

@@ -7,7 +7,7 @@ import { ClientManager } from './client-manager'
 import { CommonTransactionParams, TransactionComposer } from './composer'
 import { TestNetDispenserApiClient } from './dispenser-client'
 import { KmdAccountManager } from './kmd-account-manager'
-import { AtRoundOptions, timeTravelAlgodForRead } from './time-travel-support'
+import { AtRoundOptions, dtAlgodForRead } from './dt-support'
 import { SendParams, SendSingleTransactionResult } from './transaction'
 import LogicSigAccount = algosdk.LogicSigAccount
 import Account = algosdk.Account
@@ -246,7 +246,7 @@ export class AccountManager {
       round === undefined
         ? await this._clientManager.algod.accountInformation(sender).do()
         : await (
-            await timeTravelAlgodForRead(this._clientManager.algod, 'Reading account information', round, false)
+            await dtAlgodForRead(this._clientManager.algod, 'Reading account information', round, false)
           )
             .accountInformation(sender)
             .round(round)

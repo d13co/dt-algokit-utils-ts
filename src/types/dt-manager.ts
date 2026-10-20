@@ -14,10 +14,10 @@ import {
   RawBoxesVersion,
   RawBoxVersion,
   Round,
-  TimeTravelAlgodLike,
+  DTAlgodLike,
   VersionsOrder,
   VersionsRequestLike,
-} from './time-travel-support'
+} from './dt-support'
 
 /** Options for a `/versions` listing. */
 export interface VersionsOptions {
@@ -227,13 +227,13 @@ type AnyVersionsRequest<E> = VersionsRequestLike<E, { round: bigint; versions: E
  * Time travel on a time-travel algod (dtalgod with `EnableTimeTravel`): the rounds at which boxes, apps, assets and
  * accounts changed, with their values.
  *
- * Needs the time-travel fork of algosdk; without it every method throws a `TimeTravelNotAvailableError`. A node without
- * time travel throws the fork's `TimeTravelUnsupportedError`.
+ * Needs the time-travel fork of algosdk; without it every method throws a `DTNotAvailableError`. A node without
+ * time travel throws the fork's `DTUnsupportedError`.
  *
  * To read state at a past round, pass `{ round }` to the usual reads (`algorand.app.getGlobalState(appId, { round })`,
  * `algorand.account.getInformation(address, { round })`, ...) or use `appClient.atRound(round)`.
  */
-export class TimeTravelManager {
+export class DTManager {
   private _clientManager: ClientManager
 
   /**
@@ -244,8 +244,8 @@ export class TimeTravelManager {
     this._clientManager = clientManager
   }
 
-  private get algod(): TimeTravelAlgodLike {
-    return this._clientManager.timeTravelAlgod
+  private get algod(): DTAlgodLike {
+    return this._clientManager.dtAlgod
   }
 
   /**
@@ -254,11 +254,11 @@ export class TimeTravelManager {
    * @returns Whether time travel is supported
    * @example
    * ```typescript
-   * if (await algorand.timeTravel.supported()) { ... }
+   * if (await algorand.dt.supported()) { ... }
    * ```
    */
   public async supported(): Promise<boolean> {
-    return await this._clientManager.supportsTimeTravel()
+    return await this._clientManager.supportsDT()
   }
 
   /**
@@ -269,7 +269,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getBoxVersions(appId, 'counter', { order: 'desc', limit: 10, includeValues: true })
+   * const { versions } = await algorand.dt.getBoxVersions(appId, 'counter', { order: 'desc', limit: 10, includeValues: true })
    * ```
    */
   public async getBoxVersions(
@@ -288,7 +288,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const v of algorand.timeTravel.iterateBoxVersions(appId, 'counter', { includeValues: true })) { ... }
+   * for await (const v of algorand.dt.iterateBoxVersions(appId, 'counter', { includeValues: true })) { ... }
    * ```
    */
   public iterateBoxVersions(appId: bigint, name: BoxIdentifier | BoxName, options?: VersionsOptions): AsyncGenerator<BoxVersion> {
@@ -303,7 +303,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getBoxesVersions(appId, { minRound: 45_000_000n })
+   * const { versions } = await algorand.dt.getBoxesVersions(appId, { minRound: 45_000_000n })
    * ```
    */
   public async getBoxesVersions(appId: bigint, options?: VersionsPageOptions): Promise<VersionsPage<BoxesVersion>> {
@@ -317,7 +317,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const { round, boxes } of algorand.timeTravel.iterateBoxesVersions(appId)) { ... }
+   * for await (const { round, boxes } of algorand.dt.iterateBoxesVersions(appId)) { ... }
    * ```
    */
   public iterateBoxesVersions(appId: bigint, options?: VersionsOptions): AsyncGenerator<BoxesVersion> {
@@ -331,7 +331,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getAppVersions(appId, { includeValues: true })
+   * const { versions } = await algorand.dt.getAppVersions(appId, { includeValues: true })
    * const counters = versions.map((v) => v.app?.globalState.counter?.value)
    * ```
    */
@@ -346,7 +346,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const v of algorand.timeTravel.iterateAppVersions(appId, { includeValues: true })) { ... }
+   * for await (const v of algorand.dt.iterateAppVersions(appId, { includeValues: true })) { ... }
    * ```
    */
   public iterateAppVersions(appId: bigint, options?: VersionsOptions): AsyncGenerator<AppVersion> {
@@ -360,7 +360,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getAssetVersions(assetId, { includeValues: true })
+   * const { versions } = await algorand.dt.getAssetVersions(assetId, { includeValues: true })
    * ```
    */
   public async getAssetVersions(assetId: bigint, options?: VersionsPageOptions): Promise<VersionsPage<AssetVersion>> {
@@ -374,7 +374,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const v of algorand.timeTravel.iterateAssetVersions(assetId)) { ... }
+   * for await (const v of algorand.dt.iterateAssetVersions(assetId)) { ... }
    * ```
    */
   public iterateAssetVersions(assetId: bigint, options?: VersionsOptions): AsyncGenerator<AssetVersion> {
@@ -388,7 +388,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getAccountVersions(address, { exclude: ['all'], includeValues: true })
+   * const { versions } = await algorand.dt.getAccountVersions(address, { exclude: ['all'], includeValues: true })
    * const balances = versions.map((v) => v.base?.account?.balance)
    * ```
    */
@@ -406,7 +406,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const v of algorand.timeTravel.iterateAccountVersions(address, { exclude: ['all'] })) { ... }
+   * for await (const v of algorand.dt.iterateAccountVersions(address, { exclude: ['all'] })) { ... }
    * ```
    */
   public iterateAccountVersions(
@@ -424,7 +424,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getAccountAssetVersions(address, assetId, { includeValues: true })
+   * const { versions } = await algorand.dt.getAccountAssetVersions(address, assetId, { includeValues: true })
    * ```
    */
   public async getAccountAssetVersions(
@@ -443,7 +443,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const v of algorand.timeTravel.iterateAccountAssetVersions(address, assetId)) { ... }
+   * for await (const v of algorand.dt.iterateAccountAssetVersions(address, assetId)) { ... }
    * ```
    */
   public iterateAccountAssetVersions(
@@ -462,7 +462,7 @@ export class TimeTravelManager {
    * @returns The page of versions
    * @example
    * ```typescript
-   * const { versions } = await algorand.timeTravel.getAccountAppVersions(address, appId, { includeValues: true })
+   * const { versions } = await algorand.dt.getAccountAppVersions(address, appId, { includeValues: true })
    * ```
    */
   public async getAccountAppVersions(
@@ -481,7 +481,7 @@ export class TimeTravelManager {
    * @returns The versions
    * @example
    * ```typescript
-   * for await (const v of algorand.timeTravel.iterateAccountAppVersions(address, appId)) { ... }
+   * for await (const v of algorand.dt.iterateAccountAppVersions(address, appId)) { ... }
    * ```
    */
   public iterateAccountAppVersions(address: string | Address, appId: bigint, options?: VersionsOptions): AsyncGenerator<AccountVersion> {

@@ -10,13 +10,13 @@ Note: If you prefer Python there's an equivalent [Python utility library](https:
 
 ## dtalgod fork
 
-This fork adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel (state at any past round, and the rounds at which objects changed) and extended simulate (several transaction groups and several rounds per request). It is additive: existing APIs, types and generated typed clients work unchanged, and it runs on stock algosdk, where the new features throw a `TimeTravelNotAvailableError`.
+This fork adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel (state at any past round, and the rounds at which objects changed) and extended simulate (several transaction groups and several rounds per request). It is additive: existing APIs, types and generated typed clients work unchanged, and it runs on stock algosdk, where the new features throw a `DTNotAvailableError`.
 
-The new features need the time-travel fork of algosdk (`algosdk@3.8.0-timetravel.1`, with `TimeTravelAlgodClient`). algokit-utils and your code must load the same copy of algosdk, so replace `algosdk` everywhere with a package-manager override, e.g. with pnpm:
+The new features need the time-travel fork of algosdk (`algosdk@3.8.0-dt.1`, with `DTAlgodClient`). algokit-utils and your code must load the same copy of algosdk, so replace `algosdk` everywhere with a package-manager override, e.g. with pnpm:
 
 ```yaml
 overrides:
-  algosdk: file:./vendor/algosdk-3.8.0-timetravel.1.tgz
+  algosdk: file:./vendor/algosdk-3.8.0-dt.1.tgz
 ```
 
 `pnpm why algosdk` should then list only the fork.
@@ -32,7 +32,7 @@ const globalState = await algorand.app.getGlobalState(appId, { round: 45_000_000
 const box = await algorand.app.getBoxValue(appId, 'config', { round: 45_000_000n })
 ```
 
-The same option is on `getById`, `getLocalState`, `getBoxNames`, `getBoxValues`, `getBoxValue(s)FromABIType` and the `AppClient` state methods. A node that can't serve the round throws (`isTimeTravelUnsupportedError(e)`) rather than returning the latest state.
+The same option is on `getById`, `getLocalState`, `getBoxNames`, `getBoxValues`, `getBoxValue(s)FromABIType` and the `AppClient` state methods. A node that can't serve the round throws (`isDTUnsupportedError(e)`) rather than returning the latest state.
 
 An `AppClient` pinned to a round reads state and simulates readonly ABI calls at that round, and can't send transactions. Generated typed clients take an `AppClient`, so they can be pinned too:
 
@@ -49,24 +49,24 @@ await typedPast.state.global.counter()
 
 ### Versions: when objects changed
 
-`algorand.timeTravel` lists the rounds at which a box, all of an app's boxes, an app, an asset or an account changed, optionally with the values, a page at a time (`get…Versions`) or as an async iterator (`iterate…Versions`):
+`algorand.dt` lists the rounds at which a box, all of an app's boxes, an app, an asset or an account changed, optionally with the values, a page at a time (`get…Versions`) or as an async iterator (`iterate…Versions`):
 
 ```typescript
-const { versions, nextToken } = await algorand.timeTravel.getBoxVersions(appId, 'counter', {
+const { versions, nextToken } = await algorand.dt.getBoxVersions(appId, 'counter', {
   order: 'desc',
   limit: 10,
   includeValues: true,
 })
 
-for await (const { round, boxes } of algorand.timeTravel.iterateBoxesVersions(appId, { minRound: 45_000_000n })) {
+for await (const { round, boxes } of algorand.dt.iterateBoxesVersions(appId, { minRound: 45_000_000n })) {
   // the boxes that changed in each round
 }
 
-const { versions: appVersions } = await algorand.timeTravel.getAppVersions(appId, { includeValues: true })
+const { versions: appVersions } = await algorand.dt.getAppVersions(appId, { includeValues: true })
 appVersions.map((v) => v.app?.globalState)
 ```
 
-Also `getAssetVersions`, `getAccountVersions` (with `exclude`), `getAccountAssetVersions` and `getAccountAppVersions`. `algorand.timeTravel.supported()` tells whether the node has time travel.
+Also `getAssetVersions`, `getAccountVersions` (with `exclude`), `getAccountAssetVersions` and `getAccountAppVersions`. `algorand.dt.supported()` tells whether the node has time travel.
 
 ### Extended simulate
 
@@ -91,7 +91,7 @@ Each outcome is `{ ok: true, result }`, with the same result shape as `composer.
 
 ### Tests
 
-`src/types/time-travel.spec.ts` runs offline against a stub algod. `src/types/time-travel.live.spec.ts` runs against a MainNet dtalgod: `DT_ALGOD_SERVER=http://host:port npx vitest run src/types/time-travel.live.spec.ts`.
+`src/types/dt.spec.ts` runs offline against a stub algod. `src/types/dt.live.spec.ts` runs against a MainNet dtalgod: `DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts`.
 
 ## Install
 

@@ -4,14 +4,14 @@ import modelsv2 = algosdk.modelsv2
 /**
  * Runtime support for dtalgod (a time-travel algod) through the time-travel fork of algosdk.
  *
- * algokit-utils keeps working with stock algosdk: the fork's `TimeTravelAlgodClient` is looked up at runtime, and
- * the features that need it throw a {@link TimeTravelNotAvailableError} when it isn't there. The types below describe
+ * algokit-utils keeps working with stock algosdk: the fork's `DTAlgodClient` is looked up at runtime, and
+ * the features that need it throw a {@link DTNotAvailableError} when it isn't there. The types below describe
  * the parts of the fork that algokit-utils uses, in terms of stock algosdk types, so that the published declarations
  * never reference the fork.
  */
 
-/** The `TimeTravelAlgodClient.features` that algokit-utils needs. */
-export const REQUIRED_TIME_TRAVEL_FEATURES = Object.freeze([
+/** The `DTAlgodClient.features` that algokit-utils needs. */
+export const REQUIRED_DT_FEATURES = Object.freeze([
   'reads-at-round',
   'versions',
   'simulate-groups',
@@ -23,13 +23,13 @@ export const REQUIRED_TIME_TRAVEL_FEATURES = Object.freeze([
 ] as const)
 
 /** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork. */
-export class TimeTravelNotAvailableError extends Error {
+export class DTNotAvailableError extends Error {
   constructor(feature: string) {
     super(
-      `${feature} needs the time-travel fork of algosdk (with TimeTravelAlgodClient features ${REQUIRED_TIME_TRAVEL_FEATURES.join(', ')}), ` +
+      `${feature} needs the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
         'but the loaded algosdk does not have it. Install the fork and make sure the app loads a single copy of algosdk.',
     )
-    this.name = 'TimeTravelNotAvailableError'
+    this.name = 'DTNotAvailableError'
   }
 }
 
@@ -151,22 +151,22 @@ export type RawSimulateGroupOutcome = {
 )
 
 /** The response of an extended simulate request. */
-export interface TimeTravelSimulateResponseLike extends modelsv2.SimulateResponse {
+export interface DTSimulateResponseLike extends modelsv2.SimulateResponse {
   roundResults?: { lastRound: bigint; txnGroups: modelsv2.SimulateTransactionGroupResult[]; error?: string }[]
   groupResult(groupIndex: number, roundIndex?: number): RawSimulateGroupOutcome
   groupResults(groupCount?: number): RawSimulateGroupOutcome[][]
 }
 
 /** An extended simulate request. */
-export interface TimeTravelSimulateRequestLike {
+export interface DTSimulateRequestLike {
   parallelGroups(parallelGroups?: boolean): this
   rounds(rounds: Round[]): this
-  do(): Promise<TimeTravelSimulateResponseLike>
+  do(): Promise<DTSimulateResponseLike>
 }
 
-/** The parts of the fork's `TimeTravelAlgodClient` that algokit-utils uses. */
-export interface TimeTravelAlgodLike {
-  supportsTimeTravel(): Promise<boolean>
+/** The parts of the fork's `DTAlgodClient` that algokit-utils uses. */
+export interface DTAlgodLike {
+  supportsDT(): Promise<boolean>
   accountInformation(account: string | algosdk.Address): RoundRequestLike<modelsv2.Account> & { exclude(exclude: string): unknown }
   accountAssetInformation(account: string | algosdk.Address, assetId: Round): RoundRequestLike<modelsv2.AccountAssetResponse>
   accountApplicationInformation(account: string | algosdk.Address, appId: Round): RoundRequestLike<modelsv2.AccountApplicationResponse>
@@ -189,7 +189,7 @@ export interface TimeTravelAlgodLike {
     account: string | algosdk.Address,
     appId: Round,
   ): VersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
-  simulateTransactions(request: modelsv2.SimulateRequest): TimeTravelSimulateRequestLike
+  simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
 }
 
 /** A window of rounds that one extended simulate request covers, from `packSimulateRounds`. */
@@ -199,20 +199,20 @@ export interface SimulateRoundsWindowLike {
   lastValid: bigint
 }
 
-interface TimeTravelAlgodClass {
+interface DTAlgodClass {
   features?: readonly string[]
-  from(algod: algosdk.Algodv2): TimeTravelAlgodLike
+  from(algod: algosdk.Algodv2): DTAlgodLike
 }
 
-interface TimeTravelSdk {
-  TimeTravelAlgodClient: TimeTravelAlgodClass
-  TimeTravelUnsupportedError: new (message: string, fields?: { requestedRound?: bigint; returnedRound?: bigint; cause?: unknown }) => Error
+interface DTSdk {
+  DTAlgodClient: DTAlgodClass
+  DTUnsupportedError: new (message: string, fields?: { requestedRound?: bigint; returnedRound?: bigint; cause?: unknown }) => Error
   packSimulateRounds(
     rounds: Round[],
     options?: { maxRounds?: number; maxSpan?: number },
   ): { windows: SimulateRoundsWindowLike[]; positions: { window: number; roundIndex: number }[] }
-  timeTravelModels: {
-    TimeTravelSimulateRequest: {
+  dtModels: {
+    DTSimulateRequest: {
       fromTransactions(
         groups: algosdk.Transaction[][],
         fields?: Omit<ConstructorParameters<typeof modelsv2.SimulateRequest>[0], 'txnGroups'> & {
@@ -224,20 +224,20 @@ interface TimeTravelSdk {
   }
 }
 
-const sdk = algosdk as unknown as Partial<TimeTravelSdk>
+const sdk = algosdk as unknown as Partial<DTSdk>
 
 /** Returns the parts of the time-travel fork of algosdk that algokit-utils uses, or `undefined` with stock algosdk. */
-export function getTimeTravelSdk(): TimeTravelSdk | undefined {
-  const features = sdk.TimeTravelAlgodClient?.features
-  if (!features || !REQUIRED_TIME_TRAVEL_FEATURES.every((f) => features.includes(f))) return undefined
-  if (!sdk.packSimulateRounds || !sdk.timeTravelModels?.TimeTravelSimulateRequest?.fromTransactions) return undefined
-  return sdk as TimeTravelSdk
+export function getDTSdk(): DTSdk | undefined {
+  const features = sdk.DTAlgodClient?.features
+  if (!features || !REQUIRED_DT_FEATURES.every((f) => features.includes(f))) return undefined
+  if (!sdk.packSimulateRounds || !sdk.dtModels?.DTSimulateRequest?.fromTransactions) return undefined
+  return sdk as DTSdk
 }
 
-/** Returns the parts of the time-travel fork of algosdk that algokit-utils uses, or throws a {@link TimeTravelNotAvailableError}. */
-export function requireTimeTravelSdk(feature: string): TimeTravelSdk {
-  const tt = getTimeTravelSdk()
-  if (!tt) throw new TimeTravelNotAvailableError(feature)
+/** Returns the parts of the time-travel fork of algosdk that algokit-utils uses, or throws a {@link DTNotAvailableError}. */
+export function requireDTSdk(feature: string): DTSdk {
+  const tt = getDTSdk()
+  if (!tt) throw new DTNotAvailableError(feature)
   return tt
 }
 
@@ -247,19 +247,19 @@ export function requireTimeTravelSdk(feature: string): TimeTravelSdk {
  *
  * @param algod The algod client to share the connection of
  * @param feature The feature that needs the client, for the error message
- * @throws TimeTravelNotAvailableError if the loaded algosdk is not the time-travel fork
+ * @throws DTNotAvailableError if the loaded algosdk is not the time-travel fork
  */
-export function toTimeTravelAlgod(algod: algosdk.Algodv2, feature = 'This feature'): TimeTravelAlgodLike {
-  return requireTimeTravelSdk(feature).TimeTravelAlgodClient.from(algod)
+export function toDTAlgod(algod: algosdk.Algodv2, feature = 'This feature'): DTAlgodLike {
+  return requireDTSdk(feature).DTAlgodClient.from(algod)
 }
 
 /**
- * Returns whether an error is the fork's `TimeTravelUnsupportedError`: the node answered without time travel, or for a
+ * Returns whether an error is the fork's `DTUnsupportedError`: the node answered without time travel, or for a
  * different round than the one asked for.
  */
-export function isTimeTravelUnsupportedError(error: unknown): boolean {
-  const ctor = sdk.TimeTravelUnsupportedError
-  return (ctor !== undefined && error instanceof ctor) || (error instanceof Error && error.name === 'TimeTravelUnsupportedError')
+export function isDTUnsupportedError(error: unknown): boolean {
+  const ctor = sdk.DTUnsupportedError
+  return (ctor !== undefined && error instanceof ctor) || (error instanceof Error && error.name === 'DTUnsupportedError')
 }
 
 /**
@@ -267,16 +267,11 @@ export function isTimeTravelUnsupportedError(error: unknown): boolean {
  * when `checkSupport` is set. Use `checkSupport` for reads whose response has no round to check, such as asset and
  * application lookups, so that a stock node can't silently answer with the latest state.
  */
-export async function timeTravelAlgodForRead(
-  algod: algosdk.Algodv2,
-  feature: string,
-  round: Round,
-  checkSupport: boolean,
-): Promise<TimeTravelAlgodLike> {
-  const tt = requireTimeTravelSdk(feature)
-  const client = tt.TimeTravelAlgodClient.from(algod)
-  if (checkSupport && !(await client.supportsTimeTravel())) {
-    throw new tt.TimeTravelUnsupportedError(
+export async function dtAlgodForRead(algod: algosdk.Algodv2, feature: string, round: Round, checkSupport: boolean): Promise<DTAlgodLike> {
+  const tt = requireDTSdk(feature)
+  const client = tt.DTAlgodClient.from(algod)
+  if (checkSupport && !(await client.supportsDT())) {
+    throw new tt.DTUnsupportedError(
       `${feature} at round ${round} needs a time-travel algod (EnableTimeTravel), but the node does not support it`,
       { requestedRound: BigInt(round) },
     )

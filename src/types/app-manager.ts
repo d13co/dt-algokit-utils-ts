@@ -10,7 +10,7 @@ import {
   type CompiledTeal,
   type TealTemplateParams,
 } from './app'
-import { AtRoundOptions, timeTravelAlgodForRead } from './time-travel-support'
+import { AtRoundOptions, dtAlgodForRead } from './dt-support'
 import modelsv2 = algosdk.modelsv2
 
 /** Information about an app. */
@@ -250,7 +250,7 @@ export class AppManager {
     const app =
       round === undefined
         ? await this._algod.getApplicationByID(Number(appId)).do()
-        : await (await timeTravelAlgodForRead(this._algod, 'Reading an app', round, true)).getApplicationByID(appId).round(round).do()
+        : await (await dtAlgodForRead(this._algod, 'Reading an app', round, true)).getApplicationByID(appId).round(round).do()
     return AppManager.appInformationFromAlgod(app)
   }
 
@@ -310,7 +310,7 @@ export class AppManager {
       round === undefined
         ? await this._algod.accountApplicationInformation(address, appId).do()
         : await (
-            await timeTravelAlgodForRead(this._algod, 'Reading local state', round, false)
+            await dtAlgodForRead(this._algod, 'Reading local state', round, false)
           )
             .accountApplicationInformation(address, appId)
             .round(round)
@@ -340,7 +340,7 @@ export class AppManager {
       boxes = (await this._algod.getApplicationBoxes(appId).do()).boxes
     } else {
       // Listing a past round can come in pages; the pages of one round fit together because past rounds never change
-      const tt = await timeTravelAlgodForRead(this._algod, 'Listing boxes', round, false)
+      const tt = await dtAlgodForRead(this._algod, 'Listing boxes', round, false)
       boxes = []
       let next: string | undefined = undefined
       do {
@@ -377,7 +377,7 @@ export class AppManager {
       round === undefined
         ? await this._algod.getApplicationBoxByName(Number(appId), name).do()
         : await (
-            await timeTravelAlgodForRead(this._algod, 'Reading a box', round, false)
+            await dtAlgodForRead(this._algod, 'Reading a box', round, false)
           )
             .getApplicationBoxByName(appId, name)
             .round(round)

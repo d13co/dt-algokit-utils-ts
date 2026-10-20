@@ -1,6 +1,6 @@
 {
   "name": "@algorandfoundation/algokit-utils",
-  "version": "9.2.3-timetravel.1",
+  "version": "9.2.3-dt.1",
   "private": false,
   "description": "A set of core Algorand utilities written in TypeScript and released via npm that make it easier to build solutions on Algorand.",
   "author": "Algorand Foundation",
@@ -85,7 +85,7 @@
     "@types/uuid": "^10.0.0",
     "@typescript-eslint/eslint-plugin": "^8.8.1",
     "@vitest/coverage-v8": "^4.1.11",
-    "algosdk": "file:vendor/algosdk-3.8.0-timetravel.1.tgz",
+    "algosdk": "file:vendor/algosdk-3.8.0-dt.1.tgz",
     "better-npm-audit": "^3.11.0",
     "conventional-changelog-conventionalcommits": "8.0.0",
     "cpy-cli": "^5.0.0",

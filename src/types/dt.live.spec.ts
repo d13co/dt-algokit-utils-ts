@@ -6,7 +6,7 @@ import { AppClient } from './app-client'
 
 // Live checks against a MainNet time-travel algod (dtalgod with EnableTimeTravel). Skipped unless DT_ALGOD_SERVER is set:
 //
-//   DT_ALGOD_SERVER=http://10.114.0.27:4000 npx vitest run src/types/time-travel.live.spec.ts
+//   DT_ALGOD_SERVER=http://10.114.0.27:4000 npx vitest run src/types/dt.live.spec.ts
 //
 // DT_ALGOD_TOKEN sets the API token, if the node needs one.
 
@@ -34,11 +34,11 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
   })
 
   test('supports time travel', async () => {
-    expect(await algorand.timeTravel.supported()).toBe(true)
+    expect(await algorand.dt.supported()).toBe(true)
   })
 
   test('global state at past rounds matches the app versions', async () => {
-    const { versions } = await algorand.timeTravel.getAppVersions(XGOV, { order: 'desc', limit: 3, includeValues: true })
+    const { versions } = await algorand.dt.getAppVersions(XGOV, { order: 'desc', limit: 3, includeValues: true })
     expect(versions.length).toBeGreaterThan(0)
     for (const v of versions.filter((v) => v.app)) {
       const state = await algorand.app.getGlobalState(XGOV, { round: v.round })
@@ -47,7 +47,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
   })
 
   test('an app client pinned to a round reads that round', async () => {
-    const { versions } = await algorand.timeTravel.getAppVersions(XGOV, { order: 'desc', limit: 2, includeValues: true })
+    const { versions } = await algorand.dt.getAppVersions(XGOV, { order: 'desc', limit: 2, includeValues: true })
     const older = versions.at(-1)!
     const client = new AppClient({
       appId: XGOV,
@@ -70,7 +70,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
   })
 
   test('box values at past rounds match the box change feed', async () => {
-    const { versions } = await algorand.timeTravel.getBoxesVersions(XGOV, { order: 'desc', limit: 3, includeValues: true })
+    const { versions } = await algorand.dt.getBoxesVersions(XGOV, { order: 'desc', limit: 3, includeValues: true })
     expect(versions.length).toBeGreaterThan(0)
     for (const v of versions) {
       for (const box of v.boxes.filter((b) => !b.deleted)) {

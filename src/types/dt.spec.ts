@@ -4,7 +4,7 @@ import { algo, microAlgo } from '../amount'
 import stateArc56 from '../../tests/example-contracts/state/State.arc56.json'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
-import { TimeTravelAlgodLike, TimeTravelNotAvailableError, isTimeTravelUnsupportedError } from './time-travel-support'
+import { DTAlgodLike, DTNotAvailableError, isDTUnsupportedError } from './dt-support'
 import modelsv2 = algosdk.modelsv2
 
 // Offline tests of the time travel and extended simulate features, against a stub algod.
@@ -96,13 +96,13 @@ const appJson = (id: number, creator: string, counter: number) => ({
   },
 })
 
-/** Answers the time travel probe (`supportsTimeTravel`) as a time-travel node. */
+/** Answers the time travel probe (`supportsDT`) as a time-travel node. */
 const probeOk = (stub: StubClient) => stub.on('get', '/v2/applications/0/box/versions', json({ round: LAST_ROUND, versions: [] }), true)
 
 const sentSimulate = (call: Call) =>
   algosdk.decodeMsgpack(
     call.body!,
-    (algosdk as unknown as { timeTravelModels: { TimeTravelSimulateRequest: never } }).timeTravelModels.TimeTravelSimulateRequest,
+    (algosdk as unknown as { dtModels: { DTSimulateRequest: never } }).dtModels.DTSimulateRequest,
   ) as modelsv2.SimulateRequest & {
     parallelGroups?: boolean
     rounds?: bigint[]
@@ -131,9 +131,9 @@ const echoSimulate =
             failedAt: fail?.(gi) ? [0] : undefined,
           }),
       )
-    const tt = (algosdk as unknown as { timeTravelModels: Record<string, new (args: unknown) => object> }).timeTravelModels
+    const tt = (algosdk as unknown as { dtModels: Record<string, new (args: unknown) => object> }).dtModels
     const response = request.rounds?.length
-      ? new tt.TimeTravelSimulateResponse({
+      ? new tt.DTSimulateResponse({
           lastRound: 0,
           version: 2,
           txnGroups: [],
@@ -161,8 +161,8 @@ describe('time travel', () => {
     algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
   })
 
-  test('the fork client is shaped like TimeTravelAlgodLike', () => {
-    const client: TimeTravelAlgodLike = new algosdk.TimeTravelAlgodClient('', 'http://localhost')
+  test('the fork client is shaped like DTAlgodLike', () => {
+    const client: DTAlgodLike = new algosdk.DTAlgodClient('', 'http://localhost')
     expect(client).toBeDefined()
   })
 
@@ -185,7 +185,7 @@ describe('time travel', () => {
     test('a node that answers for another round throws instead of returning the latest state', async () => {
       stub.on('get', `/v2/accounts/${address}`, json(accountJson(address, LAST_ROUND)))
       const error = await algorand.account.getInformation(address, { round: 1234 }).catch((e) => e)
-      expect(isTimeTravelUnsupportedError(error)).toBe(true)
+      expect(isDTUnsupportedError(error)).toBe(true)
     })
 
     test('asset holding at a round', async () => {
@@ -210,7 +210,7 @@ describe('time travel', () => {
     test('global state at a round on a node without time travel throws', async () => {
       stub.on('get', '/v2/applications/0/box/versions', () => ({ status: 404, json: { message: 'Not Found' } }))
       const error = await algorand.app.getGlobalState(123n, { round: 1000n }).catch((e) => e)
-      expect(isTimeTravelUnsupportedError(error)).toBe(true)
+      expect(isDTUnsupportedError(error)).toBe(true)
       expect(stub.calls).toHaveLength(1)
     })
 
@@ -237,13 +237,13 @@ describe('time travel', () => {
     })
 
     test('without the time-travel fork of algosdk, reads at a round throw and other reads still work', async () => {
-      const TT = algosdk.TimeTravelAlgodClient as unknown as { features: readonly string[] }
+      const TT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
       const features = TT.features
       Object.defineProperty(TT, 'features', { value: [], configurable: true, writable: true })
       try {
-        await expect(algorand.account.getInformation(address, { round: 1 })).rejects.toThrow(TimeTravelNotAvailableError)
-        await expect(algorand.timeTravel.getAppVersions(1n)).rejects.toThrow(TimeTravelNotAvailableError)
-        expect(await algorand.timeTravel.supported()).toBe(false)
+        await expect(algorand.account.getInformation(address, { round: 1 })).rejects.toThrow(DTNotAvailableError)
+        await expect(algorand.dt.getAppVersions(1n)).rejects.toThrow(DTNotAvailableError)
+        expect(await algorand.dt.supported()).toBe(false)
         stub.on('get', `/v2/accounts/${address}`, json(accountJson(address, LAST_ROUND)))
         expect((await algorand.account.getInformation(address)).validAsOfRound).toBe(BigInt(LAST_ROUND))
       } finally {
@@ -263,7 +263,7 @@ describe('time travel', () => {
           'next-token': '801',
         }),
       )
-      const page = await algorand.timeTravel.getBoxVersions(5n, 'counter', {
+      const page = await algorand.dt.getBoxVersions(5n, 'counter', {
         minRound: 10,
         maxRound: 900n,
         order: 'desc',
@@ -300,7 +300,7 @@ describe('time travel', () => {
           json({ round: 900, versions: [{ round: 3, timestamp: 2, boxes: [{ name: b64('b'), deleted: true }] }] }),
         )
       const versions = []
-      for await (const v of algorand.timeTravel.iterateBoxesVersions(5n)) versions.push(v)
+      for await (const v of algorand.dt.iterateBoxesVersions(5n)) versions.push(v)
       expect(versions.map((v) => [v.round, v.boxes[0].name.name, v.boxes[0].deleted])).toEqual([
         [1n, 'a', false],
         [3n, 'b', true],
@@ -320,7 +320,7 @@ describe('time travel', () => {
           ],
         }),
       )
-      const page = await algorand.timeTravel.getAppVersions(123n, { includeValues: true })
+      const page = await algorand.dt.getAppVersions(123n, { includeValues: true })
       expect(page.nextToken).toBeUndefined()
       expect(page.versions[0].app?.globalState.int1.value).toBe(1n)
       expect(page.versions[1]).toMatchObject({ round: 20n, deleted: true, app: undefined })
@@ -342,7 +342,7 @@ describe('time travel', () => {
           ],
         }),
       )
-      const page = await algorand.timeTravel.getAccountVersions(address, { exclude: ['created-apps-params'], includeValues: true })
+      const page = await algorand.dt.getAccountVersions(address, { exclude: ['created-apps-params'], includeValues: true })
       expect(stub.calls[0].query.exclude).toBe('created-apps-params')
       expect(page.versions[0].base?.account?.balance.microAlgo).toBe(77n)
       expect(page.versions[0].assets).toEqual([{ assetId: 9n, deleted: false, holding: { balance: 3n, frozen: true } }])

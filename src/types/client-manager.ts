@@ -6,7 +6,7 @@ import { AppFactory, AppFactoryParams } from './app-factory'
 import { TestNetDispenserApiClient, TestNetDispenserApiClientParams } from './dispenser-client'
 import { Expand } from './expand'
 import { AlgoClientConfig, AlgoConfig, NetworkDetails, genesisIdIsLocalNet } from './network-client'
-import { TimeTravelAlgodLike, getTimeTravelSdk, toTimeTravelAlgod } from './time-travel-support'
+import { DTAlgodLike, getDTSdk, toDTAlgod } from './dt-support'
 import Kmd = algosdk.Kmd
 import Indexer = algosdk.Indexer
 import Algodv2 = algosdk.Algodv2
@@ -96,13 +96,13 @@ export class ClientManager {
   }
 
   /**
-   * Returns a time-travel algod client (the time-travel fork of algosdk's `TimeTravelAlgodClient`) that shares the
+   * Returns a time-travel algod client (the time-travel fork of algosdk's `DTAlgodClient`) that shares the
    * connection of `algod`, for reads at past rounds, `/versions` listings and extended simulate on dtalgod.
    * @returns The time-travel algod client
-   * @throws TimeTravelNotAvailableError if the loaded algosdk is not the time-travel fork
+   * @throws DTNotAvailableError if the loaded algosdk is not the time-travel fork
    */
-  public get timeTravelAlgod(): TimeTravelAlgodLike {
-    return toTimeTravelAlgod(this._algod, 'The time-travel algod client')
+  public get dtAlgod(): DTAlgodLike {
+    return toDTAlgod(this._algod, 'The time-travel algod client')
   }
 
   /**
@@ -110,9 +110,9 @@ export class ClientManager {
    * travel enabled (`EnableTimeTravel`). The node is probed once per algod client.
    * @returns Whether time travel is supported
    */
-  public async supportsTimeTravel(): Promise<boolean> {
-    if (!getTimeTravelSdk()) return false
-    return await this.timeTravelAlgod.supportsTimeTravel()
+  public async supportsDT(): Promise<boolean> {
+    if (!getDTSdk()) return false
+    return await this.dtAlgod.supportsDT()
   }
 
   /**

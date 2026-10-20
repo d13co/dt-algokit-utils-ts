@@ -10,7 +10,7 @@ import { AlgoSdkClients, ClientManager } from './client-manager'
 import { ErrorTransformer, TransactionComposer } from './composer'
 import { AlgoConfig } from './network-client'
 import { SimulateManager } from './simulate-manager'
-import { TimeTravelManager } from './time-travel-manager'
+import { DTManager } from './dt-manager'
 import Account = algosdk.Account
 import LogicSigAccount = algosdk.LogicSigAccount
 
@@ -25,7 +25,7 @@ export class AlgorandClient {
   private _assetManager: AssetManager
   private _transactionSender: AlgorandClientTransactionSender
   private _transactionCreator: AlgorandClientTransactionCreator
-  private _timeTravelManager: TimeTravelManager
+  private _dtManager: DTManager
   private _simulateManager: SimulateManager
 
   private _cachedSuggestedParams?: algosdk.SuggestedParams
@@ -49,7 +49,7 @@ export class AlgorandClient {
     this._transactionSender = new AlgorandClientTransactionSender(() => this.newGroup(), this._assetManager, this._appManager)
     this._transactionCreator = new AlgorandClientTransactionCreator(() => this.newGroup())
     this._appDeployer = new AppDeployer(this._appManager, this._transactionSender, this._clientManager.indexerIfPresent)
-    this._timeTravelManager = new TimeTravelManager(this._clientManager)
+    this._dtManager = new DTManager(this._clientManager)
     this._simulateManager = new SimulateManager(this._clientManager)
   }
 
@@ -224,12 +224,12 @@ export class AlgorandClient {
    *
    * To read state at a past round, pass `{ round }` to the usual reads, or use `appClient.atRound(round)`.
    * Needs the time-travel fork of algosdk.
-   * @returns The `TimeTravelManager` instance.
+   * @returns The `DTManager` instance.
    * @example
-   * const { versions } = await algorand.timeTravel.getBoxVersions(appId, 'counter', { includeValues: true });
+   * const { versions } = await algorand.dt.getBoxVersions(appId, 'counter', { includeValues: true });
    */
-  public get timeTravel() {
-    return this._timeTravelManager
+  public get dt() {
+    return this._dtManager
   }
 
   /**
