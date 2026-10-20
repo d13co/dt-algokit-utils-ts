@@ -24,7 +24,7 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
 ] as const)
 
 /** `DTAlgodClient.features` that only some algokit-utils options need, checked when they are used. */
-export type OptionalDTFeature = 'validity-window' | 'simulate-protocol'
+export type OptionalDTFeature = 'validity-window' | 'simulate-protocol' | 'simulate-limits'
 
 /** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork, or a version without it. */
 export class DTNotAvailableError extends Error {
@@ -215,6 +215,28 @@ export interface SimulateProtocolOverride {
   notes?: SimulateProtocolNote[]
 }
 
+/**
+ * The limits a node places on simulate requests, and the simulate features it allows, as dtalgod reports them
+ * (`GET /v2/transactions/simulate/limits`). A node without that endpoint (stock algod, or an older dtalgod) gets stock
+ * algod's limits, with `reported` false.
+ */
+export interface SimulateLimits {
+  /** The most transaction groups a request may hold (`MaxAPISimulateGroups`). 1 on stock algod. */
+  maxTxnGroups: number
+  /** The most entries a request may list in `rounds`, duplicates included (`MaxAPISimulateRounds`). 0: `rounds` is disabled, as on stock algod. */
+  maxRounds: number
+  /** The most `extraOpcodeBudget`, for each top-level group of a request (`MaxAPISimulateExtraOpcodeBudget`). 320,000 on stock algod. */
+  maxExtraOpcodeBudget: number
+  /** The factor on the consensus limits on unnamed resources with `allowUnnamedResources` (`SimulateResourceLimitMultiplier`). 1: the consensus limits. */
+  resourceLimitMultiplier: number
+  /** Whether `round` and `rounds` reach back to genesis (`EnableTimeTravel`). Unknown, and false, when not `reported`. */
+  timeTravel: boolean
+  /** Whether requests may set `execTraceConfig` and the protocol `future` (`EnableDeveloperAPI`). Unknown, and false, when not `reported`. */
+  developerApi: boolean
+  /** Whether the node reported these limits. False when it has no limits endpoint: these are then stock algod's limits. */
+  reported: boolean
+}
+
 /** The response of an extended simulate request. */
 export interface DTSimulateResponseLike extends modelsv2.SimulateResponse {
   roundResults?: {
@@ -264,6 +286,8 @@ export interface DTAlgodLike {
     appId: Round,
   ): VersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
+  /** The node's simulate limits, cached per client; stock algod's after a 404. Only in forks with the `simulate-limits` feature. */
+  simulateLimits?(): Promise<SimulateLimits>
 }
 
 /** A window of rounds that one extended simulate request covers, from `packSimulateRounds`. */
@@ -337,6 +361,24 @@ export function requireDTSdkFeatures(feature: string, optional: readonly Optiona
  */
 export function toDTAlgod(algod: algosdk.Algodv2, feature = 'This feature'): DTAlgodLike {
   return requireDTSdk(feature).DTAlgodClient.from(algod)
+}
+
+/**
+ * Returns the node's simulate limits, through the fork's cached `DTAlgodClient.simulateLimits()`: stock algod's limits
+ * (`reported` false) if the node has no limits endpoint. Returns `undefined` when the loaded algosdk is not the
+ * time-travel fork, or a version without the `simulate-limits` feature, so the limits are unknown.
+ * @param algod The algod client to ask
+ * @throws The request's error, other than a 404
+ */
+export async function getSimulateLimits(algod: algosdk.Algodv2): Promise<SimulateLimits | undefined> {
+  const tt = getDTSdk()
+  if (!tt || !(tt.DTAlgodClient.features ?? []).includes('simulate-limits')) return undefined
+  const client = tt.DTAlgodClient.from(algod)
+  if (!client.simulateLimits) return undefined
+  // A copy: the fork's object is shared by every caller of the client
+  const { maxTxnGroups, maxRounds, maxExtraOpcodeBudget, resourceLimitMultiplier, timeTravel, developerApi, reported } =
+    await client.simulateLimits()
+  return { maxTxnGroups, maxRounds, maxExtraOpcodeBudget, resourceLimitMultiplier, timeTravel, developerApi, reported: reported === true }
 }
 
 /**

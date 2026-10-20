@@ -89,6 +89,12 @@ for (const {
 
 Each outcome is `{ ok: true, result }`, with the same result shape as `composer.simulate()`, or `{ ok: false, error }`.
 
+#### Node limits
+
+`simulate.groups` and `simulate.rounds` keep to the node's simulate limits, which dtalgod reports (`GET /v2/transactions/simulate/limits`) and `algorand.simulate.limits()` returns. They are asked for once per algod client. Requests hold at most `maxTxnGroups` groups and `maxRounds` rounds, and an `extraOpcodeBudget` above `maxExtraOpcodeBudget` throws, as do `protocol: 'future'` and `execTraceConfig` when the node reports the developer API off (a node that doesn't report its limits checks these itself). Readonly `AppClient` calls use the node's full `maxExtraOpcodeBudget` (320,000 on a node that doesn't report it).
+
+A node without the limits endpoint (stock algod, or a dtalgod built before it) gets stock algod's limits, with `reported: false`. Each request then holds one group (sequential groups beyond one throw; `parallel` groups get one request each), and `simulate.rounds` sends one request per round with `round` set instead of `rounds`. On an older dtalgod, pass `maxGroups` and `maxRounds` (its defaults are 16) to use its extended simulate.
+
 #### Rounds far apart, under a later protocol
 
 A transaction is valid for at most 1,000 rounds, so `simulate.rounds` normally puts rounds more than 1,000 apart in separate requests. With `validityWindow: 'rewrite'`, the node moves each transaction's validity window to every simulated round (dropping its signature), and with `'skip'` it evaluates the transactions as built outside their window; either way rounds of any span share a request. `protocol` (on `groups` and `rounds`) simulates under a later consensus protocol (`v24` to `v42`, `latest`, `future` on a node with the developer API, or a version string), as if an upgrade took effect right after the round, and each outcome's `protocolOverride` says how it applied:
@@ -103,7 +109,7 @@ for (const { round, protocolOverride, groups } of await algorand.simulate.rounds
 }
 ```
 
-With `'rewrite'` the transaction IDs change, so the results' `txIds` are those as built; transactions that differ only by their validity window need distinct notes, or the later one fails as a duplicate. These options need a dtalgod with these features and `algosdk@3.8.0-dt.1` or later; an older fork throws a `DTNotAvailableError`, an older node a `DTUnsupportedError`.
+With `'rewrite'` the transaction IDs change, so the results' `txIds` are those as built; transactions that differ only by their validity window need distinct notes, or the later one fails as a duplicate. These options need a dtalgod with these features and `algosdk@3.8.0-dt.1` or later (the limits need a build of it with the `simulate-limits` feature; without it, the defaults of 16 groups and 16 rounds apply); an older fork throws a `DTNotAvailableError`, an older node a `DTUnsupportedError`.
 
 ### Tests
 

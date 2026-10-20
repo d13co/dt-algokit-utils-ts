@@ -33,6 +33,8 @@ const onNewerNode = (run: () => Promise<void>) => async (ctx: { skip: (note?: st
 describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000 }, () => {
   let algorand: AlgorandClient
   let latest: bigint
+  /** On a dtalgod older than the simulate limits endpoint, its default limits, which utils can't know */
+  let olderNode: { maxGroups?: number; maxRounds?: number }
 
   beforeAll(async () => {
     const url = new URL(server!)
@@ -42,6 +44,15 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     const { genesisId } = await algorand.client.network()
     if (genesisId !== 'mainnet-v1.0') throw new Error(`Expected a MainNet node, got ${genesisId}`)
     latest = (await algorand.client.algod.status().do()).lastRound
+    olderNode = (await algorand.simulate.limits()).reported ? {} : { maxGroups: 16, maxRounds: 16 }
+  })
+
+  test('reports its simulate limits', async (ctx) => {
+    const limits = await algorand.simulate.limits()
+    if (!limits.reported) return ctx.skip('the node has no simulate limits endpoint')
+    expect(limits.timeTravel).toBe(true)
+    expect(limits.maxTxnGroups).toBeGreaterThanOrEqual(1)
+    expect(limits.maxExtraOpcodeBudget).toBeGreaterThan(0)
   })
 
   test('supports time travel', async () => {
@@ -104,10 +115,10 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     const fund = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: fresh, amount: algo(1) })
     const spend = algorand.newGroup().addPayment({ sender: fresh, receiver: XGOV_CREATOR, amount: algo(0.1) })
 
-    const sequential = await algorand.simulate.groups([fund, spend])
+    const sequential = await algorand.simulate.groups([fund, spend], olderNode)
     expect(sequential.map((o) => o.ok)).toEqual([true, true])
 
-    const parallel = await algorand.simulate.groups([fund, spend], { parallel: true })
+    const parallel = await algorand.simulate.groups([fund, spend], { ...olderNode, parallel: true })
     expect(parallel[0].ok).toBe(true)
     expect(parallel[1].ok).toBe(false)
     if (!parallel[1].ok) expect(parallel[1].error.failureMessage).toMatch(/overspend/)
@@ -116,7 +127,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
   test('simulate at several rounds, packed into windows', async () => {
     const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
     const rounds = [latest - 2_000n, latest - 10n, latest - 1_500n, latest - 5n]
-    const outcomes = await algorand.simulate.rounds(pay, rounds)
+    const outcomes = await algorand.simulate.rounds(pay, rounds, olderNode)
     expect(outcomes.map((o) => o.round)).toEqual(rounds)
     for (const o of outcomes) {
       expect(o.groups).toHaveLength(1)
@@ -130,7 +141,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     onNewerNode(async () => {
       const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
       const rounds = [latest - 200_000n, latest - 5n]
-      const outcomes = await algorand.simulate.rounds(pay, rounds, { validityWindow: 'rewrite' })
+      const outcomes = await algorand.simulate.rounds(pay, rounds, { ...olderNode, validityWindow: 'rewrite' })
       expect(outcomes.map((o) => [o.round, o.groups[0].ok])).toEqual(rounds.map((r) => [r, true]))
     }),
   )

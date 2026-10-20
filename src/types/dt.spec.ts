@@ -110,6 +110,38 @@ const nodeStatus = json({
 /** Answers the time travel probe (`supportsDT`) as a time-travel node. */
 const probeOk = (stub: StubClient) => stub.on('get', '/v2/applications/0/box/versions', json({ round: LAST_ROUND, versions: [] }), true)
 
+/** dtalgod's default simulate limits, as its limits endpoint answers them. */
+const LIMITS = {
+  'max-txn-groups': 16,
+  'max-rounds': 16,
+  'max-extra-opcode-budget': 320_000,
+  'resource-limit-multiplier': 1,
+  'time-travel': true,
+  'developer-api': false,
+}
+
+/** Answers the simulate limits endpoint as dtalgod with these limits. */
+const limitsOk = (stub: StubClient, limits: Partial<typeof LIMITS> = {}) =>
+  stub.on('get', '/v2/transactions/simulate/limits', json({ ...LIMITS, ...limits }), true)
+
+/** Answers the simulate limits endpoint with a 404, as stock algod or an older dtalgod. */
+const limits404 = (stub: StubClient) =>
+  stub.on('get', '/v2/transactions/simulate/limits', () => ({ status: 404, json: { message: 'Not Found' } }), true)
+
+const limitsCalls = (stub: StubClient) => stub.calls.filter((c) => c.path === '/v2/transactions/simulate/limits')
+
+/** Runs `run` with the fork's `DTAlgodClient.features` lacking `without`, as an older version of the fork. */
+const withoutFeatures = async (without: string[], run: () => Promise<void>) => {
+  const DT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
+  const features = DT.features
+  Object.defineProperty(DT, 'features', { value: features.filter((f) => !without.includes(f)), configurable: true, writable: true })
+  try {
+    await run()
+  } finally {
+    Object.defineProperty(DT, 'features', { value: features, configurable: true, writable: true })
+  }
+}
+
 const sentSimulate = (call: Call) =>
   algosdk.decodeMsgpack(
     call.body!,
@@ -437,6 +469,70 @@ describe('time travel', () => {
       expect(request.txnGroups[0].txns[0].txn.lastValid).toBeGreaterThanOrEqual(1001n)
     })
 
+    test('readonly calls use the node limit as the extra opcode budget', async () => {
+      limitsOk(stub, { 'max-extra-opcode-budget': 100_000 })
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(() => uint64Return(42n)),
+          true,
+        )
+      await appClient().send.call({ method: 'call_abi_uint64_readonly', args: [1n] })
+      expect(sentSimulate(stub.calls.at(-1)!).extraOpcodeBudget).toBe(100_000)
+
+      // Above stock algod's limit too
+      const raised = new StubClient()
+      limitsOk(raised, { 'max-extra-opcode-budget': 640_000 })
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(() => uint64Return(42n)),
+          true,
+        )
+      const other = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(raised, '') })
+      await new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand: other, defaultSender: address }).send.call({
+        method: 'call_abi_uint64_readonly',
+        args: [1n],
+      })
+      expect(sentSimulate(raised.calls.at(-1)!).extraOpcodeBudget).toBe(640_000)
+
+      // The limits are asked for once per algod client
+      await appClient().send.call({ method: 'call_abi_uint64_readonly', args: [1n] })
+      expect(limitsCalls(stub)).toHaveLength(1)
+    })
+
+    test('readonly calls use the stock budget without a limits endpoint, or when it fails', async () => {
+      limits404(stub)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(() => uint64Return(42n)),
+          true,
+        )
+      await appClient().send.call({ method: 'call_abi_uint64_readonly', args: [1n] })
+      expect(sentSimulate(stub.calls.at(-1)!).extraOpcodeBudget).toBe(320_000)
+
+      // A node that fails the limits request is not asked again
+      const failing = new StubClient()
+        .on('get', '/v2/transactions/simulate/limits', () => ({ status: 503, json: {} }), true)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(() => uint64Return(42n)),
+          true,
+        )
+      const other = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(failing, '') })
+      const client = new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand: other, defaultSender: address })
+      expect((await client.send.call({ method: 'call_abi_uint64_readonly', args: [1n] })).return).toBe(42n)
+      await client.send.call({ method: 'call_abi_uint64_readonly', args: [1n] })
+      expect(sentSimulate(failing.calls.at(-1)!).extraOpcodeBudget).toBe(320_000)
+      expect(limitsCalls(failing)).toHaveLength(1)
+    })
+
     test('a pinned client cannot send transactions', async () => {
       const past = appClient().atRound(1000)
       await expect(past.send.call({ method: 'set_global', args: [1n, 2n, 'a', new Uint8Array(4)] })).rejects.toThrow(/pinned to round 1000/)
@@ -448,6 +544,10 @@ describe('time travel', () => {
 
   describe('extended simulate', () => {
     const payment = (amount: number) => algorand.newGroup().addPayment({ sender, receiver: sender, amount: microAlgo(amount) })
+
+    beforeEach(() => {
+      limitsOk(stub)
+    })
 
     test('groups: several groups in one request', async () => {
       stub.on('get', '/v2/transactions/params', suggestedParams).on(
@@ -488,9 +588,10 @@ describe('time travel', () => {
       const outcomes = await algorand.simulate.groups([payment(1), payment(2), payment(3)], { parallel: true, maxGroups: 2 })
       const requests = stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
       // Both requests at the same round, the latest when they were sent
+      // A group alone is sent without parallelGroups, as a plain request
       expect(requests.map((r) => [r.txnGroups.length, r.parallelGroups, r.round])).toEqual([
         [2, true, BigInt(LAST_ROUND)],
-        [1, true, BigInt(LAST_ROUND)],
+        [1, undefined, BigInt(LAST_ROUND)],
       ])
       expect(outcomes.map((o) => [o.groupIndex, o.ok])).toEqual([
         [0, true],
@@ -712,6 +813,200 @@ describe('time travel', () => {
         [false, false],
       ])
       expect(failed.groups[2]).toMatchObject({ ok: false, error: { kind: 'round' } })
+    })
+  })
+
+  describe('simulate limits', () => {
+    const payment = (amount: number) => algorand.newGroup().addPayment({ sender, receiver: sender, amount: microAlgo(amount) })
+    const posts = () => stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
+
+    test('limits: the node limits, asked for once per algod client', async () => {
+      limitsOk(stub, { 'max-txn-groups': 8, 'max-rounds': 4, 'developer-api': true })
+      const limits = await algorand.simulate.limits()
+      expect(limits).toEqual({
+        maxTxnGroups: 8,
+        maxRounds: 4,
+        maxExtraOpcodeBudget: 320_000,
+        resourceLimitMultiplier: 1,
+        timeTravel: true,
+        developerApi: true,
+        reported: true,
+      })
+      await algorand.simulate.limits()
+      expect(limitsCalls(stub)).toHaveLength(1)
+      expect(stub.calls[0].path).toBe('/v2/transactions/simulate/limits')
+    })
+
+    test('limits: stock algod limits after a 404', async () => {
+      limits404(stub)
+      expect(await algorand.simulate.limits()).toEqual({
+        maxTxnGroups: 1,
+        maxRounds: 0,
+        maxExtraOpcodeBudget: 320_000,
+        resourceLimitMultiplier: 1,
+        timeTravel: false,
+        developerApi: false,
+        reported: false,
+      })
+    })
+
+    test('limits: other errors are thrown and asked again next time', async () => {
+      stub.on('get', '/v2/transactions/simulate/limits', () => ({ status: 503, json: {} }))
+      limitsOk(stub)
+      await expect(algorand.simulate.limits()).rejects.toMatchObject({ status: 503 })
+      expect((await algorand.simulate.limits()).maxTxnGroups).toBe(16)
+    })
+
+    test('groups: maxGroups defaults to the node limit', async () => {
+      limitsOk(stub, { 'max-txn-groups': 2 })
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('get', '/v2/status', nodeStatus)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const outcomes = await algorand.simulate.groups([payment(1), payment(2), payment(3)], { parallel: true })
+      expect(posts().map((r) => r.txnGroups.length)).toEqual([2, 1])
+      expect(outcomes.map((o) => o.ok)).toEqual([true, true, true])
+      await expect(algorand.simulate.groups([payment(1), payment(2), payment(3)])).rejects.toThrow(/at most 2 per request \(set/)
+      // maxGroups overrides the node limit
+      await algorand.simulate.groups([payment(1), payment(2), payment(3)], { maxGroups: 3 })
+      expect(posts().at(-1)!.txnGroups).toHaveLength(3)
+      await expect(algorand.simulate.groups([payment(1)], { maxGroups: 0 })).rejects.toThrow(/positive integer/)
+    })
+
+    test('rounds: maxRounds defaults to the node limit', async () => {
+      limitsOk(stub, { 'max-rounds': 1 })
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      await algorand.simulate.rounds(payment(1), [1000n, 1001n])
+      expect(posts().map((r) => r.rounds)).toEqual([[1000n], [1001n]])
+    })
+
+    test('an extraOpcodeBudget above the node limit throws', async () => {
+      limitsOk(stub, { 'max-extra-opcode-budget': 100_000 })
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      await expect(algorand.simulate.groups([payment(1)], { extraOpcodeBudget: 1_000_000 })).rejects.toThrow(
+        /extraOpcodeBudget 1000000 is more than the node allows \(maxExtraOpcodeBudget 100000\)/,
+      )
+      await expect(algorand.simulate.rounds(payment(1), [1000n], { extraOpcodeBudget: 100_001n })).rejects.toThrow(
+        /more than the node allows/,
+      )
+      expect(posts()).toHaveLength(0)
+      await algorand.simulate.groups([payment(1)], { extraOpcodeBudget: 100_000 })
+      expect(posts().map((r) => r.extraOpcodeBudget)).toEqual([100_000])
+    })
+
+    test('without a limits endpoint, the node checks extraOpcodeBudget itself', async () => {
+      limits404(stub)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      await algorand.simulate.groups([payment(1)], { extraOpcodeBudget: 1_000_000 })
+      expect(posts().map((r) => r.extraOpcodeBudget)).toEqual([1_000_000])
+    })
+
+    test('protocol future and execTraceConfig are refused when the node reports the developer API off', async () => {
+      limitsOk(stub).on('get', '/v2/transactions/params', suggestedParams, true)
+      await expect(algorand.simulate.groups([payment(1)], { protocol: 'future' })).rejects.toThrow(
+        /protocol 'future' needs .*EnableDeveloperAPI/,
+      )
+      await expect(
+        algorand.simulate.rounds(payment(1), [1000n], { execTraceConfig: new modelsv2.SimulateTraceConfig({ enable: true }) }),
+      ).rejects.toThrow(/execTraceConfig needs .*EnableDeveloperAPI/)
+      expect(posts()).toHaveLength(0)
+    })
+
+    test('protocol future and execTraceConfig are sent when the developer API is on, or unknown', async () => {
+      const trace = { execTraceConfig: new modelsv2.SimulateTraceConfig({ enable: true }) }
+      limitsOk(stub, { 'developer-api': true })
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      await algorand.simulate.groups([payment(1)], { protocol: 'future', ...trace })
+      expect(posts().at(-1)).toMatchObject({ protocol: 'future', execTraceConfig: { enable: true } })
+
+      // Without the limits endpoint the node checks it
+      const stock = new StubClient()
+      limits404(stock)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const other = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stock, '') })
+      await other.simulate.groups([other.newGroup().addPayment({ sender, receiver: sender, amount: microAlgo(1) })], trace)
+      expect(sentSimulate(stock.calls.at(-1)!).execTraceConfig?.enable).toBe(true)
+    })
+
+    test('without a limits endpoint: one group per request, as plain upstream requests', async () => {
+      limits404(stub)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('get', '/v2/status', nodeStatus)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(undefined, (g) => (g === 0 ? undefined : 'never')),
+          true,
+        )
+      await expect(algorand.simulate.groups([payment(1), payment(2)])).rejects.toThrow(
+        /at most 1 per request \(it has no simulate limits endpoint/,
+      )
+      const outcomes = await algorand.simulate.groups([payment(1), payment(2)], { parallel: true })
+      expect(posts().map((r) => [r.txnGroups.length, r.parallelGroups, r.rounds, r.round])).toEqual([
+        [1, undefined, undefined, BigInt(LAST_ROUND)],
+        [1, undefined, undefined, BigInt(LAST_ROUND)],
+      ])
+      expect(outcomes.map((o) => [o.groupIndex, o.ok])).toEqual([
+        [0, true],
+        [1, true],
+      ])
+    })
+
+    test('without a limits endpoint: rounds are simulated one request per round, with round set', async () => {
+      limits404(stub)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate((txn) => uint64Return(txn.firstValid)),
+          true,
+        )
+      const composer = algorand
+        .newGroup()
+        .addAppCallMethodCall({ sender, appId: 123n, method: algosdk.ABIMethod.fromSignature('get()uint64') })
+      const rounds = [5000n, 1000n, 5000n]
+      const outcomes = await algorand.simulate.rounds(composer, rounds, { validityWindow: 'rewrite' })
+      const requests = posts()
+      // One request per distinct round, with transactions valid at it, and no fork fields
+      expect(requests.map((r) => [r.round, r.rounds, r.rewriteValidityWindow, r.txnGroups[0].txns[0].txn.firstValid])).toEqual([
+        [5000n, undefined, undefined, 5001n],
+        [1000n, undefined, undefined, 1001n],
+      ])
+      expect(outcomes.map((o) => [o.round, o.groups[0].round, o.groups[0].ok && o.groups[0].result.returns?.[0]?.returnValue])).toEqual([
+        [5000n, 5000n, 5001n],
+        [1000n, 1000n, 1001n],
+        [5000n, 5000n, 5001n],
+      ])
+      await expect(algorand.simulate.rounds(composer, [1000n, 0])).rejects.toThrow(RangeError)
+    })
+
+    test('maxRounds 0 sends one request per round on dtalgod too', async () => {
+      limitsOk(stub)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      await algorand.simulate.rounds(payment(1), [1000n, 1001n], { maxRounds: 0 })
+      expect(posts().map((r) => [r.round, r.rounds])).toEqual([
+        [1000n, undefined],
+        [1001n, undefined],
+      ])
+    })
+
+    test('a fork without the simulate-limits feature keeps the default limits and asks nothing', async () => {
+      await withoutFeatures(['simulate-limits'], async () => {
+        stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+        await algorand.simulate.groups([payment(1), payment(2)], { extraOpcodeBudget: 1_000_000 })
+        await algorand.simulate.rounds(payment(1), [1000n, 1001n])
+        expect(posts().map((r) => [r.txnGroups.length, r.rounds, r.extraOpcodeBudget])).toEqual([
+          [2, undefined, 1_000_000],
+          [1, [1000n, 1001n], undefined],
+        ])
+        expect(limitsCalls(stub)).toHaveLength(0)
+        await expect(algorand.simulate.limits()).rejects.toThrow(DTNotAvailableError)
+      })
     })
   })
 })
