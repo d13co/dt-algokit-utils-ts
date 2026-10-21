@@ -1,13 +1,28 @@
 {
-  "name": "@algorandfoundation/algokit-utils",
-  "version": "9.2.3-dt.1",
+  "name": "@d13co/dt-algokit-utils",
+  "version": "9.2.3-dt.2.0.0.1",
   "private": false,
-  "description": "A set of core Algorand utilities written in TypeScript and released via npm that make it easier to build solutions on Algorand.",
+  "description": "Fork of @algorandfoundation/algokit-utils with dtalgod support: reads at past rounds, object versions and extended simulate.",
+  "keywords": [
+    "algorand",
+    "algokit",
+    "dtalgod",
+    "time-travel",
+    "simulate"
+  ],
   "author": "Algorand Foundation",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/algorandfoundation/algokit-utils-ts.git"
+    "url": "git+https://github.com/d13co/dt-algokit-utils-ts.git"
+  },
+  "homepage": "https://github.com/d13co/dt-algokit-utils-ts#readme",
+  "bugs": {
+    "url": "https://github.com/d13co/dt-algokit-utils-ts/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
   },
   "engines": {
     "node": ">=22.0"
@@ -45,7 +60,7 @@
     "build:2-emit-types": "tsc --project tsconfig.build.json --emitDeclarationOnly --rootDir src --outDir dist",
     "build:3-copy-pkg-json": "tsx scripts/copy-package-json.ts",
     "build:4-copy-readme": "cpy README.md LICENSE dist",
-    "build:5-fix-readme-links": "replace-in-files --string '(./' --replacement '(https://github.com/algorandfoundation/algokit-utils-ts/blob/main/' dist/README.md",
+    "build:5-fix-readme-links": "replace-in-files --string '(./' --replacement '(https://github.com/d13co/dt-algokit-utils-ts/blob/main/' dist/README.md",
     "build:6-check-dist-types": "tsc --project tsconfig.dist-check.json",
     "test": "vitest run --coverage --passWithNoTests",
     "test:watch": "vitest watch --coverage --passWithNoTests",
@@ -59,7 +74,8 @@
     "docs:dev": "pnpm --dir docs run dev",
     "docs:build": "pnpm --dir docs run build",
     "docs:preview": "pnpm --dir docs run preview",
-    "pre-commit": "run-s check-types lint:fix audit format test"
+    "pre-commit": "run-s check-types lint:fix audit format test",
+    "prepublishOnly": "echo 'Publish the build, not the repo root: npm run build && npm publish ./dist' && exit 1"
   },
   "overrides": {
     "esbuild": "0.25.0",
@@ -73,7 +89,7 @@
     "buffer": "^6.0.3"
   },
   "peerDependencies": {
-    "algosdk": "^3.5.2"
+    "algosdk": "^3.5.2 || ^3.8.0-dt.0 || ^3.9.0-dt.0"
   },
   "devDependencies": {
     "@algorandfoundation/tealscript": "^0.106.3",
