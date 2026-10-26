@@ -189,7 +189,7 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts
 ```
 
-The algosdk fork is vendored as `vendor/algosdk-3.8.0-dt.2.tgz` (a dev dependency), so the repo's own build and tests use it.
+The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.2.0.1.0.tgz` (a dev dependency), so the repo's own build and tests use it.
 
 ## Building and publishing
 
