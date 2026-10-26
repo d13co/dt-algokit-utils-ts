@@ -11,7 +11,8 @@ It is a drop-in replacement: existing APIs, types and generated typed clients wo
 - **Versions**: `algorand.dt` lists the rounds at which a box, an app's boxes, an app, an asset or an account changed, with the values if asked, by page or as an async iterator.
 - **Extended simulate**: `algorand.simulate.groups` simulates several groups in one request, and `algorand.simulate.rounds` simulates groups at many rounds, packed into as few requests as the node's limits allow, optionally with validity windows rewritten or skipped and under a later consensus protocol.
 - **Node limits**: simulate follows the limits dtalgod reports, and readonly app calls get the node's full extra opcode budget.
-- **Abort signals**: `signal` on app reads, version pages and simulate cancels the request and its retries.
+- **Queries**: `algorand.query.run` runs read-only TEAL calls of a program or app at many rounds (`POST /v2/query`), split within the node's limits; `algorand.query.groups`/`rounds` query composed app calls, with simulate as the fallback.
+- **Abort signals**: `signal` on app reads, version pages, simulate and queries cancels the request and its retries.
 
 See **[the full list of differences](./docs/dt-fork.md)** for every changed method, examples and caveats.
 

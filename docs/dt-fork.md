@@ -9,6 +9,7 @@
 - [App clients pinned to a round](#app-clients-pinned-to-a-round)
 - [Versions: when objects changed](#versions-when-objects-changed)
 - [Extended simulate](#extended-simulate)
+- [Queries](#queries)
 - [Aborting requests](#aborting-requests)
 - [Errors](#errors)
 - [Tests](#tests)
@@ -20,6 +21,7 @@ The fork is additive: every new parameter is optional and every new feature live
 
 - It runs on stock `algosdk` (`^3.5.2`). The fork of algosdk is detected at runtime; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
+- Queries (`algorand.query`) need a `dtalgosdk` with the `query` feature (3.9.0-dt.2.0.1.0 or later). With an older one, `algorand.query.groups`/`rounds` use simulate and `run()` throws a `DTNotAvailableError`.
 - Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round` throw rather than return the latest state.
 
 ## Installing
@@ -46,29 +48,31 @@ At runtime, `await algorand.client.supportsDT()` (or `algorand.dt.supported()`) 
 
 New:
 
-| Where                                                                                                         | What                                                                                                                                                                                                         |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `algorand.dt` (`DTManager`)                                                                                   | Version listings: `get…Versions` (a page) and `iterate…Versions` (async iterator) for boxes, all boxes of an app, apps, assets, accounts, account asset holdings and account app local states; `supported()` |
-| `algorand.simulate` (`SimulateManager`)                                                                       | `groups(composers, options)`, `rounds(composers, rounds, options)` and `limits()`                                                                                                                            |
-| `algorand.client.dtAlgod`                                                                                     | The algod client as the fork's `DTAlgodClient`                                                                                                                                                               |
-| `algorand.client.supportsDT()`                                                                                | Whether the fork is loaded and the node has time travel                                                                                                                                                      |
-| `AppClient.atRound(round)`, `AppClient.round`                                                                 | A clone of the client pinned to a past round, and the round it's pinned to                                                                                                                                   |
-| `DTNotAvailableError`, `isDTUnsupportedError` (exported from the package root)                                | See [Errors](#errors)                                                                                                                                                                                        |
-| `accountInformationFromAlgod`, `AssetManager.assetInformationFromAlgod`, `AppManager.appInformationFromAlgod` | The converters from algod models that the existing getters use, exposed for the version listings                                                                                                             |
+| Where                                                                                                               | What                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `algorand.dt` (`DTManager`)                                                                                         | Version listings: `get…Versions` (a page) and `iterate…Versions` (async iterator) for boxes, all boxes of an app, apps, assets, accounts, account asset holdings and account app local states; `supported()` |
+| `algorand.simulate` (`SimulateManager`)                                                                             | `groups(composers, options)`, `rounds(composers, rounds, options)` and `limits()`                                                                                                                            |
+| `algorand.query` (`QueryManager`)                                                                                   | Read-only TEAL queries (`POST /v2/query`): `run(params, options)`, `groups(composers, options)` and `rounds(composers, rounds, options)` with simulate as the fallback, `limits()` and `supported()`         |
+| `algorand.client.dtAlgod`                                                                                           | The algod client as the fork's `DTAlgodClient`                                                                                                                                                               |
+| `algorand.client.supportsDT()`                                                                                      | Whether the fork is loaded and the node has time travel                                                                                                                                                      |
+| `AppClient.atRound(round)`, `AppClient.round`                                                                       | A clone of the client pinned to a past round, and the round it's pinned to                                                                                                                                   |
+| `DTNotAvailableError`, `isDTUnsupportedError`, `QueryCallError`, `QueryGroupError` (exported from the package root) | See [Errors](#errors)                                                                                                                                                                                        |
+| `accountInformationFromAlgod`, `AssetManager.assetInformationFromAlgod`, `AppManager.appInformationFromAlgod`       | The converters from algod models that the existing getters use, exposed for the version listings                                                                                                             |
 
 Changed (all additions are optional):
 
-| Method                                                                                                                                                        | Change                                                                                                                                        |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `algorand.account.getInformation(address, options?)`                                                                                                          | `{ round }`                                                                                                                                   |
-| `algorand.asset.getById(assetId, options?)`, `getAccountInformation(address, assetId, options?)`                                                              | `{ round }`                                                                                                                                   |
-| `algorand.app.getById`, `getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue`, `getBoxValues`                                                       | `{ round, signal }`                                                                                                                           |
-| `algorand.app.getBoxValueFromABIType`, `getBoxValuesFromABIType`                                                                                              | `round` in the box request params                                                                                                             |
-| `AppClient` state reads (`getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue(s)`, `getBoxValue(s)FromABIType`, and `state.*` in generated clients) | `{ round }`, defaulting to the client's pinned round                                                                                          |
-| `AppClient` constructor / `clone` params                                                                                                                      | `round`                                                                                                                                       |
-| `AppClient` readonly ABI calls                                                                                                                                | Simulated at the pinned round, if any; their extra opcode budget follows the node's reported `maxExtraOpcodeBudget` (320,000 if not reported) |
-| `composer.simulate(options)`                                                                                                                                  | With `round`, transactions that don't set their own validity are built valid at that round; `signal`                                          |
-| `AlgoHttpClientWithRetry`                                                                                                                                     | Passes fetch options (`customOptions`) through, stops retrying and backing off when their `signal` aborts                                     |
+| Method                                                                                                                                                        | Change                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `algorand.account.getInformation(address, options?)`                                                                                                          | `{ round }`                                                                                                                                                                                                 |
+| `algorand.asset.getById(assetId, options?)`, `getAccountInformation(address, assetId, options?)`                                                              | `{ round }`                                                                                                                                                                                                 |
+| `algorand.app.getById`, `getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue`, `getBoxValues`                                                       | `{ round, signal }`                                                                                                                                                                                         |
+| `algorand.app.getBoxValueFromABIType`, `getBoxValuesFromABIType`                                                                                              | `round` in the box request params                                                                                                                                                                           |
+| `AppClient` state reads (`getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue(s)`, `getBoxValue(s)FromABIType`, and `state.*` in generated clients) | `{ round }`, defaulting to the client's pinned round                                                                                                                                                        |
+| `AppClient` constructor / `clone` params                                                                                                                      | `round`                                                                                                                                                                                                     |
+| `AppClient` readonly ABI calls                                                                                                                                | Simulated at the pinned round, if any; their extra opcode budget follows the node's reported `maxExtraOpcodeBudget` (320,000 if not reported)                                                               |
+| `composer.simulate(options)`                                                                                                                                  | With `round`, transactions that don't set their own validity are built valid at that round; `signal`                                                                                                        |
+| `AlgoHttpClientWithRetry`                                                                                                                                     | Passes fetch options (`customOptions`) through, stops retrying and backing off when their `signal` aborts; waits at least a 429/503's `Retry-After` (up to 10 s); doesn't retry a 504 from `POST /v2/query` |
+| `algorand.simulate.limits()`                                                                                                                                  | Includes `query` (the query limits) when the node has queries                                                                                                                                               |
 
 ## Reads at a past round
 
@@ -164,9 +168,79 @@ for (const { round, protocolOverride, groups } of await algorand.simulate.rounds
 
 With `'rewrite'` the transaction IDs change, so the results' `txIds` are those as built; transactions that differ only by their validity window need distinct notes, or the later one fails as a duplicate. These options need a dtalgod with these features and an algosdk fork that has them (every `dtalgosdk` release does; on an older build of the fork without the `simulate-limits` feature, the defaults of 16 groups and 16 rounds apply); an older fork throws a `DTNotAvailableError`, an older node a `DTUnsupportedError`.
 
+## Queries
+
+dtalgod's `POST /v2/query` runs read-only TEAL calls: one program (each call creates an app running it) or one deployed app (each call is a NoOp call of it), many calls with their own args and references, at many rounds. Each call is an app call alone in its group, in the block after the round, on the state that round left: no signatures, fees or minimum balances, every resource available without references (they only matter to programs before v9), and its writes dropped. A failed call doesn't affect the others. Only the called app's logs and the cost come back; inner transactions run but aren't echoed. `algorand.query` (`QueryManager`) wraps it.
+
+### Raw queries: `run`
+
+```typescript
+const program = (await algorand.app.compileTeal('#pragma version 10\nglobal Round\nitob\nlog\ntxn ApplicationArgs 0\nlog\nint 1'))
+  .compiledBase64ToBytes
+const results = await algorand.query.run({
+  program,
+  rounds: [0, 50_000_000n], // 0 = the latest round
+  protocol: 'round', // the chain's own rules; the node's default is 'latest'
+  calls: [{ args: [new TextEncoder().encode('hi')] }, {}],
+})
+for (const { round, calls } of results) {
+  for (const c of calls) console.log(round, c.callIndex, c.ok ? c.logs : `${c.error.kind}: ${c.error.failureMessage}`)
+}
+// 66351672n 0 [ <round + 1>, 'hi' ]
+// 66351672n 1 call: logic eval error: invalid ApplicationArgs index 0. Details: ...
+// 50000000n 0 [ <round + 1>, 'hi' ]
+// ...
+
+// A deployed app, at the latest round
+const [{ calls }] = await algorand.query.run({ appId: 760937186n, calls: [{ args: [selector] }] })
+```
+
+`run` returns one result per entry of `rounds` (the latest round resolved to its number), each with one outcome per call: `{ ok: true, logs, cost }` or `{ ok: false, error }`, where `error` is a `QueryCallError` with `kind: 'round'` (the whole round failed) or `'call'`, the node's `failureMessage`, and the call's partial `logs` and `cost`. `sender` (default: the fee sink), `budget` (per call, inner calls included; default and at most `maxCallBudget`), the created app's `clearProgram`, `globalSchema` and `localSchema`, and `protocol` (as simulate's, but the default is `latest`; with anything but `round` each result has a `protocolOverride`, whose note hits give the call index as `group`) are sent as given. `run` has no simulate fallback: it throws a `DTUnsupportedError` on a node without queries.
+
+### Composed app calls: `groups` and `rounds`
+
+`algorand.query.groups(composers, options)` and `algorand.query.rounds(composers, rounds, options)` take the same composers and options as `algorand.simulate.groups`/`rounds` and return the same kind of outcomes, so a caller can swap one for the other. Each built app call becomes a query call: calls to the same program (with the same clear program and schemas) or app from the same sender share requests, others get their own.
+
+```typescript
+const composer = algorand.newGroup().addAppCreateMethodCall({ sender, method, args, approvalProgram, clearStateProgram, schema })
+for (const {
+  round,
+  groups: [g],
+} of await algorand.query.rounds(composer, [45_000_000n, 46_000_000n])) {
+  if (g.ok) console.log(round, g.via, g.returns[0]?.returnValue, g.txns[0].logs)
+  else console.log(round, g.error.kind, g.error.message)
+}
+```
+
+Each outcome is `{ ok: true, txns, returns }` (each transaction's `logs` and `cost`, and the method calls' ABI returns as in `composer.send()`) or `{ ok: false, error }` with a `QueryGroupError` (`kind`, `failureMessage`, `failedAt`, `txns`), plus `via: 'query' | 'simulate'`. A failed call's `failureMessage` is worded as simulate's (`transaction <TXID>: logic eval error: ...`), so `LogicError` and other parsers of simulate's messages keep working.
+
+**The contract**: with query, every app call runs alone, against the round's state: the calls of one group don't see each other (no shared budget pool, `global GroupSize` 1, no `gtxn`), and the composers' fees, validity, notes and leases are ignored. With the simulate fallback, the groups run as composed, each on its own (`parallel: true`). So use these for independent read-only calls, such as ghost calls.
+
+`via` picks the path: `auto` (the default) queries when it can and simulates otherwise; `query` throws when it can't (a `DTNotAvailableError` for an older fork, a `DTUnsupportedError` for a node without queries, an `Error` naming the reason otherwise); `simulate` always simulates. Query is used when the fork has the `query` feature and the node reports query limits, `execTraceConfig` is off, `allowMoreLogging` is off or the node's `maxCallLogBytes` is at least simulate's 65,536, an `extraOpcodeBudget` plus 700 per transaction fits the node's `maxCallBudget` for every group, and every transaction is a NoOp app call that creates an app (with an approval program) or calls one (without programs), without an access list or `rejectVersion`, and no method call has transaction arguments. The options are checked the same way on both paths. A node without queries met mid-way (a load balancer mixing nodes) falls back to simulate with `auto`.
+
+|                                              | Query path                                                                                    | Simulate path                                                |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Protocol default                             | `round` is sent (simulate's default)                                                          | The round's own                                              |
+| Budget                                       | The node's `maxCallBudget` per call (not used if an `extraOpcodeBudget` + 700·n exceeds it)   | 700·n + `extraOpcodeBudget` per group                        |
+| Logs                                         | The called app's only, up to `maxCallLogBytes`                                                | The top-level app's only, within `allowMoreLogging`'s limits |
+| Fees, minimum balances, validity             | Not checked / ignored                                                                         | Checked as composed (signatures skipped)                     |
+| Unnamed resources                            | Always allowed                                                                                | With `allowUnnamedResources`                                 |
+| Calls of one group                           | Each alone                                                                                    | Together, in order                                           |
+| Error text                                   | `transaction <TXID>: logic eval error: ...` (the prefix added by utils, with the ID as built) | The node's `failureMessage`                                  |
+| Inner transactions                           | Run, not echoed                                                                               | Run, in `confirmations` but not in `txns`                    |
+| A round the request can't run at in `groups` | `kind: 'round'` outcomes                                                                      | Throws                                                       |
+
+### Limits, splitting and retries
+
+`algorand.query.limits()` returns the node's query limits (`maxCalls`, `maxRounds`, `maxCallBudget`, `maxCallLogBytes`, `maxResponseBytes`), or `undefined` on a node without queries; `algorand.query.supported()` says whether queries can be used. They come with the simulate limits, asked for once per algod client (`algorand.simulate.limits().query`).
+
+Requests hold at most `maxCalls` calls and `maxRounds` rounds (lower them with the `maxCalls` / `maxRounds` options of `run`, or `maxRounds` of `rounds`), and are split so their body stays under the node's 1,000,000 bytes. They are sent `concurrency` at a time (default 4). Duplicate rounds are queried once. When the latest round (0) is queried in more than one request, it is looked up first so every call sees the same block. A request whose results are over `maxResponseBytes`, or that runs over the node's time limit (504), is split in halves (rounds first, then calls) and sent again; a call that is still too large or too slow alone fails on its own (`kind: 'call'` with `run`, `kind: 'group'` with `groups`/`rounds`). Any other error cancels the requests in flight (and the node's work on them) and is thrown; a round after the latest one fails the whole request.
+
+A busy node answers 503 with `Retry-After`: the clients that `AlgorandClient.fromConfig` / `fromEnvironment` / `mainNet()` etc. make (`AlgoHttpClientWithRetry`) retry it, waiting at least as long as the header says (up to 10 s). They don't retry a 504 from `POST /v2/query`, which `QueryManager` splits instead. An `Algodv2` passed to `fromClients` has no retries.
+
 ## Aborting requests
 
-`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages and `algorand.simulate.groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
+`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages, `algorand.simulate.groups`/`rounds` and `algorand.query.run`/`groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). Aborting a query cancels all its requests in flight, and the node stops working on them. The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
 
 ```typescript
 const controller = new AbortController()
@@ -176,10 +250,13 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 
 ## Errors
 
-| Error                     | Meaning                                                                                                           |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `DTNotAvailableError`     | The loaded algosdk isn't the fork, or is an older fork without a feature an option needs (the message lists them) |
-| `isDTUnsupportedError(e)` | The node doesn't support the request: a stock algod, an older dtalgod, or a round it can't serve                  |
+| Error                                          | Meaning                                                                                                                          |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `DTNotAvailableError`                          | The loaded algosdk isn't the fork, or is an older fork without a feature an option needs (the message lists them)                |
+| `isDTUnsupportedError(e)`                      | The node doesn't support the request: a stock algod, an older dtalgod, or a round it can't serve                                 |
+| `QueryCallError`                               | A call of `algorand.query.run` at a round failed (`kind: 'call'`) or its round did (`kind: 'round'`); in the outcome, not thrown |
+| `QueryGroupError`                              | A group of `algorand.query.groups`/`rounds` failed, on either path (`kind` as simulate's); in the outcome, not thrown            |
+| `DTUnsupportedError` from `algorand.query.run` | The node has no queries (stock algod, an older dtalgod, or queries disabled)                                                     |
 
 ## Tests
 
@@ -188,6 +265,8 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 ```sh
 DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts
 ```
+
+The query tests branch on whether the node has queries: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
 
 The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.2.0.1.0.tgz` (a dev dependency), so the repo's own build and tests use it.
 
