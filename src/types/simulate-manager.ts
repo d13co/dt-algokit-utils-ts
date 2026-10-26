@@ -8,10 +8,12 @@ import {
   OptionalDTFeature,
   RawSimulateGroupOutcome,
   Round,
-  SimulateProtocolNote,
   SimulateLimits,
   SimulateProtocolOverride,
+  chunk,
   getSimulateLimits,
+  mergeProtocolOverrides,
+  offsetProtocolOverride,
   requireDTSdkFeatures,
 } from './dt-support'
 import { SendAtomicTransactionComposerResults } from './transaction'
@@ -150,18 +152,6 @@ const optionalFeatures = (options: { protocol?: string; validityWindow?: string 
   return [...(validityWindow ? (['validity-window'] as const) : []), ...(options.protocol ? (['simulate-protocol'] as const) : [])]
 }
 
-/** The order the node lists protocol notes in; codes it adds later go after these. */
-const PROTOCOL_NOTE_ORDER: readonly string[] = [
-  'semantics-changed',
-  'no-heartbeat-challenges',
-  'no-load-history',
-  'block-incentive-fields',
-  'block-hash-fields',
-  'online-stake-includes-expired',
-  'account-incentive-fields',
-  'app-version-starts-at-upgrade',
-]
-
 /** The validity window of transactions simulated at `round` (none for the latest round). */
 const validityAt = (round: Round | undefined) =>
   round ? { firstValidRound: BigInt(round) + 1n, lastValidRound: BigInt(round) + 11n } : undefined
@@ -190,12 +180,6 @@ function checkLimits(
       `extraOpcodeBudget ${extraOpcodeBudget} is more than the node allows (maxExtraOpcodeBudget ${limits.maxExtraOpcodeBudget})`,
     )
   }
-}
-
-const chunk = <T>(items: T[], size: number): T[][] => {
-  const chunks: T[][] = []
-  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size))
-  return chunks
 }
 
 /** Turns a successful group result into the same shape as `TransactionComposer.simulate` returns. */
@@ -244,26 +228,7 @@ function protocolOverrideAt(
   offset: number,
 ): SimulateProtocolOverride | undefined {
   const o = roundIndex === undefined ? response.protocolOverride : response.roundResults?.[roundIndex]?.protocolOverride
-  if (!o || !o.notes || offset === 0) return o
-  return {
-    ...o,
-    notes: o.notes.map((n) => (n.hits ? { ...n, hits: n.hits.map((h) => ({ ...h, group: h.group + offset })) } : n)),
-  }
-}
-
-/** Merges the protocol overrides of the requests that parallel groups were split across, at the same round. */
-function mergeProtocolOverrides(overrides: (SimulateProtocolOverride | undefined)[]): SimulateProtocolOverride | undefined {
-  const present = overrides.filter((o): o is SimulateProtocolOverride => o !== undefined)
-  if (present.length <= 1) return present[0]
-  const notes: SimulateProtocolNote[] = []
-  for (const n of present.flatMap((o) => o.notes ?? [])) {
-    const same = notes.find((m) => m.code === n.code && m.message === n.message)
-    if (!same) notes.push({ ...n, ...(n.hits ? { hits: [...n.hits] } : {}) })
-    else if (n.hits) same.hits = [...(same.hits ?? []), ...n.hits]
-  }
-  const rank = (code: string) => (PROTOCOL_NOTE_ORDER.includes(code) ? PROTOCOL_NOTE_ORDER.indexOf(code) : PROTOCOL_NOTE_ORDER.length)
-  notes.sort((a, b) => rank(a.code) - rank(b.code)) // stable: unknown codes keep their order
-  return { from: present[0].from, to: present[0].to, applied: present.some((o) => o.applied), ...(notes.length ? { notes } : {}) }
+  return offsetProtocolOverride(o, offset)
 }
 
 /**

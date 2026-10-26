@@ -224,6 +224,72 @@ export interface SimulateProtocolOverride {
   notes?: SimulateProtocolNote[]
 }
 
+// Helpers shared by the simulate and query managers
+
+/** The order the node lists protocol notes in; codes it adds later go after these. */
+export const PROTOCOL_NOTE_ORDER: readonly string[] = [
+  'semantics-changed',
+  'no-heartbeat-challenges',
+  'no-load-history',
+  'block-incentive-fields',
+  'block-hash-fields',
+  'online-stake-includes-expired',
+  'account-incentive-fields',
+  'app-version-starts-at-upgrade',
+]
+
+/**
+ * A protocol override with each note hit replaced by `map(hit)`: for results of requests that hold only part of the
+ * groups or calls asked for. Notes without hits, and an override without notes, are kept as they are.
+ * @param override The override of one request at one round, if any
+ * @param map The new hit for a hit of that request
+ */
+export function mapProtocolOverrideHits(
+  override: SimulateProtocolOverride | undefined,
+  map: (hit: SimulateProtocolNoteHit) => SimulateProtocolNoteHit,
+): SimulateProtocolOverride | undefined {
+  if (!override || !override.notes) return override
+  return { ...override, notes: override.notes.map((n) => (n.hits ? { ...n, hits: n.hits.map(map) } : n)) }
+}
+
+/**
+ * A protocol override with the notes' group indexes moved by `offset`: for a request whose first group (or call) is the
+ * `offset`th of those asked for.
+ */
+export function offsetProtocolOverride(
+  override: SimulateProtocolOverride | undefined,
+  offset: number,
+): SimulateProtocolOverride | undefined {
+  if (offset === 0) return override
+  return mapProtocolOverrideHits(override, (h) => ({ ...h, group: h.group + offset }))
+}
+
+/**
+ * Merges the protocol overrides of the requests that the groups (or calls) of one round were split across: notes with the
+ * same code and message become one with all their hits, in the node's note order, and the override is `applied` if it
+ * applied in any request. Undefined when no request has one.
+ */
+export function mergeProtocolOverrides(overrides: (SimulateProtocolOverride | undefined)[]): SimulateProtocolOverride | undefined {
+  const present = overrides.filter((o): o is SimulateProtocolOverride => o !== undefined)
+  if (present.length <= 1) return present[0]
+  const notes: SimulateProtocolNote[] = []
+  for (const n of present.flatMap((o) => o.notes ?? [])) {
+    const same = notes.find((m) => m.code === n.code && m.message === n.message)
+    if (!same) notes.push({ ...n, ...(n.hits ? { hits: [...n.hits] } : {}) })
+    else if (n.hits) same.hits = [...(same.hits ?? []), ...n.hits]
+  }
+  const rank = (code: string) => (PROTOCOL_NOTE_ORDER.includes(code) ? PROTOCOL_NOTE_ORDER.indexOf(code) : PROTOCOL_NOTE_ORDER.length)
+  notes.sort((a, b) => rank(a.code) - rank(b.code)) // stable: unknown codes keep their order
+  return { from: present[0].from, to: present[0].to, applied: present.some((o) => o.applied), ...(notes.length ? { notes } : {}) }
+}
+
+/** Splits `items` into consecutive chunks of at most `size`. */
+export const chunk = <T>(items: T[], size: number): T[][] => {
+  const chunks: T[][] = []
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size))
+  return chunks
+}
+
 /**
  * The limits a node places on simulate requests, and the simulate features it allows, as dtalgod reports them
  * (`GET /v2/transactions/simulate/limits`). A node without that endpoint (stock algod, or an older dtalgod) gets stock
