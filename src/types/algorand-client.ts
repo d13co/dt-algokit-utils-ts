@@ -11,6 +11,7 @@ import { ErrorTransformer, TransactionComposer } from './composer'
 import { AlgoConfig } from './network-client'
 import { SimulateManager } from './simulate-manager'
 import { DTManager } from './dt-manager'
+import { QueryManager } from './query-manager'
 import Account = algosdk.Account
 import LogicSigAccount = algosdk.LogicSigAccount
 
@@ -27,6 +28,7 @@ export class AlgorandClient {
   private _transactionCreator: AlgorandClientTransactionCreator
   private _dtManager: DTManager
   private _simulateManager: SimulateManager
+  private _queryManager: QueryManager
 
   private _cachedSuggestedParams?: algosdk.SuggestedParams
   private _cachedSuggestedParamsExpiry?: Date
@@ -51,6 +53,7 @@ export class AlgorandClient {
     this._appDeployer = new AppDeployer(this._appManager, this._transactionSender, this._clientManager.indexerIfPresent)
     this._dtManager = new DTManager(this._clientManager)
     this._simulateManager = new SimulateManager(this._clientManager)
+    this._queryManager = new QueryManager(this._clientManager, this._simulateManager)
   }
 
   /**
@@ -241,6 +244,17 @@ export class AlgorandClient {
    */
   public get simulate() {
     return this._simulateManager
+  }
+
+  /**
+   * Read-only TEAL queries on dtalgod (`POST /v2/query`): many calls of one program or app, each alone, at many rounds,
+   * with their logs. Needs a version of the time-travel fork of algosdk with the `query` feature.
+   * @returns The `QueryManager` instance.
+   * @example
+   * const [{ calls }] = await algorand.query.run({ program, rounds: [45_000_000n], calls: [{ args: [arg] }] });
+   */
+  public get query() {
+    return this._queryManager
   }
 
   /**

@@ -161,4 +161,62 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(old.protocolOverride?.to).toBe(now.protocolOverride!.to)
     }),
   )
+
+  describe('query', () => {
+    /** `#pragma version 10; global Round; itob; log; txn ApplicationArgs 0; log; int 1`, compiled by dtalgod's /v2/teal/compile */
+    const ECHO = new Uint8Array(Buffer.from('CjIGFrA2GgCwgQE=', 'base64'))
+    let supported: boolean
+
+    beforeAll(async () => {
+      supported = await algorand.query.supported()
+    })
+
+    const roundLog = (log: Uint8Array) => algosdk.decodeUint64(log, 'bigint')
+
+    test('runs a program at several rounds, in one request or chunked', async (ctx) => {
+      if (!supported) return ctx.skip('the node has no queries')
+      const params = { program: ECHO, protocol: 'round', rounds: [0, PAST, PAST], calls: [{ args: [new TextEncoder().encode('hi')] }, {}] }
+      const results = await algorand.query.run(params)
+      expect(results).toHaveLength(3)
+      expect(results[0].round).toBeGreaterThan(PAST)
+      expect(results.slice(1).map((r) => r.round)).toEqual([PAST, PAST])
+      for (const r of results) {
+        expect(r.protocolOverride).toBeUndefined()
+        const [hi, none] = r.calls
+        expect(hi.ok).toBe(true)
+        if (hi.ok) {
+          expect(roundLog(hi.logs[0])).toBe(r.round + 1n)
+          expect(new TextDecoder().decode(hi.logs[1])).toBe('hi')
+          expect(hi.cost).toBeGreaterThan(0)
+        }
+        expect(none.ok).toBe(false)
+        if (!none.ok) {
+          expect(none.error).toMatchObject({ kind: 'call', callIndex: 1 })
+          expect(none.error.failureMessage).toMatch(/^logic eval error: invalid ApplicationArgs index 0/)
+          expect(none.error.logs.map(roundLog)).toEqual([r.round + 1n])
+        }
+      }
+      // One call and one round per request: the same results, with the latest round pinned
+      const chunked = await algorand.query.run(params, { maxCalls: 1, maxRounds: 1 })
+      expect(chunked.slice(1)).toEqual(results.slice(1))
+      expect(chunked[0].round).toBeGreaterThanOrEqual(results[0].round)
+    })
+
+    test('calls a deployed app at the latest round and before it existed', async (ctx) => {
+      if (!supported) return ctx.skip('the node has no queries')
+      const [now] = await algorand.query.run({ appId: XGOV, calls: [{}] })
+      expect(now.round).toBeGreaterThanOrEqual(latest)
+      expect(now.calls).toHaveLength(1)
+      // Before the app existed: a failed call or round, not a thrown error
+      const [before] = await algorand.query.run({ appId: XGOV, rounds: [PAST], calls: [{}] })
+      expect(before.round).toBe(PAST)
+      expect(before.calls[0].ok).toBe(false)
+    })
+
+    test('a node without queries throws DTUnsupportedError', async (ctx) => {
+      if (supported) return ctx.skip('the node has queries')
+      expect(await algorand.query.limits()).toBeUndefined()
+      expect(isDTUnsupportedError(await algorand.query.run({ program: ECHO, calls: [{}] }).catch((e) => e))).toBe(true)
+    })
+  })
 })

@@ -5,20 +5,21 @@ import stateArc56 from '../../tests/example-contracts/state/State.arc56.json'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
 import { DTAlgodLike, DTNotAvailableError, isDTUnsupportedError } from './dt-support'
+import { QueryCallError, QueryCallOutcome } from './query-manager'
 import modelsv2 = algosdk.modelsv2
 
 // Offline tests of the time travel and extended simulate features, against a stub algod.
 
 type Call = { method: 'get' | 'post'; path: string; query: Record<string, string>; body?: Uint8Array; options?: Record<string, unknown> }
 type Answer = { status: number; json?: unknown; body?: Uint8Array }
-type Route = { method: 'get' | 'post'; path: string | RegExp; answer: (call: Call) => Answer }
+type Route = { method: 'get' | 'post'; path: string | RegExp; answer: (call: Call) => Answer | Promise<Answer> }
 
 /** A BaseHTTPClient that answers from routes, in the order they were added; a route answers once unless `repeat`. */
 class StubClient implements algosdk.BaseHTTPClient {
   calls: Call[] = []
   private routes: (Route & { repeat: boolean })[] = []
 
-  on(method: 'get' | 'post', path: string | RegExp, answer: (call: Call) => Answer, repeat = false) {
+  on(method: 'get' | 'post', path: string | RegExp, answer: (call: Call) => Answer | Promise<Answer>, repeat = false) {
     this.routes.push({ method, path, answer, repeat })
     return this
   }
@@ -31,7 +32,7 @@ class StubClient implements algosdk.BaseHTTPClient {
     if (i < 0) throw new Error(`unexpected request ${call.method} ${call.path}`)
     const route = this.routes[i]
     if (!route.repeat) this.routes.splice(i, 1)
-    const { status, json, body } = route.answer(call)
+    const { status, json, body } = await route.answer(call)
     const response = { body: body ?? new TextEncoder().encode(JSON.stringify(json)), status, headers: {} }
     if (status >= 300) {
       const { message } = (json ?? {}) as { message?: string }
@@ -257,6 +258,7 @@ describe('time travel', () => {
   test('the fork client is shaped like DTAlgodLike', () => {
     const client: DTAlgodLike = new algosdk.DTAlgodClient('', 'http://localhost')
     expect(client).toBeDefined()
+    expect(client.query).toBeTypeOf('function')
   })
 
   describe('reads at a round', () => {
@@ -1037,6 +1039,422 @@ describe('time travel', () => {
         expect(limitsCalls(stub)).toHaveLength(0)
         await expect(algorand.simulate.limits()).rejects.toThrow(DTNotAvailableError)
       })
+    })
+  })
+})
+
+/** dtalgod's query limits, as its simulate limits endpoint answers them. */
+const QUERY_LIMITS = {
+  'max-calls': 1024,
+  'max-call-budget': 320_000,
+  'max-call-log-bytes': 65_536,
+  'max-response-bytes': 67_108_864,
+  'max-rounds': 16,
+}
+
+/** Answers the simulate limits endpoint as dtalgod with queries, with these query limits. */
+const queryLimitsOk = (stub: StubClient, query: Partial<typeof QUERY_LIMITS> = {}, limits: Partial<typeof LIMITS> = {}) =>
+  stub.on('get', '/v2/transactions/simulate/limits', json({ ...LIMITS, ...limits, query: { ...QUERY_LIMITS, ...query } }), true)
+
+type SentQueryCall = {
+  args?: Uint8Array[]
+  accounts?: string[]
+  'foreign-apps'?: bigint[]
+  'foreign-assets'?: bigint[]
+  boxes?: { app?: bigint; name: Uint8Array }[]
+}
+type SentQuery = {
+  program?: Uint8Array
+  'clear-program'?: Uint8Array
+  'global-schema'?: { 'num-uint'?: bigint; 'num-byte-slice'?: bigint }
+  'local-schema'?: { 'num-uint'?: bigint; 'num-byte-slice'?: bigint }
+  'app-id'?: bigint
+  sender?: string
+  rounds?: bigint[]
+  protocol?: string
+  budget?: bigint
+  calls: SentQueryCall[]
+}
+
+/** The body of a query request, decoded with the node's keys. */
+const sentQuery = (call: Call) => algosdk.msgpackRawDecode(call.body!) as SentQuery
+
+const queries = (stub: StubClient) => stub.calls.filter((c) => c.path === '/v2/query')
+
+/**
+ * A query answer where each call logs its first arg (or nothing) and the round + 1, at each round (0 answered as
+ * LAST_ROUND), with cost 10 + its index in the request. `callError` fails a call after its logs, `roundError` a round.
+ * With a protocol other than `round`, each round has a protocol override with a note hit on the request's first call.
+ */
+const queryEcho =
+  ({
+    callError,
+    roundError,
+  }: { callError?: (arg: string, round: bigint) => string | undefined; roundError?: (round: bigint) => string | undefined } = {}) =>
+  (call: Call): Answer => {
+    const request = sentQuery(call)
+    const rounds = (request.rounds ?? [0n]).map((r) => (r === 0n ? BigInt(LAST_ROUND) : r))
+    const override =
+      request.protocol && request.protocol !== 'round'
+        ? {
+            from: 'v38',
+            to: 'v42',
+            applied: true,
+            notes: [
+              { code: 'semantics-changed', message: 'MinTxnFee: 1000 → 1000' },
+              { code: 'block-incentive-fields', message: 'block read an incentive field', hits: [{ group: 0, path: [0] }] },
+            ],
+          }
+        : undefined
+    const body = {
+      'last-round': LAST_ROUND,
+      rounds: rounds.map((round) => {
+        const error = roundError?.(round)
+        if (error) return { round, error }
+        return {
+          round,
+          ...(override ? { protocol: override } : {}),
+          calls: request.calls.map((c, i) => {
+            const arg = c.args?.[0]
+            const failure = callError?.(Buffer.from(arg ?? []).toString(), round)
+            return {
+              logs: [...(arg ? [arg] : []), algosdk.encodeUint64(round + 1n)],
+              cost: 10 + i,
+              ...(failure ? { error: failure } : {}),
+            }
+          }),
+        }
+      }),
+    }
+    return { status: 200, body: algosdk.msgpackRawEncode(body) }
+  }
+
+const tooLarge = () => ({ status: 400, json: { message: 'query response too large: over 1000 bytes' } })
+const enc = (text: string) => new TextEncoder().encode(text)
+const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
+/** The logs of each call outcome as text (the round log as a number), or the error kind. */
+const callLogs = (results: { round: bigint; calls: QueryCallOutcome[] }[]) =>
+  results.map((r) => [
+    r.round,
+    r.calls.map((c) => (c.ok ? c.logs.map((l) => (l.length === 8 ? algosdk.decodeUint64(l, 'bigint') : dec(l))) : c.error.kind)),
+  ])
+
+describe('query', () => {
+  let stub: StubClient
+  let algorand: AlgorandClient
+  const program = new Uint8Array([10, 50, 6, 22, 176, 54, 26, 0, 176, 129, 1])
+  const someone = algosdk.generateAccount().addr.toString()
+
+  beforeEach(() => {
+    stub = new StubClient()
+    algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+  })
+
+  describe('run', () => {
+    test('one request: the request body, the results in order and the signal', async () => {
+      queryLimitsOk(stub).on('post', '/v2/query', queryEcho({ callError: (arg) => (arg === '' ? 'logic eval error: no arg' : undefined) }))
+      const controller = new AbortController()
+      const results = await algorand.query.run(
+        {
+          program,
+          sender: someone,
+          budget: 1000,
+          rounds: [1000, 2000n],
+          calls: [
+            { args: [enc('hi')], accounts: [someone], foreignApps: [5], foreignAssets: [6n], boxes: [{ app: 0, name: enc('b') }] },
+            {},
+          ],
+        },
+        { signal: controller.signal },
+      )
+      const [call] = queries(stub)
+      expect(call.query.format).toBe('msgpack')
+      expect(call.options?.signal).toBeInstanceOf(AbortSignal)
+      const body = sentQuery(call)
+      expect(Object.keys(body).sort()).toEqual(['budget', 'calls', 'program', 'rounds', 'sender'])
+      expect(body).toMatchObject({ program, sender: someone, budget: 1000n, rounds: [1000n, 2000n] })
+      expect(body.calls).toEqual([
+        { args: [enc('hi')], accounts: [someone], 'foreign-apps': [5n], 'foreign-assets': [6n], boxes: [{ name: enc('b') }] },
+        {},
+      ])
+      expect(callLogs(results)).toEqual([
+        [1000n, [['hi', 1001n], 'call']],
+        [2000n, [['hi', 2001n], 'call']],
+      ])
+      const failed = results[0].calls[1]
+      expect(failed).toMatchObject({ ok: false, callIndex: 1, round: 1000n })
+      if (!failed.ok) {
+        expect(failed.error).toBeInstanceOf(QueryCallError)
+        expect(failed.error).toMatchObject({
+          kind: 'call',
+          failureMessage: 'logic eval error: no arg',
+          cost: 11,
+          callIndex: 1,
+          round: 1000n,
+        })
+        expect(failed.error.logs.map((l) => algosdk.decodeUint64(l, 'bigint'))).toEqual([1001n])
+        expect(failed.error.message).toBe('Query call 1 at round 1000 failed: logic eval error: no arg')
+      }
+      expect(results[0].calls[0]).toMatchObject({ ok: true, cost: 10 })
+    })
+
+    test('an app ID and a protocol; without rounds, the latest round', async () => {
+      queryLimitsOk(stub).on('post', '/v2/query', queryEcho())
+      const [result] = await algorand.query.run({ appId: 77n, protocol: 'latest', calls: [{ args: [enc('a')] }] })
+      const body = sentQuery(queries(stub)[0])
+      expect(body).toMatchObject({ 'app-id': 77n, protocol: 'latest', rounds: [0n] })
+      expect(body.program).toBeUndefined()
+      expect(result.round).toBe(BigInt(LAST_ROUND))
+      expect(result.protocolOverride).toMatchObject({ from: 'v38', to: 'v42', applied: true })
+    })
+
+    test('chunking by the node limits and the options, results in input order, duplicated rounds sent once', async () => {
+      queryLimitsOk(stub, { 'max-calls': 2, 'max-rounds': 2 }).on('post', '/v2/query', queryEcho(), true)
+      const calls = ['a', 'b', 'c', 'd', 'e'].map((a) => ({ args: [enc(a)] }))
+      const results = await algorand.query.run({ program, rounds: [30, 10, 20, 10], calls })
+      const sent = queries(stub).map(sentQuery)
+      expect(sent).toHaveLength(6)
+      expect(sent.map((q) => [q.rounds, q.calls.map((c) => dec(c.args![0])).join('')])).toEqual(
+        expect.arrayContaining([
+          [[30n, 10n], 'ab'],
+          [[30n, 10n], 'cd'],
+          [[30n, 10n], 'e'],
+          [[20n], 'ab'],
+          [[20n], 'cd'],
+          [[20n], 'e'],
+        ]),
+      )
+      expect(results.map((r) => r.round)).toEqual([30n, 10n, 20n, 10n])
+      for (const r of results) {
+        expect(r.calls.map((c) => (c.ok ? dec(c.logs[0]) : undefined))).toEqual(['a', 'b', 'c', 'd', 'e'])
+        expect(r.calls.map((c) => c.callIndex)).toEqual([0, 1, 2, 3, 4])
+      }
+      // The options lower the limits
+      stub.calls = []
+      await algorand.query.run({ program, rounds: [1, 2], calls }, { maxCalls: 1, maxRounds: 1 })
+      expect(queries(stub)).toHaveLength(10)
+    })
+
+    test('calls are split by the request body limit; a call too large alone throws', async () => {
+      queryLimitsOk(stub).on('post', '/v2/query', queryEcho(), true)
+      const big = (fill: number) => ({ args: [new Uint8Array(400_000).fill(fill)] })
+      const results = await algorand.query.run({ program, rounds: [5], calls: [big(1), big(2), big(3)] })
+      expect(queries(stub).map((c) => sentQuery(c).calls.length)).toEqual([2, 1])
+      expect(queries(stub).every((c) => c.body!.length < 1_000_000)).toBe(true)
+      expect(results[0].calls.map((c) => c.ok && c.logs[0][0])).toEqual([1, 2, 3])
+      await expect(algorand.query.run({ program, calls: [{ args: [new Uint8Array(1_000_000)] }] })).rejects.toThrow(/too large to send/)
+    })
+
+    test('the latest round is resolved first when it is queried in more than one request', async () => {
+      queryLimitsOk(stub, { 'max-calls': 2 }).on('get', '/v2/status', nodeStatus).on('post', '/v2/query', queryEcho(), true)
+      const calls = [{ args: [enc('a')] }, { args: [enc('b')] }, { args: [enc('c')] }]
+      const [result] = await algorand.query.run({ program, rounds: [0], calls })
+      expect(stub.calls.filter((c) => c.path === '/v2/status')).toHaveLength(1)
+      expect(queries(stub).map((c) => sentQuery(c).rounds)).toEqual([[BigInt(LAST_ROUND)], [BigInt(LAST_ROUND)]])
+      expect(result.round).toBe(BigInt(LAST_ROUND))
+      // In one request, the node resolves it
+      stub.calls = []
+      await algorand.query.run({ program, calls: calls.slice(0, 2) })
+      expect(stub.calls.filter((c) => c.path === '/v2/status')).toHaveLength(0)
+      expect(sentQuery(queries(stub)[0]).rounds).toEqual([0n])
+    })
+
+    test('a response too large is split by rounds, then by calls; a call too large alone fails on its own', async () => {
+      queryLimitsOk(stub)
+        .on('post', '/v2/query', tooLarge) // 2 rounds × 2 calls
+        .on('post', '/v2/query', tooLarge) // round 10 × 2 calls
+        .on('post', '/v2/query', queryEcho()) // round 20 × 2 calls
+        .on('post', '/v2/query', queryEcho()) // round 10 × call 0
+        .on('post', '/v2/query', tooLarge) // round 10 × call 1
+      const results = await algorand.query.run({ program, rounds: [10, 20], calls: [{ args: [enc('a')] }, { args: [enc('b')] }] })
+      expect(queries(stub).map((c) => [sentQuery(c).rounds, sentQuery(c).calls.length])).toEqual([
+        [[10n, 20n], 2],
+        [[10n], 2],
+        [[20n], 2],
+        [[10n], 1],
+        [[10n], 1],
+      ])
+      expect(callLogs(results)).toEqual([
+        [10n, [['a', 11n], 'call']],
+        [
+          20n,
+          [
+            ['a', 21n],
+            ['b', 21n],
+          ],
+        ],
+      ])
+      const alone = results[0].calls[1]
+      if (!alone.ok)
+        expect(alone.error).toMatchObject({ kind: 'call', failureMessage: 'query response too large: over 1000 bytes', logs: [] })
+    })
+
+    test('a 504 is split the same way, and a body over the limit splits calls', async () => {
+      const timeout = () => ({ status: 504, json: { message: 'query time limit exceeded' } })
+      queryLimitsOk(stub).on('post', '/v2/query', timeout).on('post', '/v2/query', queryEcho()).on('post', '/v2/query', queryEcho())
+      const results = await algorand.query.run({ program, rounds: [10, 20], calls: [{}] })
+      expect(queries(stub).map((c) => sentQuery(c).rounds)).toEqual([[10n, 20n], [10n], [20n]])
+      expect(results.every((r) => r.calls[0].ok)).toBe(true)
+
+      stub.calls = []
+      stub
+        .on('post', '/v2/query', () => ({ status: 400, json: { message: 'http: request body too large' } }))
+        .on('post', '/v2/query', queryEcho())
+        .on('post', '/v2/query', queryEcho())
+      await algorand.query.run({ program, rounds: [10, 20], calls: [{}, {}] })
+      expect(queries(stub).map((c) => [sentQuery(c).rounds, sentQuery(c).calls.length])).toEqual([
+        [[10n, 20n], 2],
+        [[10n, 20n], 1],
+        [[10n, 20n], 1],
+      ])
+    })
+
+    test('at most `concurrency` requests in flight', async () => {
+      let inFlight = 0
+      let most = 0
+      const echo = queryEcho()
+      queryLimitsOk(stub, { 'max-calls': 1 }).on(
+        'post',
+        '/v2/query',
+        async (call) => {
+          most = Math.max(most, ++inFlight)
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          inFlight--
+          return echo(call)
+        },
+        true,
+      )
+      const calls = Array.from({ length: 7 }, (_, i) => ({ args: [enc(String(i))] }))
+      const [result] = await algorand.query.run({ program, rounds: [9], calls }, { concurrency: 2 })
+      expect(queries(stub)).toHaveLength(7)
+      expect(most).toBe(2)
+      expect(result.calls.map((c) => c.ok && dec(c.logs[0]))).toEqual(['0', '1', '2', '3', '4', '5', '6'])
+    })
+
+    test('a fatal error cancels the requests in flight and is thrown', async () => {
+      const hang = (call: Call) =>
+        new Promise<Answer>((_, reject) => {
+          const signal = call.options!.signal as AbortSignal
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      queryLimitsOk(stub, { 'max-calls': 1 })
+        .on('post', '/v2/query', hang)
+        .on('post', '/v2/query', hang)
+        .on('post', '/v2/query', async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+          return { status: 400, json: { message: 'call 0: account "x": bad address' } }
+        })
+      const error = await algorand.query.run({ program, rounds: [9], calls: [{}, {}, {}] }, { concurrency: 3 }).catch((e) => e)
+      expect(error.message).toMatch(/bad address/)
+      const sent = queries(stub)
+      expect(sent).toHaveLength(3)
+      expect(sent.every((c) => (c.options!.signal as AbortSignal).aborted)).toBe(true)
+    })
+
+    test("aborting the caller's signal cancels the requests in flight", async () => {
+      const controller = new AbortController()
+      queryLimitsOk(stub).on('post', '/v2/query', (call) => {
+        const signal = call.options!.signal as AbortSignal
+        setTimeout(() => controller.abort(), 1)
+        return new Promise<Answer>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+      })
+      await expect(algorand.query.run({ program, calls: [{}] }, { signal: controller.signal })).rejects.toMatchObject({
+        name: 'AbortError',
+      })
+      // Once aborted, nothing is sent
+      const sent = stub.calls.length
+      await expect(algorand.query.run({ program, calls: [{}] }, { signal: controller.signal })).rejects.toMatchObject({
+        name: 'AbortError',
+      })
+      expect(stub.calls).toHaveLength(sent)
+    })
+
+    test('a round error fails every call of the round', async () => {
+      queryLimitsOk(stub).on('post', '/v2/query', queryEcho({ roundError: (r) => (r === 10n ? 'round 10 is not available' : undefined) }))
+      const results = await algorand.query.run({ program, rounds: [10, 20], calls: [{}, {}] })
+      expect(callLogs(results)).toEqual([
+        [10n, ['round', 'round']],
+        [20n, [[21n], [21n]]],
+      ])
+      const c = results[0].calls[1]
+      if (!c.ok) {
+        expect(c.error).toMatchObject({ kind: 'round', callIndex: 1, round: 10n, failureMessage: 'round 10 is not available', logs: [] })
+        expect(c.error.message).toBe('Could not query round 10: round 10 is not available')
+      }
+    })
+
+    test('protocol overrides are merged across requests, with hits at the call indexes', async () => {
+      queryLimitsOk(stub, { 'max-calls': 2 }).on('get', '/v2/status', nodeStatus).on('post', '/v2/query', queryEcho(), true)
+      const [result] = await algorand.query.run({ program, rounds: [100], protocol: 'latest', calls: [{}, {}, {}] })
+      expect(queries(stub)).toHaveLength(2)
+      expect(result.protocolOverride).toEqual({
+        from: 'v38',
+        to: 'v42',
+        applied: true,
+        notes: [
+          { code: 'semantics-changed', message: 'MinTxnFee: 1000 → 1000' },
+          {
+            code: 'block-incentive-fields',
+            message: 'block read an incentive field',
+            hits: [
+              { group: 0, path: [0] },
+              { group: 2, path: [0] },
+            ],
+          },
+        ],
+      })
+    })
+
+    test('invalid requests throw before sending', async () => {
+      queryLimitsOk(stub, { 'max-call-budget': 1000 })
+      await expect(algorand.query.run({ program, calls: [] })).rejects.toThrow('A query needs at least one call')
+      await expect(algorand.query.run({ calls: [{}] })).rejects.toThrow('exactly one of program and appId')
+      await expect(algorand.query.run({ program, appId: 5, calls: [{}] })).rejects.toThrow('exactly one of program and appId')
+      await expect(algorand.query.run({ appId: 5, clearProgram: program, calls: [{}] })).rejects.toThrow(/need program, not appId/)
+      await expect(algorand.query.run({ program, rounds: [-1], calls: [{}] })).rejects.toThrow(RangeError)
+      await expect(algorand.query.run({ program, calls: [{}] }, { concurrency: 0 })).rejects.toThrow(/concurrency/)
+      await expect(algorand.query.run({ program, budget: 1001, calls: [{}] })).rejects.toThrow(/maxCallBudget 1000/)
+      expect(queries(stub)).toHaveLength(0)
+    })
+
+    test('a node without queries throws DTUnsupportedError; supported() and limits()', async () => {
+      limitsOk(stub)
+      expect(await algorand.query.supported()).toBe(false)
+      expect(await algorand.query.limits()).toBeUndefined()
+      expect(isDTUnsupportedError(await algorand.query.run({ program, calls: [{}] }).catch((e) => e))).toBe(true)
+      expect(queries(stub)).toHaveLength(0)
+
+      stub = new StubClient()
+      algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+      queryLimitsOk(stub).on('post', '/v2/query', () => ({ status: 404, json: { message: 'Not Found' } }))
+      expect(await algorand.query.supported()).toBe(true)
+      expect(await algorand.query.limits()).toEqual({
+        maxCalls: 1024,
+        maxCallBudget: 320_000,
+        maxCallLogBytes: 65_536,
+        maxResponseBytes: 67_108_864,
+        maxRounds: 16,
+      })
+      expect(isDTUnsupportedError(await algorand.query.run({ program, calls: [{}] }).catch((e) => e))).toBe(true)
+    })
+
+    test('a fork without the query feature', async () => {
+      queryLimitsOk(stub)
+      await withoutFeatures(['query'], async () => {
+        expect(await algorand.query.supported()).toBe(false)
+        await expect(algorand.query.run({ program, calls: [{}] })).rejects.toThrow(DTNotAvailableError)
+        await expect(algorand.query.limits()).rejects.toThrow(DTNotAvailableError)
+      })
+      expect(queries(stub)).toHaveLength(0)
+    })
+
+    test('simulate limits include the query limits only when the node has queries', async () => {
+      queryLimitsOk(stub, { 'max-calls': 7 })
+      expect((await algorand.simulate.limits()).query).toMatchObject({ maxCalls: 7, maxRounds: 16 })
+      stub = new StubClient()
+      algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+      limitsOk(stub)
+      expect('query' in (await algorand.simulate.limits())).toBe(false)
     })
   })
 })

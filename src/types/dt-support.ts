@@ -24,7 +24,7 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
 ] as const)
 
 /** `DTAlgodClient.features` that only some algokit-utils options need, checked when they are used. */
-export type OptionalDTFeature = 'validity-window' | 'simulate-protocol' | 'simulate-limits'
+export type OptionalDTFeature = 'validity-window' | 'simulate-protocol' | 'simulate-limits' | 'query'
 
 /** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork, or a version without it. */
 export class DTNotAvailableError extends Error {
@@ -65,7 +65,7 @@ export const fetchOptions = (options?: { signal?: AbortSignal }): { signal: Abor
   options?.signal ? { signal: options.signal } : undefined
 
 /** algosdk's `.do(headers, customOptions)`: `customOptions` are fetch options, such as `{ signal }`. */
-type DoArgs = [headers?: Record<string, string>, customOptions?: Record<string, unknown>]
+export type DoArgs = [headers?: Record<string, string>, customOptions?: Record<string, unknown>]
 
 /** A request that can be read at a past round. */
 export interface RoundRequestLike<T> {
@@ -310,6 +310,68 @@ export interface SimulateLimits {
   developerApi: boolean
   /** Whether the node reported these limits. False when it has no limits endpoint: these are then stock algod's limits. */
   reported: boolean
+  /** The limits of read-only queries (`POST /v2/query`): present only when the node has queries. */
+  query?: QueryLimits
+}
+
+/** The limits a node places on read-only queries (`POST /v2/query`), as dtalgod reports them in its simulate limits. */
+export interface QueryLimits {
+  /** The most calls a request may hold (`MaxAPIQueryCalls`). */
+  maxCalls: number
+  /** The most opcode budget of a call, and its budget when the request sets none (`MaxAPIQueryCallBudget`). */
+  maxCallBudget: number
+  /** The most bytes each program of a call may log, in up to 2,048 logs. 0: the protocol's limits, 1,024 bytes in 32 logs (`MaxAPIQueryCallLogBytes`). */
+  maxCallLogBytes: number
+  /**
+   * The most bytes of logs and errors a request may return, across its calls and rounds (a round listed twice counts
+   * twice, each log 48 bytes more than its length). 0: no limit (`MaxAPIQueryResponseBytes`).
+   */
+  maxResponseBytes: number
+  /** The most entries a request may list in `rounds`, duplicates included (`MaxAPIQueryRounds`). */
+  maxRounds: number
+}
+
+/** A call of a query request, as the fork's `QueryCallParams`. */
+export interface QueryCallLike {
+  args?: Uint8Array[]
+  accounts?: string[]
+  foreignApps?: bigint[]
+  foreignAssets?: bigint[]
+  boxes?: { app: bigint; name: Uint8Array }[]
+}
+
+/** A query request, as the fork's `QueryRequestParams`. */
+export interface QueryRequestParamsLike {
+  program?: Uint8Array
+  clearProgram?: Uint8Array
+  globalSchema?: { numUint: number; numByteSlice: number }
+  localSchema?: { numUint: number; numByteSlice: number }
+  appId?: bigint
+  sender?: string
+  rounds?: bigint[]
+  protocol?: string
+  budget?: number
+  calls: QueryCallLike[]
+}
+
+/** The result of one call of a query at one round. */
+export interface QueryCallResultLike {
+  logs: Uint8Array[]
+  cost: number
+  error?: string
+}
+
+/** The response of a query request: one round result per requested round, in order. */
+export interface QueryResponseLike {
+  lastRound: bigint
+  rounds: { round: bigint; error?: string; protocolOverride?: SimulateProtocolOverride; calls: QueryCallResultLike[] }[]
+}
+
+/** A query request (`POST /v2/query`). */
+export interface RunQueryLike {
+  rounds(rounds: Round[]): this
+  protocol(protocol: string): this
+  do(...args: DoArgs): Promise<QueryResponseLike>
 }
 
 /** The response of an extended simulate request. */
@@ -363,6 +425,8 @@ export interface DTAlgodLike {
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
   /** The node's simulate limits, cached per client; stock algod's after a 404. Only in forks with the `simulate-limits` feature. */
   simulateLimits?(): Promise<SimulateLimits>
+  /** A read-only query (`POST /v2/query`). Only in forks with the `query` feature. */
+  query?(request: QueryRequestParamsLike): RunQueryLike
 }
 
 /** A window of rounds that one extended simulate request covers, from `packSimulateRounds`. */
@@ -394,7 +458,13 @@ interface DTSdk {
         },
       ): modelsv2.SimulateRequest
     }
+    /** Only in forks with the `query` feature. */
+    QueryCall?: new (call: QueryCallLike) => algosdk.Encodable
   }
+  /** Whether an error of a query request means its results are over the node's `maxResponseBytes`. Only in forks with the `query` feature. */
+  isQueryResponseTooLarge?(error: unknown): boolean
+  /** The most bytes of a query request body. Only in forks with the `query` feature. */
+  MAX_QUERY_REQUEST_BYTES?: number
 }
 
 const sdk = algosdk as unknown as Partial<DTSdk>
@@ -451,9 +521,42 @@ export async function getSimulateLimits(algod: algosdk.Algodv2): Promise<Simulat
   const client = tt.DTAlgodClient.from(algod)
   if (!client.simulateLimits) return undefined
   // A copy: the fork's object is shared by every caller of the client
-  const { maxTxnGroups, maxRounds, maxExtraOpcodeBudget, resourceLimitMultiplier, timeTravel, developerApi, reported } =
+  const { maxTxnGroups, maxRounds, maxExtraOpcodeBudget, resourceLimitMultiplier, timeTravel, developerApi, reported, query } =
     await client.simulateLimits()
-  return { maxTxnGroups, maxRounds, maxExtraOpcodeBudget, resourceLimitMultiplier, timeTravel, developerApi, reported: reported === true }
+  return {
+    maxTxnGroups,
+    maxRounds,
+    maxExtraOpcodeBudget,
+    resourceLimitMultiplier,
+    timeTravel,
+    developerApi,
+    reported: reported === true,
+    // Only when present, so the limits of a node without queries have no `query` key
+    ...(query
+      ? {
+          query: {
+            maxCalls: query.maxCalls,
+            maxCallBudget: query.maxCallBudget,
+            maxCallLogBytes: query.maxCallLogBytes,
+            maxResponseBytes: query.maxResponseBytes,
+            maxRounds: query.maxRounds,
+          },
+        }
+      : {}),
+  }
+}
+
+/**
+ * Returns the node's query limits (`query` of its simulate limits), or `undefined` when the node has no queries (stock
+ * algod, an older dtalgod, or queries disabled) or the loaded algosdk is not a version of the time-travel fork with the
+ * `query` feature.
+ * @param algod The algod client to ask
+ * @throws The limits request's error, other than a 404
+ */
+export async function getQueryLimits(algod: algosdk.Algodv2): Promise<QueryLimits | undefined> {
+  const tt = getDTSdk()
+  if (!tt || !(tt.DTAlgodClient.features ?? []).includes('query')) return undefined
+  return (await getSimulateLimits(algod))?.query
 }
 
 /**
