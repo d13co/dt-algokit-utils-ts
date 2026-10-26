@@ -1,6 +1,5 @@
 # dt-algokit-utils
 
-> [!NOTE]
 > `@d13co/dt-algokit-utils` is a fork of [`@algorandfoundation/algokit-utils`](https://github.com/algorandfoundation/algokit-utils-ts) that adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel and extended simulate. The upstream README follows below.
 
 It is a drop-in replacement: existing APIs, types and generated typed clients work unchanged, and on stock `algosdk` or a stock algod everything behaves as upstream while the new features throw.
@@ -43,9 +42,11 @@ overrides:
   algosdk: npm:dtalgosdk@3.9.0-dt.2.0.0.1
 ```
 
-yarn: the same entries under `resolutions` in `package.json`. bun: the same entries under `overrides`.
+yarn: the same entries under `resolutions` in `package.json` (yarn ignores `overrides`). Yarn 4 refuses versions published less than a day ago (`npmMinimalAgeGate`); to install a new release right away, add `npmPreapprovedPackages: ["@d13co/dt-algokit-utils", "dtalgosdk"]` to `.yarnrc.yml`. bun: the same entries under `overrides`.
 
-Then check that only the forks are installed: `npm ls algosdk @algorandfoundation/algokit-utils` or `pnpm why algosdk`. Fork versions are prereleases (`-dt.…`), so `^` ranges don't match them: pin the exact versions as above. Other packages' `algosdk` peer ranges such as `^3.0.0` don't match them either, so expect peer dependency warnings; if npm refuses to install, add `--legacy-peer-deps`.
+Fork versions are prereleases (`-dt.…`), which `^` ranges don't match, so pin the exact versions as above. With the overrides in place, other packages' `algosdk` and algokit-utils peer ranges are satisfied. Don't reach for `--legacy-peer-deps` or `--force` if npm reports a peer conflict: it means an override is missing, and those flags install a second, stock copy.
+
+Then check that only the forks are installed: `npm ls algosdk @algorandfoundation/algokit-utils` or `pnpm why algosdk`.
 
 ---
 

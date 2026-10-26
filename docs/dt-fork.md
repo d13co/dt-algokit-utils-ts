@@ -1,6 +1,6 @@
 # dt-algokit-utils: differences from algokit-utils
 
-`@d13co/dt-algokit-utils` is a fork of [`@algorandfoundation/algokit-utils`](https://github.com/algorandfoundation/algokit-utils-ts) (based on 9.2.3) that adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel (state at any past round, and the rounds at which objects changed) and extended simulate (several transaction groups and several rounds per request).
+`@d13co/dt-algokit-utils` is a fork of [`@algorandfoundation/algokit-utils`](https://github.com/algorandfoundation/algokit-utils-ts) (based on 9.2.3-beta.2) that adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel (state at any past round, and the rounds at which objects changed) and extended simulate (several transaction groups and several rounds per request).
 
 - [Compatibility](#compatibility)
 - [Installing](#installing)
@@ -20,7 +20,7 @@ The fork is additive: every new parameter is optional and every new feature live
 
 - It runs on stock `algosdk` (`^3.5.2`). The fork of algosdk is detected at runtime; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
-- Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream. Reads with `round` throw rather than return the latest state.
+- Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round` throw rather than return the latest state.
 
 ## Installing
 
@@ -62,7 +62,8 @@ Changed (all additions are optional):
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `algorand.account.getInformation(address, options?)`                                                                                                          | `{ round }`                                                                                                                                   |
 | `algorand.asset.getById(assetId, options?)`, `getAccountInformation(address, assetId, options?)`                                                              | `{ round }`                                                                                                                                   |
-| `algorand.app.getById`, `getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue`, `getBoxValues`, `getBoxValueFromABIType`, `getBoxValuesFromABIType`  | `{ round, signal }` (an options argument, or `round` in the box request params)                                                               |
+| `algorand.app.getById`, `getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue`, `getBoxValues`                                                       | `{ round, signal }`                                                                                                                           |
+| `algorand.app.getBoxValueFromABIType`, `getBoxValuesFromABIType`                                                                                              | `round` in the box request params                                                                                                             |
 | `AppClient` state reads (`getGlobalState`, `getLocalState`, `getBoxNames`, `getBoxValue(s)`, `getBoxValue(s)FromABIType`, and `state.*` in generated clients) | `{ round }`, defaulting to the client's pinned round                                                                                          |
 | `AppClient` constructor / `clone` params                                                                                                                      | `round`                                                                                                                                       |
 | `AppClient` readonly ABI calls                                                                                                                                | Simulated at the pinned round, if any; their extra opcode budget follows the node's reported `maxExtraOpcodeBudget` (320,000 if not reported) |
@@ -165,7 +166,7 @@ With `'rewrite'` the transaction IDs change, so the results' `txIds` are those a
 
 ## Aborting requests
 
-`algorand.app` reads, `algorand.dt` version pages and `algorand.simulate.groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
+`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages and `algorand.simulate.groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
 
 ```typescript
 const controller = new AbortController()
@@ -175,10 +176,10 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 
 ## Errors
 
-| Error                     | Meaning                                                                                                         |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `DTNotAvailableError`     | The loaded algosdk isn't the fork, or is an older fork without a feature an option needs (`missing` lists them) |
-| `isDTUnsupportedError(e)` | The node doesn't support the request: a stock algod, an older dtalgod, or a round it can't serve                |
+| Error                     | Meaning                                                                                                           |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `DTNotAvailableError`     | The loaded algosdk isn't the fork, or is an older fork without a feature an option needs (the message lists them) |
+| `isDTUnsupportedError(e)` | The node doesn't support the request: a stock algod, an older dtalgod, or a round it can't serve                  |
 
 ## Tests
 
@@ -192,12 +193,26 @@ The algosdk fork is vendored as `vendor/algosdk-3.8.0-dt.2.tgz` (a dev dependenc
 
 ## Building and publishing
 
-```sh
-npm run build              # builds into dist/, with its own package.json and README
-npm publish ./dist         # publishes @d13co/dt-algokit-utils (public, tag latest, from publishConfig)
-```
+`npm run build` builds into `dist/`, with its own `package.json` and README, and the package is published from there (`npm publish ./dist`), never from the repo root (the root `prepublishOnly` refuses). The build rewrites the README's relative links to `https://github.com/d13co/dt-algokit-utils-ts/blob/main/`, so this branch must be the repo's `main`.
 
-Always publish `dist/`, never the repo root (the root `prepublishOnly` refuses). The build rewrites the README's relative links to `https://github.com/d13co/dt-algokit-utils-ts/blob/main/`, so push the branch there before publishing. Publish `dtalgosdk` at the matching version first, since the README's install snippets point at it.
+### CI and CD
+
+- `.github/workflows/ci.yml` validates every push to `main` or `dtalgorand` and every pull request with `dt-ci.yml`: type check, lint, an audit of the production dependencies (the full audit only warns), build and the tests against LocalNet.
+- `.github/workflows/cd.yml` publishes on a pushed tag `v<version>` (only tags with `-dt.` in them). It runs the same validation on the tagged commit, checks the tag matches `package.json`'s version, skips a version already on npm, then builds and runs `npm publish ./dist --tag latest --provenance`.
+- The upstream workflows (semantic-release, docs publishing) are removed: they need the Algorand Foundation's bot and secrets.
+
+One-time setup:
+
+1. Create `github.com/d13co/dt-algokit-utils-ts` and push this branch as `main`.
+2. For the first publish, add an npm granular access token with read and write access (allowed to bypass 2FA) as the `NPM_TOKEN` secret (npm can only set up trusted publishing for a package that already exists). The `npm` environment is created on the first run; add protection rules to it if you want to approve each publish.
+3. After the first publish, on npmjs.com under the package's Settings, add a trusted publisher: GitHub Actions, organization `d13co`, repository `dt-algokit-utils-ts`, workflow `cd.yml`, environment `npm`. Then delete the `NPM_TOKEN` secret and the token.
+
+### Releasing
+
+1. Choose the version (see below) and set it with `npm version <version> --no-git-tag-version`, which updates `package.json` and `package-lock.json`.
+2. Update the version in the README's install snippets. If `dtalgosdk` moved to a new base version (say `3.9.1-dt.…`), update its snippets too and add `|| ^<base>-dt.0` to the `algosdk` peer range in `package.json`: a prerelease only matches a range naming the same `x.y.z`.
+3. Publish `dtalgosdk` at that version first, since the snippets point at it.
+4. Commit, then tag and push: `git tag v<version> && git push origin main v<version>`. The CD workflow publishes it.
 
 Versions follow the same scheme as `dtalgosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.2.0.0.1`.
 

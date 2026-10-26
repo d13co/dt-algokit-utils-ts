@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dtalgorand]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    uses: ./.github/workflows/dt-ci.yml
