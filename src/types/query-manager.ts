@@ -229,7 +229,10 @@ export type QueryRoundsOptions = Omit<SimulateRoundsOptions, 'parallel'> & Query
 export interface QueryTxnResult {
   /** What the transaction's app logged (only the top-level app: inner apps' logs aren't included). Empty for other transactions. */
   logs: Uint8Array[]
-  /** The opcode budget the app call used, inner calls included, when the node reported it. */
+  /**
+   * The opcode budget the app call used, inner calls included, when the node reported it: the query's `cost` on the query
+   * path, simulate's `appBudgetConsumed` on the simulate path.
+   */
   cost?: number
 }
 
@@ -251,8 +254,9 @@ export class QueryGroupError extends Error {
   /** The round of the result. */
   public round: bigint
   /**
-   * The node's message. For a failed transaction, as simulate words it: `transaction <TXID>: logic eval error: ...` (the
-   * query path adds the prefix, with the ID of the transaction as built), so `LogicError` can parse it.
+   * The node's message. For a logic error, as simulate words it: `transaction <TXID>: logic eval error: ...` (the query
+   * path adds the prefix, with the ID of the transaction as built), so `LogicError` can parse it. A call that was too large
+   * or too slow even alone has the node's message as it is.
    */
   public failureMessage?: string
   /** For `group`: the path of the transaction that failed (on the query path, its index in the group). */
@@ -638,7 +642,15 @@ class QueryRun {
   private async recordAlone(piece: Piece, error: unknown): Promise<void> {
     const results = this.results[piece.job]
     // Report the round the call would have run at
-    const latest = piece.rounds.includes(0n) ? await this.pinLatest() : undefined
+    let latest: bigint | undefined
+    if (piece.rounds.includes(0n)) {
+      try {
+        latest = await this.pinLatest()
+      } catch (e) {
+        this.fail(e)
+        throw e
+      }
+    }
     for (const r of piece.rounds) {
       const acc = results.get(r)!
       if (r === 0n && acc.round === 0n) acc.round = latest!
@@ -866,7 +878,7 @@ export class QueryManager {
     // The limits are cached per client and shared, so they are read without the signal
     checkSimulateLimits(await getSimulateLimits(this._clientManager.algod), simulateOptions.protocol, simulateOptions)
     if (via !== 'simulate') {
-      const plan = await this.queryPlan(composers, simulateOptions)
+      const plan = await this.queryPlan(composers, simulateOptions, 'round' in at ? at.round : undefined)
       if (plan.ok) {
         try {
           return await this.viaQuery(plan, at, simulateOptions, concurrency ?? DEFAULT_QUERY_CONCURRENCY)
@@ -883,7 +895,11 @@ export class QueryManager {
   }
 
   /** Whether the groups can be queried with these options, with the built groups if so. */
-  private async queryPlan(composers: TransactionComposer[], options: Omit<SimulateRoundsOptions, 'parallel'>): Promise<QueryPlan> {
+  private async queryPlan(
+    composers: TransactionComposer[],
+    options: Omit<SimulateRoundsOptions, 'parallel'>,
+    round: bigint | undefined,
+  ): Promise<QueryPlan> {
     const no = (reason: string, error: () => Error = () => new Error(`Can't query these groups: ${reason}`)): QueryPlan => ({
       ok: false,
       reason,
@@ -910,7 +926,10 @@ export class QueryManager {
     }
     const built: BuiltTransactions[] = []
     for (const composer of composers) {
-      const b = await composer.buildTransactions()
+      // Built as `simulate.groups` builds them at a past round, so the transaction IDs (in failure messages) match
+      const b = round
+        ? await composer.buildTransactionsWithValidity({ firstValidRound: round + 1n, lastValidRound: round + 11n })
+        : await composer.buildTransactions()
       if (b.transactions.length === 0) throw new Error(`Transaction group ${built.length} is empty`)
       built.push(b)
     }
@@ -1150,8 +1169,10 @@ function toQueryGroupOutcome(
         kind: 'group',
         groupIndex,
         round,
-        // As simulate words it, for LogicError and other parsers of simulate's messages
-        failureMessage: `transaction ${built.transactions[failed].txID()}: ${results[failed].error}`,
+        // A logic error worded as simulate words it, for LogicError and other parsers of simulate's messages
+        failureMessage: /^logic eval error/.test(results[failed].error!)
+          ? `transaction ${built.transactions[failed].txID()}: ${results[failed].error}`
+          : results[failed].error,
         failedAt: [failed],
         txns: results.map((c) => ({ ...txnResult(c), ...(c.error !== undefined ? { error: c.error } : {}) })),
       }),

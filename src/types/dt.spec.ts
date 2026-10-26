@@ -1296,6 +1296,13 @@ describe('query', () => {
         expect(alone.error).toMatchObject({ kind: 'call', failureMessage: 'query response too large: over 1000 bytes', logs: [] })
     })
 
+    test('a call too large alone at the latest round throws if the latest round cannot be looked up', async () => {
+      queryLimitsOk(stub)
+        .on('post', '/v2/query', tooLarge)
+        .on('get', '/v2/status', () => ({ status: 500, json: { message: 'status failed' } }))
+      await expect(algorand.query.run({ program, calls: [{}] })).rejects.toThrow(/status failed/)
+    })
+
     test('a 504 is split the same way, and a body over the limit splits calls', async () => {
       const timeout = () => ({ status: 504, json: { message: 'query time limit exceeded' } })
       queryLimitsOk(stub).on('post', '/v2/query', timeout).on('post', '/v2/query', queryEcho()).on('post', '/v2/query', queryEcho())
@@ -1611,6 +1618,25 @@ describe('query', () => {
         expect(atRoundError.error).toMatchObject({ kind: 'round', failureMessage: 'round 3000 is not available' })
         expect(atRoundError.error.message).toBe('Could not query group 0 at round 3000: round 3000 is not available')
       }
+    })
+
+    test('at a past round, transactions are built as simulate builds them; only logic errors get the transaction prefix', async () => {
+      queryLimitsOk(stub)
+        .on('post', '/v2/query', queryEcho({ callError: () => 'logic eval error: nope' }))
+        .on('post', '/v2/query', tooLarge)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(undefined, () => 'logic eval error: nope'),
+        )
+      const [queried] = await algorand.query.groups([ghost()], { round: 2000, via: 'query' })
+      await algorand.query.groups([ghost()], { round: 2000, via: 'simulate' })
+      const simulatedTxn = sentSimulate(simulates()[0]).txnGroups[0].txns[0].txn
+      expect(simulatedTxn.firstValid).toBe(2001n)
+      if (!queried.ok) expect(queried.error.failureMessage).toBe(`transaction ${simulatedTxn.txID()}: logic eval error: nope`)
+      const [alone] = await algorand.query.groups([ghost()], { round: 2000, via: 'query' })
+      if (!alone.ok) expect(alone.error.failureMessage).toBe('query response too large: over 1000 bytes')
+      expect(queried.ok || alone.ok).toBe(false)
     })
 
     test('protocol note hits are moved to the group and transaction index', async () => {
