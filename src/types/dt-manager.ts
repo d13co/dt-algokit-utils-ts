@@ -15,6 +15,7 @@ import {
   RawBoxVersion,
   Round,
   DTAlgodLike,
+  fetchOptions,
   VersionsOrder,
   VersionsRequestLike,
 } from './dt-support'
@@ -40,6 +41,8 @@ export interface VersionsOptions {
 export interface VersionsPageOptions extends VersionsOptions {
   /** The `nextToken` of the previous page, with the same other options. */
   next?: string
+  /** Aborts the request: passed to fetch. */
+  signal?: AbortSignal
 }
 
 /** Options for an account `/versions` listing. */
@@ -506,7 +509,7 @@ export class DTManager {
   private async page<E, T>(request: AnyVersionsRequest<E>, options: VersionsPageOptions | undefined, map: (entry: E) => T) {
     this.configure(request, options)
     if (options?.next) request.next(options.next)
-    const page = await request.do()
+    const page = await request.do(undefined, fetchOptions(options))
     return { round: page.round, versions: page.versions.map(map), nextToken: page.nextToken || undefined }
   }
 

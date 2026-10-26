@@ -9,7 +9,7 @@ import modelsv2 = algosdk.modelsv2
 
 // Offline tests of the time travel and extended simulate features, against a stub algod.
 
-type Call = { method: 'get' | 'post'; path: string; query: Record<string, string>; body?: Uint8Array }
+type Call = { method: 'get' | 'post'; path: string; query: Record<string, string>; body?: Uint8Array; options?: Record<string, unknown> }
 type Answer = { status: number; json?: unknown; body?: Uint8Array }
 type Route = { method: 'get' | 'post'; path: string | RegExp; answer: (call: Call) => Answer }
 
@@ -43,12 +43,18 @@ class StubClient implements algosdk.BaseHTTPClient {
     return response
   }
 
-  async get(path: string, query?: Record<string, string>) {
-    return this.answer({ method: 'get', path, query: { ...(query ?? {}) } })
+  async get(path: string, query?: Record<string, string>, _headers?: Record<string, string>, options?: Record<string, unknown>) {
+    return this.answer({ method: 'get', path, query: { ...(query ?? {}) }, options })
   }
 
-  async post(path: string, data: Uint8Array, query?: Record<string, string>) {
-    return this.answer({ method: 'post', path, query: { ...(query ?? {}) }, body: data })
+  async post(
+    path: string,
+    data: Uint8Array,
+    query?: Record<string, string>,
+    _headers?: Record<string, string>,
+    options?: Record<string, unknown>,
+  ) {
+    return this.answer({ method: 'post', path, query: { ...(query ?? {}) }, body: data, options })
   }
 
   delete(): Promise<algosdk.BaseHTTPClientResponse> {
@@ -323,6 +329,14 @@ describe('time travel', () => {
       expect(stub.calls[0].query).toMatchObject({ name: `b64:${b64('a')}`, round: '70' })
     })
 
+    test('a signal goes to fetch for reads at a round and at the latest round', async () => {
+      const { signal } = new AbortController()
+      stub.on('get', '/v2/applications/5/box', json({ round: 70, name: b64('a'), value: b64('hello') }), true)
+      await algorand.app.getBoxValue(5n, 'a', { round: 70, signal })
+      await algorand.app.getBoxValue(5n, 'a', { signal })
+      expect(stub.calls.map((c) => c.options?.signal)).toEqual([signal, signal])
+    })
+
     test('without the time-travel fork of algosdk, reads at a round throw and other reads still work', async () => {
       const TT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
       const features = TT.features
@@ -578,6 +592,22 @@ describe('time travel', () => {
       const group2 = request.txnGroups[1].txns.map((t) => t.txn.group)
       expect(group2[0]).toBeDefined()
       expect(group2[0]).toEqual(group2[1])
+    })
+
+    test('groups: a signal goes to fetch and stays out of the request body', async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams).on('post', '/v2/transactions/simulate', echoSimulate())
+      const controller = new AbortController()
+      await algorand.simulate.groups([payment(1)], { signal: controller.signal })
+      const call = stub.calls.at(-1)!
+      expect(call.options).toEqual({ signal: controller.signal })
+      const body = algosdk.msgpackRawDecode(call.body!) as Map<string, unknown> | Record<string, unknown>
+      const keys = body instanceof Map ? [...body.keys()] : Object.keys(body)
+      expect(keys).not.toContain('signal')
+      // Once aborted, nothing more is sent
+      controller.abort()
+      const sent = stub.calls.length
+      await expect(algorand.simulate.groups([payment(1)], { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+      expect(stub.calls).toHaveLength(sent)
     })
 
     test('groups: parallel groups beyond maxGroups are split across requests; sequential ones throw', async () => {

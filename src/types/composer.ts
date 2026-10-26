@@ -37,7 +37,16 @@ export type SkipSignaturesSimulateOptions = Expand<
 /** The raw API options to control a simulate request.
  * See algod API docs for more information: https://dev.algorand.co/reference/rest-api/algod/operations/simulatetransaction/
  */
-export type RawSimulateOptions = Expand<Omit<ConstructorParameters<typeof modelsv2.SimulateRequest>[0], 'txnGroups'>>
+export type RawSimulateOptions = Expand<
+  Omit<ConstructorParameters<typeof modelsv2.SimulateRequest>[0], 'txnGroups'> & {
+    /**
+     * Aborts the request. With the time-travel simulate (`algorand.simulate.*`) it cancels the HTTP request; with
+     * `composer.simulate` it is checked before and after the request (algosdk's composer can't pass it to fetch).
+     * Not sent to algod.
+     */
+    signal?: AbortSignal
+  }
+>
 
 /** All options to control a simulate request */
 export type SimulateOptions = Expand<Partial<SkipSignaturesSimulateOptions> & RawSimulateOptions>
@@ -2165,7 +2174,8 @@ export class TransactionComposer {
    */
   async simulate(options: RawSimulateOptions): Promise<SendAtomicTransactionComposerResults & { simulateResponse: SimulateResponse }>
   async simulate(options?: SimulateOptions): Promise<SendAtomicTransactionComposerResults & { simulateResponse: SimulateResponse }> {
-    const { skipSignatures = false, ...rawOptions } = options ?? {}
+    const { skipSignatures = false, signal, ...rawOptions } = options ?? {}
+    signal?.throwIfAborted()
     const atc = skipSignatures ? new AtomicTransactionComposer() : this.atc
 
     // Build the transactions
@@ -2183,6 +2193,7 @@ export class TransactionComposer {
       await this.withValidityForSimulateRound(rawOptions.round, () => this.build())
     }
 
+    signal?.throwIfAborted()
     const { methodResults, simulateResponse } = await atc.simulate(
       this.algod,
       new modelsv2.SimulateRequest({
@@ -2203,6 +2214,8 @@ export class TransactionComposer {
           : undefined),
       }),
     )
+
+    signal?.throwIfAborted()
 
     const failedGroup = simulateResponse?.txnGroups[0]
     if (failedGroup?.failureMessage) {

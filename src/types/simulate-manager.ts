@@ -310,6 +310,8 @@ export class SimulateManager {
   public async groups(composers: TransactionComposer[], options?: SimulateGroupsOptions): Promise<SimulateGroupOutcome[]> {
     const { round, ...rest } = options ?? {}
     requireDTSdkFeatures('Simulating several groups', optionalFeatures(rest))
+    rest.signal?.throwIfAborted()
+    // The limits are cached per client and shared, so they are read without the signal
     const limits = await getSimulateLimits(this._clientManager.algod)
     const built = await this.buildGroups(composers, validityAt(round))
     const [outcomes] = await this.send(built, rest, { round }, limits)
@@ -371,6 +373,8 @@ export class SimulateManager {
     const groups = Array.isArray(composers) ? composers : [composers]
     if (rounds.length === 0) return []
     const tt = requireDTSdkFeatures('Simulating at several rounds', optionalFeatures(rest))
+    rest.signal?.throwIfAborted()
+    // The limits are cached per client and shared, so they are read without the signal
     const limits = await getSimulateLimits(this._clientManager.algod)
     const maxRounds = maxRoundsOption ?? limits?.maxRounds ?? DEFAULT_MAX_SIMULATE_ROUNDS
     if (maxRounds === 0) return await this.roundByRound(groups, rounds, rest, limits)
@@ -438,7 +442,10 @@ export class SimulateManager {
     limits: SimulateLimits | undefined,
   ): Promise<{ groups: SimulateGroupOutcome[]; protocolOverride?: SimulateProtocolOverride }[]> {
     const tt = requireDTSdkFeatures('Simulating several groups', optionalFeatures(options))
-    const { parallel = false, maxGroups: maxGroupsOption, protocol, validityWindow, ...raw } = options
+    const { parallel = false, maxGroups: maxGroupsOption, protocol, validityWindow, signal, ...raw } = options
+    signal?.throwIfAborted()
+    // Fetch options for each request: the signal goes to fetch, never into the request body
+    const fetchOptions = signal ? { signal } : undefined
     const maxGroups = maxGroupsOption ?? limits?.maxTxnGroups ?? DEFAULT_MAX_SIMULATE_GROUPS
     if (!Number.isInteger(maxGroups) || maxGroups < 1) throw new RangeError(`maxGroups must be a positive integer, not ${maxGroups}`)
     if (!parallel && built.length > maxGroups) {
@@ -455,7 +462,7 @@ export class SimulateManager {
     const algod = this._clientManager.dtAlgod
     // Parallel groups split across requests must all run at the same round, even if a new block comes in between
     let round = at.round || undefined
-    if (chunks.length > 1 && !round && !at.rounds) round = (await this._clientManager.algod.status().do()).lastRound
+    if (chunks.length > 1 && !round && !at.rounds) round = (await this._clientManager.algod.status().do(undefined, fetchOptions)).lastRound
 
     const responses = await Promise.all(
       chunks.map(async (groups) => {
@@ -469,7 +476,7 @@ export class SimulateManager {
         if (validityWindow === 'skip') call = call.skipValidityWindow()
         if (validityWindow === 'rewrite') call = call.rewriteValidityWindow()
         if (protocol) call = call.protocol(protocol)
-        return await call.do()
+        return await call.do(undefined, fetchOptions)
       }),
     )
 

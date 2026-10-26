@@ -10,7 +10,7 @@ import {
   type CompiledTeal,
   type TealTemplateParams,
 } from './app'
-import { AtRoundOptions, dtAlgodForRead } from './dt-support'
+import { AtRoundOptions, dtAlgodForRead, fetchOptions } from './dt-support'
 import modelsv2 = algosdk.modelsv2
 
 /** Information about an app. */
@@ -249,8 +249,13 @@ export class AppManager {
     const round = options?.round
     const app =
       round === undefined
-        ? await this._algod.getApplicationByID(Number(appId)).do()
-        : await (await dtAlgodForRead(this._algod, 'Reading an app', round, true)).getApplicationByID(appId).round(round).do()
+        ? await this._algod.getApplicationByID(Number(appId)).do(undefined, fetchOptions(options))
+        : await (
+            await dtAlgodForRead(this._algod, 'Reading an app', round, true)
+          )
+            .getApplicationByID(appId)
+            .round(round)
+            .do(undefined, fetchOptions(options))
     return AppManager.appInformationFromAlgod(app)
   }
 
@@ -308,13 +313,13 @@ export class AppManager {
     const round = options?.round
     const appInfo =
       round === undefined
-        ? await this._algod.accountApplicationInformation(address, appId).do()
+        ? await this._algod.accountApplicationInformation(address, appId).do(undefined, fetchOptions(options))
         : await (
             await dtAlgodForRead(this._algod, 'Reading local state', round, false)
           )
             .accountApplicationInformation(address, appId)
             .round(round)
-            .do()
+            .do(undefined, fetchOptions(options))
 
     if (!appInfo.appLocalState?.keyValue) {
       throw new Error("Couldn't find local state")
@@ -337,14 +342,18 @@ export class AppManager {
     const round = options?.round
     let boxes: modelsv2.BoxDescriptor[]
     if (round === undefined) {
-      boxes = (await this._algod.getApplicationBoxes(appId).do()).boxes
+      boxes = (await this._algod.getApplicationBoxes(appId).do(undefined, fetchOptions(options))).boxes
     } else {
       // Listing a past round can come in pages; the pages of one round fit together because past rounds never change
       const tt = await dtAlgodForRead(this._algod, 'Listing boxes', round, false)
       boxes = []
       let next: string | undefined = undefined
       do {
-        const page: modelsv2.BoxesResponse = await tt.getApplicationBoxes(appId).round(round).next(next).do()
+        const page: modelsv2.BoxesResponse = await tt
+          .getApplicationBoxes(appId)
+          .round(round)
+          .next(next)
+          .do(undefined, fetchOptions(options))
         boxes.push(...page.boxes)
         next = page.nextToken
       } while (next)
@@ -375,13 +384,13 @@ export class AppManager {
     const round = options?.round
     const boxResult =
       round === undefined
-        ? await this._algod.getApplicationBoxByName(Number(appId), name).do()
+        ? await this._algod.getApplicationBoxByName(Number(appId), name).do(undefined, fetchOptions(options))
         : await (
             await dtAlgodForRead(this._algod, 'Reading a box', round, false)
           )
             .getApplicationBoxByName(appId, name)
             .round(round)
-            .do()
+            .do(undefined, fetchOptions(options))
     return boxResult.value
   }
 

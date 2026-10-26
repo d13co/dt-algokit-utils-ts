@@ -56,12 +56,21 @@ export interface AtRoundOptions {
    * throws instead of returning the latest state.
    */
   round?: Round
+  /** Aborts the read: passed to fetch, never to the node's support probe. */
+  signal?: AbortSignal
 }
+
+/** The fetch options (`customOptions`) that carry an abort signal to algosdk's `.do()`, if there is one. */
+export const fetchOptions = (options?: { signal?: AbortSignal }): { signal: AbortSignal } | undefined =>
+  options?.signal ? { signal: options.signal } : undefined
+
+/** algosdk's `.do(headers, customOptions)`: `customOptions` are fetch options, such as `{ signal }`. */
+type DoArgs = [headers?: Record<string, string>, customOptions?: Record<string, unknown>]
 
 /** A request that can be read at a past round. */
 export interface RoundRequestLike<T> {
   round(round: Round): this
-  do(): Promise<T>
+  do(...args: DoArgs): Promise<T>
 }
 
 /** A box listing request that can be read at a past round. */
@@ -77,7 +86,7 @@ export interface VersionsRequestLike<Entry, Response extends { round: bigint; ve
   limit(limit: number): this
   next(nextToken: string | undefined): this
   include(...include: 'values'[]): this
-  do(): Promise<Response>
+  do(...args: DoArgs): Promise<Response>
   iterate(): AsyncGenerator<Entry>
 }
 
@@ -257,7 +266,7 @@ export interface DTSimulateRequestLike {
   skipValidityWindow(skipValidityWindow?: boolean): this
   rewriteValidityWindow(rewriteValidityWindow?: boolean): this
   protocol(protocol: string): this
-  do(): Promise<DTSimulateResponseLike>
+  do(...args: DoArgs): Promise<DTSimulateResponseLike>
 }
 
 /** The parts of the fork's `DTAlgodClient` that algokit-utils uses. */

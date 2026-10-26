@@ -22,31 +22,55 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     'EPROTO', // We get this intermittently with AlgoNode API
   ]
 
-  private async callWithRetry(func: () => Promise<BaseHTTPClientResponse>): Promise<BaseHTTPClientResponse> {
+  /** The abort signal in fetch options passed as `customOptions`, if any. */
+  private static signalOf(customOptions?: Record<string, unknown>): AbortSignal | undefined {
+    // Duck-typed: a signal from another realm (e.g. jsdom) isn't an instance of this one's AbortSignal
+    const signal = customOptions?.signal as AbortSignal | undefined
+    return signal && typeof signal === 'object' && 'aborted' in signal ? signal : undefined
+  }
+
+  /** Waits `ms`, rejecting with the signal's reason as soon as it aborts. */
+  private static sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(signal.reason)
+      const onAbort = () => {
+        clearTimeout(timer)
+        reject(signal!.reason)
+      }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  private async callWithRetry(func: () => Promise<BaseHTTPClientResponse>, signal?: AbortSignal): Promise<BaseHTTPClientResponse> {
     let response: BaseHTTPClientResponse | undefined
     let numTries = 1
     do {
+      signal?.throwIfAborted()
       try {
         response = await func()
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } catch (err: any) {
+        // An aborted request is never retried
+        if (signal?.aborted) throw err
         if (numTries >= AlgoHttpClientWithRetry.MAX_TRIES) {
           throw err
         }
         // Only retry for one of the hardcoded conditions
-        if (
-          !(
-            AlgoHttpClientWithRetry.RETRY_ERROR_CODES.includes(err.code) ||
-            AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.status)) ||
-            ('response' in err && AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.response.status)))
-          )
-        ) {
+        if (!(
+          AlgoHttpClientWithRetry.RETRY_ERROR_CODES.includes(err.code) ||
+          AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.status)) ||
+          ('response' in err && AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.response.status)))
+        )) {
           throw err
         }
         // Retry immediately the first time, then exponentially backoff.
         const delayTimeMs = numTries == 1 ? 0 : Math.min(1000 * Math.pow(2, numTries - 1), AlgoHttpClientWithRetry.MAX_BACKOFF_MS)
         if (delayTimeMs > 0) {
-          await new Promise((r) => setTimeout(r, delayTimeMs))
+          await AlgoHttpClientWithRetry.sleep(delayTimeMs, signal)
         }
         Config.logger.warn(`algosdk request failed ${numTries} times. Retrying in ${delayTimeMs}ms: ${err}`)
       }
@@ -54,8 +78,16 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     return response!
   }
 
-  async get(relativePath: string, query?: Query<string>, requestHeaders: Record<string, string> = {}): Promise<BaseHTTPClientResponse> {
-    const response = await this.callWithRetry(() => super.get(relativePath, query, requestHeaders))
+  async get(
+    relativePath: string,
+    query?: Query<string>,
+    requestHeaders: Record<string, string> = {},
+    customOptions?: Record<string, unknown>,
+  ): Promise<BaseHTTPClientResponse> {
+    const response = await this.callWithRetry(
+      () => super.get(relativePath, query, requestHeaders, customOptions),
+      AlgoHttpClientWithRetry.signalOf(customOptions),
+    )
     if (
       relativePath.startsWith('/v2/accounts/') &&
       relativePath.endsWith('/created-applications') &&
@@ -93,8 +125,12 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     data: Uint8Array,
     query?: Query<string>,
     requestHeaders: Record<string, string> = {},
+    customOptions?: Record<string, unknown>,
   ): Promise<BaseHTTPClientResponse> {
-    return await this.callWithRetry(() => super.post(relativePath, data, query, requestHeaders))
+    return await this.callWithRetry(
+      () => super.post(relativePath, data, query, requestHeaders, customOptions),
+      AlgoHttpClientWithRetry.signalOf(customOptions),
+    )
   }
 
   async delete(
@@ -102,7 +138,11 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     data: Uint8Array,
     query?: Query<string>,
     requestHeaders: Record<string, string> = {},
+    customOptions?: Record<string, unknown>,
   ): Promise<BaseHTTPClientResponse> {
-    return await this.callWithRetry(() => super.delete(relativePath, data, query, requestHeaders))
+    return await this.callWithRetry(
+      () => super.delete(relativePath, data, query, requestHeaders, customOptions),
+      AlgoHttpClientWithRetry.signalOf(customOptions),
+    )
   }
 }
