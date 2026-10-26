@@ -2,7 +2,12 @@ import { IntDecoding, parseJSON, stringifyJSON } from 'algosdk'
 import { BaseHTTPClientResponse, Query, URLTokenBaseHTTPClient } from 'algosdk/client'
 import { Config } from '../config'
 
-/** A HTTP Client that wraps the Algorand SDK HTTP Client with retries */
+/**
+ * A HTTP Client that wraps the Algorand SDK HTTP Client with retries.
+ *
+ * A 429 or 503 with a `Retry-After` header waits at least that long before the next try (capped at 10 s). A 504 from
+ * `POST /v2/query` (the node's time limit) is not retried.
+ */
 export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
   private static readonly MAX_TRIES = 5
   private static readonly MAX_BACKOFF_MS = 10000
@@ -10,6 +15,13 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
   // These lists come from https://visionmedia.github.io/superagent/#retrying-requests
   // which is the underlying library used by algosdk - but the CloudFlare specific 52X status codes have been removed
   private static readonly RETRY_STATUS_CODES = [408, 413, 429, 500, 502, 503, 504]
+  /**
+   * The status codes retried for `POST /v2/query`: all but 504, which is the node's time limit. A retry would repeat the
+   * whole (up to `time-limit-seconds`) work; the caller splits the request instead.
+   */
+  private static readonly QUERY_RETRY_STATUS_CODES = AlgoHttpClientWithRetry.RETRY_STATUS_CODES.filter((s) => s !== 504)
+  /** The status codes whose `Retry-After` header is honored. */
+  private static readonly RETRY_AFTER_STATUS_CODES = [429, 503]
   private static readonly RETRY_ERROR_CODES = [
     'ETIMEDOUT',
     'ECONNRESET',
@@ -45,7 +57,36 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     })
   }
 
-  private async callWithRetry(func: () => Promise<BaseHTTPClientResponse>, signal?: AbortSignal): Promise<BaseHTTPClientResponse> {
+  /**
+   * How long a failed response asks to wait before retrying, from its `Retry-After` header (seconds or an HTTP date),
+   * or undefined without one. Only for 429 and 503. The header name is looked up case-insensitively.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private static retryAfterMs(err: any): number | undefined {
+    const status = Number(err?.response?.status ?? err?.status)
+    if (!AlgoHttpClientWithRetry.RETRY_AFTER_STATUS_CODES.includes(status)) return undefined
+    const headers = err?.response?.headers
+    if (!headers || typeof headers !== 'object') return undefined
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === 'retry-after')
+    if (key === undefined) return undefined
+    const value = String(headers[key]).trim()
+    if (/^\d+$/.test(value)) return Number(value) * 1000
+    const date = Date.parse(value)
+    return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now())
+  }
+
+  /** The status codes to retry for a request to `relativePath`. */
+  private static retryStatusCodes(relativePath: string): number[] {
+    return relativePath.replace(/\/+$/, '') === '/v2/query'
+      ? AlgoHttpClientWithRetry.QUERY_RETRY_STATUS_CODES
+      : AlgoHttpClientWithRetry.RETRY_STATUS_CODES
+  }
+
+  private async callWithRetry(
+    func: () => Promise<BaseHTTPClientResponse>,
+    signal?: AbortSignal,
+    retryStatusCodes: number[] = AlgoHttpClientWithRetry.RETRY_STATUS_CODES,
+  ): Promise<BaseHTTPClientResponse> {
     let response: BaseHTTPClientResponse | undefined
     let numTries = 1
     do {
@@ -62,13 +103,17 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
         // Only retry for one of the hardcoded conditions
         if (!(
           AlgoHttpClientWithRetry.RETRY_ERROR_CODES.includes(err.code) ||
-          AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.status)) ||
-          ('response' in err && AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.response.status)))
+          retryStatusCodes.includes(Number(err.status)) ||
+          ('response' in err && retryStatusCodes.includes(Number(err.response.status)))
         )) {
           throw err
         }
-        // Retry immediately the first time, then exponentially backoff.
-        const delayTimeMs = numTries == 1 ? 0 : Math.min(1000 * Math.pow(2, numTries - 1), AlgoHttpClientWithRetry.MAX_BACKOFF_MS)
+        // Retry immediately the first time, then exponentially backoff; wait at least as long as a Retry-After header asks
+        // (capped at the longest backoff).
+        const backoffMs = numTries == 1 ? 0 : Math.min(1000 * Math.pow(2, numTries - 1), AlgoHttpClientWithRetry.MAX_BACKOFF_MS)
+        const retryAfterMs = AlgoHttpClientWithRetry.retryAfterMs(err)
+        const delayTimeMs =
+          retryAfterMs === undefined ? backoffMs : Math.min(Math.max(backoffMs, retryAfterMs), AlgoHttpClientWithRetry.MAX_BACKOFF_MS)
         if (delayTimeMs > 0) {
           await AlgoHttpClientWithRetry.sleep(delayTimeMs, signal)
         }
@@ -130,6 +175,7 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     return await this.callWithRetry(
       () => super.post(relativePath, data, query, requestHeaders, customOptions),
       AlgoHttpClientWithRetry.signalOf(customOptions),
+      AlgoHttpClientWithRetry.retryStatusCodes(relativePath),
     )
   }
 
