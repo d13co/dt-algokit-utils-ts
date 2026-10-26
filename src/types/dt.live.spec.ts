@@ -4,6 +4,7 @@ import { algo } from '../amount'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
 import { isDTUnsupportedError } from './dt-support'
+import { QueryRoundOutcome } from './query-manager'
 
 // Live checks against a MainNet time-travel algod (dtalgod with EnableTimeTravel). Skipped unless DT_ALGOD_SERVER is set:
 //
@@ -211,6 +212,60 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       const [before] = await algorand.query.run({ appId: XGOV, rounds: [PAST], calls: [{}] })
       expect(before.round).toBe(PAST)
       expect(before.calls[0].ok).toBe(false)
+    })
+
+    /** `#pragma version 10; global Round; itob; log; byte 0x151f7c75; global Round; itob; concat; log; int 1`: returns the round of its block */
+    const ROUND_ABI = new Uint8Array(Buffer.from('CjIGFrCABBUffHUyBhZQsIEB', 'base64'))
+    /** `#pragma version 10; int 1` */
+    const CLEAR = new Uint8Array(Buffer.from('CoEB', 'base64'))
+    const FEE_SINK = 'Y76M3MSY6DKBRHBL7C3NNDXGS5IIMQVQVUAB6MP4XEMMGVF2QWNPL226CA'
+    const roundMethod = algosdk.ABIMethod.fromSignature('round()uint64')
+    const roundCall = () =>
+      algorand
+        .newGroup()
+        .addAppCreateMethodCall({ sender: FEE_SINK, method: roundMethod, args: [], approvalProgram: ROUND_ABI, clearStateProgram: CLEAR })
+    /** Per round, per group: the via, the logs and the return value of each outcome */
+    const summary = (results: QueryRoundOutcome[]) =>
+      results.map((r) => [
+        r.round,
+        r.groups.map((g) =>
+          g.ok
+            ? [g.via, g.txns.map((t) => t.logs.map((l) => Buffer.from(l).toString('hex'))), g.returns.map((x) => x.returnValue)]
+            : g.error.message,
+        ),
+      ])
+
+    test('composed calls give the same results through query and simulate', async (ctx) => {
+      if (!supported) return ctx.skip('the node has no queries')
+      const rounds = [PAST, PAST + 5_000n]
+      const queried = await algorand.query.rounds(roundCall(), rounds, { via: 'query' })
+      const simulated = await algorand.query.rounds(roundCall(), rounds, { via: 'simulate', validityWindow: 'rewrite' })
+      expect(queried.map((r) => r.groups[0].via)).toEqual(['query', 'query'])
+      expect(simulated.map((r) => r.groups[0].via)).toEqual(['simulate', 'simulate'])
+      const strip = (s: ReturnType<typeof summary>) => s.map(([round, groups]) => [round, (groups as unknown[][]).map((g) => g.slice(1))])
+      expect(strip(summary(queried))).toEqual(strip(summary(simulated)))
+      for (const r of queried) {
+        const g = r.groups[0]
+        expect(g.ok && g.returns[0].returnValue).toBe(r.round + 1n)
+      }
+      const outcomes = await algorand.query.groups([roundCall(), roundCall()], { via: 'query' })
+      expect(outcomes.map((o) => [o.via, o.ok, o.round])).toEqual([
+        ['query', true, outcomes[0].round],
+        ['query', true, outcomes[0].round],
+      ])
+      expect(outcomes[0].round).toBeGreaterThanOrEqual(latest)
+    })
+
+    test('composed calls fall back to simulate on a node without queries', async (ctx) => {
+      if (supported) return ctx.skip('the node has queries')
+      const rounds = [PAST, PAST + 5_000n]
+      const results = await algorand.query.rounds(roundCall(), rounds, { validityWindow: 'rewrite' })
+      expect(results.map((r) => r.groups[0].via)).toEqual(['simulate', 'simulate'])
+      for (const r of results) {
+        const g = r.groups[0]
+        expect(g.ok && g.returns[0].returnValue).toBe(r.round + 1n)
+      }
+      await expect(algorand.query.rounds(roundCall(), rounds, { via: 'query' })).rejects.toThrow()
     })
 
     test('a node without queries throws DTUnsupportedError', async (ctx) => {

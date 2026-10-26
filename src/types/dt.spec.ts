@@ -5,7 +5,8 @@ import stateArc56 from '../../tests/example-contracts/state/State.arc56.json'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
 import { DTAlgodLike, DTNotAvailableError, isDTUnsupportedError } from './dt-support'
-import { QueryCallError, QueryCallOutcome } from './query-manager'
+import { QueryCallError, QueryCallOutcome, QueryGroupError, QueryGroupOutcome, QueryGroupsOptions } from './query-manager'
+import { TransactionComposer } from './composer'
 import modelsv2 = algosdk.modelsv2
 
 // Offline tests of the time travel and extended simulate features, against a stub algod.
@@ -1085,12 +1086,18 @@ const queries = (stub: StubClient) => stub.calls.filter((c) => c.path === '/v2/q
  * A query answer where each call logs its first arg (or nothing) and the round + 1, at each round (0 answered as
  * LAST_ROUND), with cost 10 + its index in the request. `callError` fails a call after its logs, `roundError` a round.
  * With a protocol other than `round`, each round has a protocol override with a note hit on the request's first call.
+ * With `abi`, each call logs an ABI return of the round + 1 instead.
  */
 const queryEcho =
   ({
     callError,
     roundError,
-  }: { callError?: (arg: string, round: bigint) => string | undefined; roundError?: (round: bigint) => string | undefined } = {}) =>
+    abi,
+  }: {
+    callError?: (arg: string, round: bigint) => string | undefined
+    roundError?: (round: bigint) => string | undefined
+    abi?: boolean
+  } = {}) =>
   (call: Call): Answer => {
     const request = sentQuery(call)
     const rounds = (request.rounds ?? [0n]).map((r) => (r === 0n ? BigInt(LAST_ROUND) : r))
@@ -1118,7 +1125,7 @@ const queryEcho =
             const arg = c.args?.[0]
             const failure = callError?.(Buffer.from(arg ?? []).toString(), round)
             return {
-              logs: [...(arg ? [arg] : []), algosdk.encodeUint64(round + 1n)],
+              logs: abi ? [uint64Return(round + 1n)] : [...(arg ? [arg] : []), algosdk.encodeUint64(round + 1n)],
               cost: 10 + i,
               ...(failure ? { error: failure } : {}),
             }
@@ -1455,6 +1462,301 @@ describe('query', () => {
       algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
       limitsOk(stub)
       expect('query' in (await algorand.simulate.limits())).toBe(false)
+    })
+  })
+
+  describe('groups and rounds', () => {
+    const sender = algosdk.generateAccount().addr
+    const clear = new Uint8Array([10, 129, 1])
+    const method = new algosdk.ABIMethod({ name: 'round', args: [{ type: 'account' }, { type: 'asset' }], returns: { type: 'uint64' } })
+    /** A ghost-style call: an app create method call of `program`, with an account, an asset and a box reference. */
+    const ghost = (composer = algorand.newGroup(), approvalProgram = program) =>
+      composer.addAppCreateMethodCall({
+        sender,
+        method,
+        args: [someone, 6n],
+        approvalProgram,
+        clearStateProgram: clear,
+        schema: { globalInts: 1, globalByteSlices: 2, localInts: 0, localByteSlices: 0 },
+        boxReferences: [{ appId: 0n, name: 'box' }],
+      })
+    const appCall = (appId: bigint, composer = algorand.newGroup()) =>
+      composer.addAppCallMethodCall({ sender, appId, method, args: [someone, 6n] })
+    const payment = () => algorand.newGroup().addPayment({ sender, receiver: sender, amount: microAlgo(1) })
+    const simulates = () => stub.calls.filter((c) => c.path === '/v2/transactions/simulate')
+    const withoutCost = (outcomes: QueryGroupOutcome[]) =>
+      outcomes.map((o) => {
+        const { via: _via, ...rest } = o
+        return rest.ok ? { ...rest, txns: rest.txns.map((t) => ({ logs: t.logs })) } : rest
+      })
+
+    beforeEach(() => {
+      stub.on('get', '/v2/transactions/params', suggestedParams, true)
+    })
+
+    test('a ghost call: one request from the transaction, returns and logs, protocol round by default', async () => {
+      queryLimitsOk(stub).on('post', '/v2/query', queryEcho({ abi: true }), true)
+      const [outcome] = await algorand.query.groups([ghost()])
+      const [call] = queries(stub)
+      const body = sentQuery(call)
+      expect(body).toMatchObject({
+        program,
+        'clear-program': clear,
+        'global-schema': { 'num-uint': 1n, 'num-byte-slice': 2n },
+        sender: sender.toString(),
+        rounds: [0n],
+        protocol: 'round',
+      })
+      expect(body['local-schema']).toBeUndefined()
+      expect(body.budget).toBeUndefined()
+      expect(body.calls).toHaveLength(1)
+      expect(body.calls[0]).toMatchObject({ accounts: [someone], 'foreign-assets': [6n], boxes: [{ name: enc('box') }] })
+      expect(body.calls[0].args![0]).toEqual(method.getSelector())
+      expect(outcome).toMatchObject({ ok: true, via: 'query', groupIndex: 0, round: BigInt(LAST_ROUND) })
+      if (outcome.ok) {
+        expect(outcome.returns[0].returnValue).toBe(BigInt(LAST_ROUND) + 1n)
+        expect(outcome.txns).toEqual([{ logs: [uint64Return(BigInt(LAST_ROUND) + 1n)], cost: 10 }])
+      }
+      expect(outcome.protocolOverride).toBeUndefined()
+
+      stub.calls = []
+      const [later] = await algorand.query.groups([ghost()], { round: 1000, protocol: 'latest' })
+      expect(sentQuery(queries(stub)[0])).toMatchObject({ rounds: [1000n], protocol: 'latest' })
+      expect(later.protocolOverride).toMatchObject({ applied: true })
+    })
+
+    test('calls to different programs, apps or senders go in separate requests; the same target shares one', async () => {
+      queryLimitsOk(stub)
+        .on('get', '/v2/status', nodeStatus)
+        .on('post', '/v2/query', queryEcho({ abi: true }), true)
+      const other = new Uint8Array([10, 129, 2])
+      const outcomes = await algorand.query.groups([ghost(), appCall(77n), ghost(ghost(), other), appCall(77n, appCall(78n))], {
+        via: 'query',
+      })
+      const sent = queries(stub).map(sentQuery)
+      expect(sent.map((q) => [q.program ? Array.from(q.program).join() : undefined, q['app-id'], q.calls.length])).toEqual([
+        [Array.from(program).join(), undefined, 2],
+        [undefined, 77n, 2],
+        [Array.from(other).join(), undefined, 1],
+        [undefined, 78n, 1],
+      ])
+      // The latest round is pinned for all of them
+      expect(stub.calls.filter((c) => c.path === '/v2/status')).toHaveLength(1)
+      expect(sent.every((q) => q.rounds![0] === BigInt(LAST_ROUND))).toBe(true)
+      expect(outcomes.map((o) => [o.groupIndex, o.ok, o.ok && o.txns.length, o.ok && o.returns.length])).toEqual([
+        [0, true, 1, 1],
+        [1, true, 1, 1],
+        [2, true, 2, 2],
+        [3, true, 2, 2],
+      ])
+    })
+
+    test('the same program from another sender, or with other schemas, goes in its own request', async () => {
+      queryLimitsOk(stub)
+        .on('get', '/v2/status', nodeStatus)
+        .on('post', '/v2/query', queryEcho({ abi: true }), true)
+      const other = algosdk.generateAccount().addr
+      const create = (from: algosdk.Address, globalInts: number) =>
+        algorand.newGroup().addAppCreateMethodCall({
+          sender: from,
+          method,
+          args: [someone, 6n],
+          approvalProgram: program,
+          clearStateProgram: clear,
+          schema: { globalInts, globalByteSlices: 2, localInts: 0, localByteSlices: 0 },
+        })
+      const outcomes = await algorand.query.groups([ghost(), create(other, 1), create(sender, 3), ghost()])
+      expect(
+        queries(stub).map((c) => [sentQuery(c).sender, sentQuery(c)['global-schema']?.['num-uint'], sentQuery(c).calls.length]),
+      ).toEqual([
+        [sender.toString(), 1n, 2],
+        [other.toString(), 1n, 1],
+        [sender.toString(), 3n, 1],
+      ])
+      expect(outcomes.every((o) => o.ok && o.via === 'query')).toBe(true)
+    })
+
+    test('a failed call fails its group, worded as simulate does; a round error fails every group', async () => {
+      queryLimitsOk(stub).on(
+        'post',
+        '/v2/query',
+        queryEcho({
+          callError: (_, round) => (round === 2000n ? 'logic eval error: assert failed pc=12. Details: app=1, pc=12' : undefined),
+          roundError: (round) => (round === 3000n ? 'round 3000 is not available' : undefined),
+        }),
+        true,
+      )
+      const composer = ghost(ghost())
+      const { transactions } = await composer.buildTransactions()
+      const results = await algorand.query.rounds(composer, [1000, 2000, 3000])
+      expect(results.map((r) => [r.round, r.groups[0].ok])).toEqual([
+        [1000n, true],
+        [2000n, false],
+        [3000n, false],
+      ])
+      const atFailure = results[1].groups[0]
+      expect(atFailure.via).toBe('query')
+      if (!atFailure.ok) {
+        expect(atFailure.error).toBeInstanceOf(QueryGroupError)
+        expect(atFailure.error).toMatchObject({ kind: 'group', groupIndex: 0, round: 2000n, failedAt: [0] })
+        expect(atFailure.error.failureMessage).toBe(
+          `transaction ${transactions[0].txID()}: logic eval error: assert failed pc=12. Details: app=1, pc=12`,
+        )
+        expect(atFailure.error.message).toBe(`Querying group 0 at round 2000 failed at transaction 0: ${atFailure.error.failureMessage}`)
+        expect(atFailure.error.txns).toHaveLength(2)
+        expect(atFailure.error.txns![1]).toMatchObject({ cost: 11, error: expect.stringMatching(/^logic eval error/) })
+      }
+      const atRoundError = results[2].groups[0]
+      if (!atRoundError.ok) {
+        expect(atRoundError.error).toMatchObject({ kind: 'round', failureMessage: 'round 3000 is not available' })
+        expect(atRoundError.error.message).toBe('Could not query group 0 at round 3000: round 3000 is not available')
+      }
+    })
+
+    test('protocol note hits are moved to the group and transaction index', async () => {
+      queryLimitsOk(stub, { 'max-calls': 2 }).on('post', '/v2/query', queryEcho({ abi: true }), true)
+      const [result] = await algorand.query.rounds([ghost(), ghost(ghost())], [500], { protocol: 'latest' })
+      expect(queries(stub)).toHaveLength(2)
+      expect(result.protocolOverride?.notes?.[1].hits).toEqual([
+        { group: 0, path: [0] },
+        { group: 1, path: [1] },
+      ])
+      expect(result.groups.map((g) => g.protocolOverride)).toEqual([result.protocolOverride, result.protocolOverride])
+    })
+
+    describe('falls back to simulate', () => {
+      const optIn = () => algorand.newGroup().addAppCall({ sender, appId: 5n, onComplete: algosdk.OnApplicationComplete.OptInOC })
+      const withAccess = () => algorand.newGroup().addAppCall({ sender, appId: 5n, accessReferences: [{ appId: 9n }] })
+      const cases: [string, () => void, () => TransactionComposer, QueryGroupsOptions?, (() => Promise<void>)?][] = [
+        ['a payment', () => queryLimitsOk(stub), payment],
+        ['an opt-in', () => queryLimitsOk(stub), optIn],
+        ['an access list', () => queryLimitsOk(stub), withAccess],
+        [
+          'execTraceConfig',
+          () => queryLimitsOk(stub, {}, { 'developer-api': true }),
+          () => ghost(),
+          { execTraceConfig: new modelsv2.SimulateTraceConfig({ enable: true }) },
+        ],
+        [
+          'an extraOpcodeBudget over a query call budget',
+          () => queryLimitsOk(stub, { 'max-call-budget': 10_000 }),
+          () => ghost(),
+          { extraOpcodeBudget: 9_500 },
+        ],
+        [
+          'allowMoreLogging over the query log limit',
+          () => queryLimitsOk(stub, { 'max-call-log-bytes': 0 }),
+          () => ghost(),
+          { allowMoreLogging: true },
+        ],
+        ['no queries on the node', () => limitsOk(stub), () => ghost()],
+      ]
+
+      test.each(cases)('%s', async (_, setup, compose, options) => {
+        setup()
+        stub.on('post', '/v2/transactions/simulate', echoSimulate(), true)
+        const [outcome] = await algorand.query.groups([compose()], options)
+        expect(outcome.via).toBe('simulate')
+        expect(simulates()).toHaveLength(1)
+        expect(sentSimulate(simulates()[0]).allowEmptySignatures).toBe(true)
+        await expect(algorand.query.groups([compose()], { ...options, via: 'query' })).rejects.toThrow()
+        expect(queries(stub)).toHaveLength(0)
+      })
+
+      test('a fork without the query feature', async () => {
+        queryLimitsOk(stub).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+        await withoutFeatures(['query'], async () => {
+          const [outcome] = await algorand.query.groups([ghost()])
+          expect(outcome.via).toBe('simulate')
+          await expect(algorand.query.groups([ghost()], { via: 'query' })).rejects.toThrow(DTNotAvailableError)
+        })
+        expect(queries(stub)).toHaveLength(0)
+      })
+
+      test('via query on a node without queries throws DTUnsupportedError; a 404 mid-way falls back with auto', async () => {
+        limitsOk(stub)
+        expect(isDTUnsupportedError(await algorand.query.groups([ghost()], { via: 'query' }).catch((e) => e))).toBe(true)
+        stub = new StubClient()
+        algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+        stub
+          .on('get', '/v2/transactions/params', suggestedParams, true)
+          .on('post', '/v2/query', () => ({ status: 404, json: { message: 'Not Found' } }), true)
+          .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+        queryLimitsOk(stub)
+        const [outcome] = await algorand.query.groups([ghost()])
+        expect(outcome.via).toBe('simulate')
+        expect(queries(stub)).toHaveLength(1)
+        expect(isDTUnsupportedError(await algorand.query.groups([ghost()], { via: 'query' }).catch((e) => e))).toBe(true)
+      })
+
+      test('via simulate never queries; parallel groups, with the options passed on', async () => {
+        queryLimitsOk(stub).on('get', '/v2/status', nodeStatus).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+        const outcomes = await algorand.query.groups([ghost(), ghost()], { via: 'simulate', allowUnnamedResources: true, round: 700 })
+        expect(outcomes.map((o) => [o.via, o.ok, o.round])).toEqual([
+          ['simulate', true, 700n],
+          ['simulate', true, 700n],
+        ])
+        const [request] = simulates().map(sentSimulate)
+        expect(request).toMatchObject({ parallelGroups: true, allowUnnamedResources: true, round: 700n })
+        expect(queries(stub)).toHaveLength(0)
+      })
+    })
+
+    test('both paths give the same outcomes for the same answers', async () => {
+      const value = uint64Return(BigInt(LAST_ROUND) + 1n)
+      queryLimitsOk(stub)
+        .on('get', '/v2/status', nodeStatus, true)
+        .on('post', '/v2/query', queryEcho({ abi: true, callError: (arg) => (arg === 'x' ? 'logic eval error: nope' : undefined) }), true)
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(() => value),
+          true,
+        )
+      const composers = () => [ghost(), appCall(77n), ghost(ghost())]
+      const queried = await algorand.query.groups(composers(), { via: 'query' })
+      const simulated = await algorand.query.groups(composers(), { via: 'simulate' })
+      expect(queried.map((o) => o.via)).toEqual(['query', 'query', 'query'])
+      expect(simulated.map((o) => o.via)).toEqual(['simulate', 'simulate', 'simulate'])
+      expect(withoutCost(queried)).toEqual(withoutCost(simulated))
+
+      // Failures map kind, failedAt, failureMessage and the message
+      stub = new StubClient()
+      algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+      queryLimitsOk(stub).on('get', '/v2/transactions/params', suggestedParams, true)
+      stub.on(
+        'post',
+        '/v2/transactions/simulate',
+        echoSimulate(
+          () => value,
+          (g) => (g === 0 ? 'transaction ABC: logic eval error: nope' : undefined),
+        ),
+      )
+      const [failed] = await algorand.query.groups([ghost()], { via: 'simulate' })
+      expect(failed.ok).toBe(false)
+      if (!failed.ok) {
+        expect(failed.error).toBeInstanceOf(QueryGroupError)
+        expect(failed.error).toMatchObject({ kind: 'group', failedAt: [0], failureMessage: 'transaction ABC: logic eval error: nope' })
+        expect(failed.error.message).toBe(
+          'Querying group 0 at round 50000 failed at transaction 0: transaction ABC: logic eval error: nope',
+        )
+        expect(failed.error.txns).toEqual([{ logs: [value], error: 'transaction ABC: logic eval error: nope' }])
+        expect(failed.error.cause).toMatchObject({ kind: 'group' })
+      }
+    })
+
+    test('the options are checked the same way on both paths', async () => {
+      queryLimitsOk(stub, {}, { 'max-extra-opcode-budget': 1000 })
+      for (const via of ['query', 'simulate', 'auto'] as const) {
+        await expect(algorand.query.groups([], { via })).rejects.toThrow('No transaction groups to query')
+        await expect(algorand.query.rounds(ghost(), [0, 5], { via })).rejects.toThrow(RangeError)
+        await expect(algorand.query.groups([ghost()], { via, extraOpcodeBudget: 2000 })).rejects.toThrow(/maxExtraOpcodeBudget 1000/)
+        await expect(algorand.query.groups([ghost()], { via, concurrency: 0 })).rejects.toThrow(/concurrency/)
+        await expect(algorand.query.groups([algorand.newGroup()], { via })).rejects.toThrow('Transaction group 0 is empty')
+        expect(await algorand.query.rounds(ghost(), [], { via })).toEqual([])
+      }
+      expect(queries(stub)).toHaveLength(0)
+      expect(simulates()).toHaveLength(0)
     })
   })
 })

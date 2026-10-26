@@ -143,8 +143,8 @@ export interface SimulateRoundOutcome {
   protocolOverride?: SimulateProtocolOverride
 }
 
-/** The optional fork features that the options need, after checking `validityWindow`. */
-const optionalFeatures = (options: { protocol?: string; validityWindow?: string }): OptionalDTFeature[] => {
+/** The optional fork features that extended simulate options need, after checking `validityWindow`. Shared with `QueryManager`, which validates the same options. */
+export const simulateOptionFeatures = (options: { protocol?: string; validityWindow?: string }): OptionalDTFeature[] => {
   const { validityWindow } = options
   if (validityWindow !== undefined && validityWindow !== 'skip' && validityWindow !== 'rewrite') {
     throw new Error(`validityWindow must be 'skip' or 'rewrite', not ${JSON.stringify(validityWindow)}`)
@@ -157,10 +157,10 @@ const validityAt = (round: Round | undefined) =>
   round ? { firstValidRound: BigInt(round) + 1n, lastValidRound: BigInt(round) + 11n } : undefined
 
 /**
- * Checks the options against the limits the node reported, throwing for what it doesn't allow. A node that didn't report
- * its limits checks the options itself.
+ * Checks extended simulate options against the limits the node reported, throwing for what it doesn't allow. A node that
+ * didn't report its limits checks the options itself. Shared with `QueryManager`, which validates the same options.
  */
-function checkLimits(
+export function checkSimulateLimits(
   limits: SimulateLimits | undefined,
   protocol: string | undefined,
   raw: Pick<RawSimulateOptions, 'execTraceConfig' | 'extraOpcodeBudget'>,
@@ -274,7 +274,7 @@ export class SimulateManager {
    */
   public async groups(composers: TransactionComposer[], options?: SimulateGroupsOptions): Promise<SimulateGroupOutcome[]> {
     const { round, ...rest } = options ?? {}
-    requireDTSdkFeatures('Simulating several groups', optionalFeatures(rest))
+    requireDTSdkFeatures('Simulating several groups', simulateOptionFeatures(rest))
     rest.signal?.throwIfAborted()
     // The limits are cached per client and shared, so they are read without the signal
     const limits = await getSimulateLimits(this._clientManager.algod)
@@ -337,7 +337,7 @@ export class SimulateManager {
     const { maxRounds: maxRoundsOption, ...rest } = options ?? {}
     const groups = Array.isArray(composers) ? composers : [composers]
     if (rounds.length === 0) return []
-    const tt = requireDTSdkFeatures('Simulating at several rounds', optionalFeatures(rest))
+    const tt = requireDTSdkFeatures('Simulating at several rounds', simulateOptionFeatures(rest))
     rest.signal?.throwIfAborted()
     // The limits are cached per client and shared, so they are read without the signal
     const limits = await getSimulateLimits(this._clientManager.algod)
@@ -406,7 +406,7 @@ export class SimulateManager {
     at: { round?: Round; rounds?: bigint[] },
     limits: SimulateLimits | undefined,
   ): Promise<{ groups: SimulateGroupOutcome[]; protocolOverride?: SimulateProtocolOverride }[]> {
-    const tt = requireDTSdkFeatures('Simulating several groups', optionalFeatures(options))
+    const tt = requireDTSdkFeatures('Simulating several groups', simulateOptionFeatures(options))
     const { parallel = false, maxGroups: maxGroupsOption, protocol, validityWindow, signal, ...raw } = options
     signal?.throwIfAborted()
     // Fetch options for each request: the signal goes to fetch, never into the request body
@@ -422,7 +422,7 @@ export class SimulateManager {
         `Can't simulate ${built.length} groups one after the other: the node takes at most ${maxGroups} per request${stock} (set maxGroups if the node allows more, or use parallel)`,
       )
     }
-    checkLimits(limits, protocol, raw)
+    checkSimulateLimits(limits, protocol, raw)
     const chunks = parallel ? chunk(built, maxGroups) : [built]
     const algod = this._clientManager.dtAlgod
     // Parallel groups split across requests must all run at the same round, even if a new block comes in between

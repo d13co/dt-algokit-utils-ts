@@ -1,7 +1,12 @@
 import algosdk, { Address } from 'algosdk'
+import { Config } from '../config'
+import { getABIReturnValue } from '../transaction/transaction'
+import { ABIReturn } from './app'
 import { ClientManager } from './client-manager'
+import { BuiltTransactions, TransactionComposer } from './composer'
 import {
   DTAlgodLike,
+  DTNotAvailableError,
   QueryCallLike,
   QueryCallResultLike,
   QueryLimits,
@@ -11,12 +16,23 @@ import {
   chunk,
   getDTSdk,
   getQueryLimits,
+  getSimulateLimits,
+  isDTUnsupportedError,
+  mapProtocolOverrideHits,
   mergeProtocolOverrides,
   offsetProtocolOverride,
   requireDTSdk,
   requireDTSdkFeatures,
 } from './dt-support'
-import { SimulateManager } from './simulate-manager'
+import {
+  SimulateGroupOutcome,
+  SimulateGroupsOptions,
+  SimulateManager,
+  SimulateRoundsOptions,
+  checkSimulateLimits,
+  simulateOptionFeatures,
+} from './simulate-manager'
+import modelsv2 = algosdk.modelsv2
 
 /** The most requests of a query in flight at once, by default. */
 export const DEFAULT_QUERY_CONCURRENCY = 4
@@ -29,6 +45,12 @@ const QUERY_REQUEST_OVERHEAD_BYTES = 512
 
 /** The most bytes of a round in a request body (a msgpack uint64). */
 const QUERY_ROUND_BYTES = 9
+
+/** The log bytes a transaction may have with simulate's `allowMoreLogging` (`simulation.LogBytesLimit`). */
+const SIMULATE_MORE_LOGGING_BYTES = 65_536
+
+/** The opcode budget of each app call of a group (`MaxAppProgramCost`), pooled. */
+const APP_CALL_BUDGET = 700
 
 /** A call of a query: the app args and references of its app call. The references only matter to programs before v9. */
 export interface QueryCallParams {
@@ -171,6 +193,152 @@ export interface QueryRunResult {
   protocolOverride?: SimulateProtocolOverride
   /** The outcome of each call, in the order given. */
   calls: QueryCallOutcome[]
+}
+
+/**
+ * Which way `groups` and `rounds` go:
+ * - `auto` (the default): query when the node has queries and the groups and options can be queried (see `groups`), else
+ *   simulate;
+ * - `query`: query, throwing when it can't;
+ * - `simulate`: simulate, as `algorand.simulate` with `parallel`.
+ */
+export type QueryVia = 'auto' | 'query' | 'simulate'
+
+/** How `groups` and `rounds` choose between query and simulate. */
+export interface QueryRouting {
+  /** Query or simulate (default `auto`). */
+  via?: QueryVia
+  /** The most query requests in flight at once (default 4). The simulate path sends as `algorand.simulate` does. */
+  concurrency?: number
+}
+
+/**
+ * Options to query groups at one round: those of `algorand.simulate.groups` (except `parallel`: the groups never see each
+ * other) and the routing. On the query path, `maxGroups` and `validityWindow` don't apply, and `allowUnnamedResources`
+ * is always on.
+ */
+export type QueryGroupsOptions = Omit<SimulateGroupsOptions, 'parallel'> & QueryRouting
+
+/**
+ * Options to query groups at several rounds: those of `algorand.simulate.rounds` (except `parallel`) and the routing. On
+ * the query path, `maxRounds` (when more than 0) also caps the rounds per query request.
+ */
+export type QueryRoundsOptions = Omit<SimulateRoundsOptions, 'parallel'> & QueryRouting
+
+/** The result of a transaction of a queried group. */
+export interface QueryTxnResult {
+  /** What the transaction's app logged (only the top-level app: inner apps' logs aren't included). Empty for other transactions. */
+  logs: Uint8Array[]
+  /** The opcode budget the app call used, inner calls included, when the node reported it. */
+  cost?: number
+}
+
+/**
+ * Why a group has no result:
+ * - `round`: the whole round failed (`failureMessage` is the round's error);
+ * - `group`: a transaction failed (`failedAt`, `failureMessage`);
+ * - `not-simulated` (simulate only): the group wasn't run because an earlier group broke the block;
+ * - `missing`: the node returned no result for the group.
+ */
+export type QueryGroupErrorKind = 'round' | 'group' | 'not-simulated' | 'missing'
+
+/** The failure of a group at a round, from `algorand.query.groups` / `rounds`, on either path. */
+export class QueryGroupError extends Error {
+  /** Why the group has no result. */
+  public kind: QueryGroupErrorKind
+  /** The index of the group, in the order the composers were given. */
+  public groupIndex: number
+  /** The round of the result. */
+  public round: bigint
+  /**
+   * The node's message. For a failed transaction, as simulate words it: `transaction <TXID>: logic eval error: ...` (the
+   * query path adds the prefix, with the ID of the transaction as built), so `LogicError` can parse it.
+   */
+  public failureMessage?: string
+  /** For `group`: the path of the transaction that failed (on the query path, its index in the group). */
+  public failedAt?: number[]
+  /**
+   * For `group`: the results of the group's transactions, with the failed one's `error`. On the query path every
+   * transaction ran and has one; on the simulate path, the ones that ran before the failure.
+   */
+  public txns?: (QueryTxnResult & { error?: string })[]
+
+  constructor({
+    kind,
+    groupIndex,
+    round,
+    failureMessage,
+    failedAt,
+    txns,
+    cause,
+  }: {
+    kind: QueryGroupErrorKind
+    groupIndex: number
+    round: bigint
+    failureMessage?: string
+    failedAt?: number[]
+    txns?: (QueryTxnResult & { error?: string })[]
+    /** On the simulate path, simulate's error */
+    cause?: unknown
+  }) {
+    const where = `group ${groupIndex} at round ${round}`
+    let message: string
+    switch (kind) {
+      case 'round':
+        message = `Could not query ${where}: ${failureMessage}`
+        break
+      case 'not-simulated':
+        message = `Did not query ${where}: ${failureMessage}`
+        break
+      case 'missing':
+        message = `The response has no result for ${where}`
+        break
+      default:
+        message = `Querying ${where} failed${failedAt ? ` at transaction ${failedAt.join('.')}` : ''}: ${failureMessage}`
+    }
+    super(message, cause !== undefined ? { cause } : undefined)
+    this.name = 'QueryGroupError'
+    this.kind = kind
+    this.groupIndex = groupIndex
+    this.round = round
+    this.failureMessage = failureMessage
+    this.failedAt = failedAt
+    this.txns = txns
+  }
+}
+
+/** The outcome of one group at one round, from `algorand.query.groups` / `rounds`. */
+export type QueryGroupOutcome = {
+  /** The index of the group, in the order the composers were given. */
+  groupIndex: number
+  /** The round of the result: the state as of the end of it. */
+  round: bigint
+  /**
+   * With `protocol`: how it applied at this round, the same for every group of the round. The notes' `hits` give the
+   * group index and the path in it. Undefined when the round failed.
+   */
+  protocolOverride?: SimulateProtocolOverride
+  /** Which way the group went. */
+  via: 'query' | 'simulate'
+} & (
+  | {
+      ok: true
+      /** The result of each transaction of the group, in order. */
+      txns: QueryTxnResult[]
+      /** The ABI returns of the group's method calls, in order, as `SendAtomicTransactionComposerResults.returns`. */
+      returns: ABIReturn[]
+    }
+  | { ok: false; error: QueryGroupError }
+)
+
+/** The outcomes of the groups at one round. */
+export interface QueryRoundOutcome {
+  /** The round, as given. */
+  round: bigint
+  /** The outcome of each group, in the order the composers were given. */
+  groups: QueryGroupOutcome[]
+  /** With `protocol`: how it applied at this round. */
+  protocolOverride?: SimulateProtocolOverride
 }
 
 /** What a query request goes to: a program (with its clear program and schemas) or an app, and the sender. */
@@ -610,6 +778,243 @@ export class QueryManager {
     return rounds.map((r) => toRunResult(results.get(r)!, calls.length))
   }
 
+  /**
+   * Queries composed app calls at one round (the latest by default), with simulate as the fallback: a drop-in for
+   * `algorand.simulate.groups(composers, { parallel: true })` for read-only calls.
+   *
+   * With query, every app call runs alone, against the round's state: the calls of one group don't see each other (no
+   * shared budget pool, `global GroupSize` 1, no `gtxn`), and the composers' fees, validity, notes and leases are ignored;
+   * each call gets the node's `maxCallBudget`. With simulate, the groups run as composed, each on its own (`parallel`).
+   * So use it for independent read-only calls, such as ghost calls. The protocol defaults to `round` (the round's own,
+   * as simulate does).
+   *
+   * `via: 'auto'` (the default) queries when all of these hold, and simulates otherwise:
+   * - the fork has the `query` feature and the node reports query limits;
+   * - `execTraceConfig` is off;
+   * - without `allowMoreLogging`, or with the node's `maxCallLogBytes` at least simulate's 65,536;
+   * - with `extraOpcodeBudget`, it plus 700 per transaction is at most `maxCallBudget` for every group;
+   * - every transaction is a NoOp app call that creates an app (with an approval program) or calls one (without
+   *   programs), without an access list or `rejectVersion`, and no method call has transaction arguments.
+   *
+   * The options are checked the same way whichever path is taken. A node without queries met mid-way (a load balancer
+   * mixing nodes) falls back to simulate with `auto`.
+   *
+   * Unlike `algorand.simulate.groups`, a round the query can't run at gives `kind: 'round'` outcomes (a bad round still
+   * fails the whole request).
+   *
+   * @param composers The groups, one composer each
+   * @param options The simulate options and the routing
+   * @returns The outcome of each group, in order
+   * @example
+   * ```typescript
+   * const composer = algorand.newGroup().addAppCreateMethodCall({ sender, method, args, approvalProgram, clearStateProgram, schema })
+   * const [outcome] = await algorand.query.groups([composer])
+   * if (outcome.ok) console.log(outcome.via, outcome.returns[0]?.returnValue, outcome.txns[0].logs)
+   * ```
+   */
+  public async groups(composers: TransactionComposer[], options?: QueryGroupsOptions): Promise<QueryGroupOutcome[]> {
+    const { round, ...rest } = options ?? {}
+    const [outcomes] = await this.composed(composers, { round: round ? BigInt(round) : 0n }, rest)
+    return outcomes.groups
+  }
+
+  /**
+   * Queries composed app calls at several past rounds, with simulate as the fallback: a drop-in for
+   * `algorand.simulate.rounds(composers, rounds, { parallel: true })` for read-only calls. See `groups` for what query
+   * runs and when it is used.
+   *
+   * @param composers The groups, one composer each (or a single composer)
+   * @param rounds The rounds to query at (each > 0): the state as of the end of each round
+   * @param options The simulate options and the routing
+   * @returns The outcomes at each round, in the order of `rounds`
+   * @example
+   * ```typescript
+   * const composer = algorand.newGroup().addAppCallMethodCall(await appClient.params.call({ method: 'get_price' }))
+   * const prices = await algorand.query.rounds(composer, [45_000_000n, 45_001_000n, 45_002_000n])
+   * for (const { round, groups: [g] } of prices) if (g.ok) console.log(round, g.returns[0]?.returnValue)
+   * ```
+   */
+  public async rounds(
+    composers: TransactionComposer | TransactionComposer[],
+    rounds: Round[],
+    options?: QueryRoundsOptions,
+  ): Promise<QueryRoundOutcome[]> {
+    const groups = Array.isArray(composers) ? composers : [composers]
+    if (rounds.length === 0) return []
+    const requested = rounds.map((r) => BigInt(r))
+    const zero = requested.find((r) => r < 1n)
+    if (zero !== undefined) {
+      throw new RangeError(`Can't query at round ${zero} in rounds: give past rounds (look the latest round up with status())`)
+    }
+    return await this.composed(groups, { rounds: requested }, options ?? {})
+  }
+
+  /** Validates the options, then queries or simulates. */
+  private async composed(
+    composers: TransactionComposer[],
+    at: { round: bigint } | { rounds: bigint[] },
+    options: Omit<QueryRoundsOptions, 'round'>,
+  ): Promise<QueryRoundOutcome[]> {
+    const { via = 'auto', concurrency, ...simulateOptions } = options
+    if (via !== 'auto' && via !== 'query' && via !== 'simulate') {
+      throw new Error(`via must be 'auto', 'query' or 'simulate', not ${JSON.stringify(via)}`)
+    }
+    checkPositiveInteger('concurrency', concurrency)
+    if (composers.length === 0) throw new Error('No transaction groups to query')
+    requireDTSdkFeatures('Querying composed app calls', simulateOptionFeatures(simulateOptions))
+    simulateOptions.signal?.throwIfAborted()
+    // The limits are cached per client and shared, so they are read without the signal
+    checkSimulateLimits(await getSimulateLimits(this._clientManager.algod), simulateOptions.protocol, simulateOptions)
+    if (via !== 'simulate') {
+      const plan = await this.queryPlan(composers, simulateOptions)
+      if (plan.ok) {
+        try {
+          return await this.viaQuery(plan, at, simulateOptions, concurrency ?? DEFAULT_QUERY_CONCURRENCY)
+        } catch (error) {
+          if (via === 'query' || !isDTUnsupportedError(error)) throw error
+          Config.logger.debug(`Querying through simulate: ${(error as Error).message}`)
+        }
+      } else {
+        if (via === 'query') throw plan.error()
+        Config.logger.debug(`Querying through simulate: ${plan.reason}`)
+      }
+    }
+    return await this.viaSimulate(composers, at, simulateOptions)
+  }
+
+  /** Whether the groups can be queried with these options, with the built groups if so. */
+  private async queryPlan(composers: TransactionComposer[], options: Omit<SimulateRoundsOptions, 'parallel'>): Promise<QueryPlan> {
+    const no = (reason: string, error: () => Error = () => new Error(`Can't query these groups: ${reason}`)): QueryPlan => ({
+      ok: false,
+      reason,
+      error,
+    })
+    const tt = getDTSdk()
+    if (!tt) return no('the loaded algosdk is not the time-travel fork', () => new DTNotAvailableError('Querying'))
+    if (!(tt.DTAlgodClient.features ?? []).includes('query')) {
+      return no('the loaded time-travel fork of algosdk has no query feature', () => new DTNotAvailableError('Querying', ['query']))
+    }
+    const limits = await getQueryLimits(this._clientManager.algod)
+    if (!limits) {
+      return no(
+        'the node has no query endpoint',
+        () =>
+          new tt.DTUnsupportedError(
+            'The node has no query endpoint (POST /v2/query): it is stock algod, an older dtalgod, or has queries disabled',
+          ),
+      )
+    }
+    if (options.execTraceConfig?.enable) return no('execTraceConfig needs simulate')
+    if (options.allowMoreLogging && limits.maxCallLogBytes < SIMULATE_MORE_LOGGING_BYTES) {
+      return no(`allowMoreLogging allows more log bytes than the node's queries (maxCallLogBytes ${limits.maxCallLogBytes})`)
+    }
+    const built: BuiltTransactions[] = []
+    for (const composer of composers) {
+      const b = await composer.buildTransactions()
+      if (b.transactions.length === 0) throw new Error(`Transaction group ${built.length} is empty`)
+      built.push(b)
+    }
+    const { extraOpcodeBudget } = options
+    for (const [g, b] of built.entries()) {
+      if (extraOpcodeBudget !== undefined) {
+        const pool = BigInt(extraOpcodeBudget) + BigInt(APP_CALL_BUDGET * b.transactions.length)
+        if (pool > BigInt(limits.maxCallBudget)) {
+          return no(`group ${g} gets a budget of ${pool} with simulate, more than a query call's maxCallBudget ${limits.maxCallBudget}`)
+        }
+      }
+      for (const [t, txn] of b.transactions.entries()) {
+        const why = notQueryable(txn)
+        if (why) return no(`transaction ${t} of group ${g} ${why}`)
+      }
+      for (const [t, method] of b.methodCalls) {
+        if (method.args.some((a) => algosdk.abiTypeIsTransaction(a.type))) {
+          return no(`the method call at transaction ${t} of group ${g} has transaction arguments`)
+        }
+      }
+    }
+    return { ok: true, tt, limits, built }
+  }
+
+  /** Queries the groups' app calls: one job per target (program or app, and sender), sharing one run. */
+  private async viaQuery(
+    plan: Extract<QueryPlan, { ok: true }>,
+    at: { round: bigint } | { rounds: bigint[] },
+    options: Omit<SimulateRoundsOptions, 'parallel'>,
+    concurrency: number,
+  ): Promise<QueryRoundOutcome[]> {
+    const { tt, limits, built } = plan
+    const parts: { target: QueryTarget; calls: QueryCallLike[]; refs: { group: number; txn: number }[] }[] = []
+    const where = built.map((b, g) =>
+      b.transactions.map((txn, t) => {
+        const target = targetOf(txn)
+        let part = parts.findIndex((p) => sameTarget(p.target, target))
+        if (part < 0) part = parts.push({ target, calls: [], refs: [] }) - 1
+        parts[part].calls.push(callOf(txn))
+        parts[part].refs.push({ group: g, txn: t })
+        return { part, call: parts[part].calls.length - 1 }
+      }),
+    )
+    const requested = 'rounds' in at ? at.rounds : [at.round]
+    // Simulate's default: the protocol the round really ran (which reports no override)
+    const protocol = options.protocol ?? 'round'
+    const run = this.newRun(tt, limits, { signal: options.signal, concurrency, maxRounds: options.maxRounds || undefined })
+    const results = await run.execute(parts.map((p) => ({ target: p.target, calls: p.calls, rounds: [...new Set(requested)], protocol })))
+    return requested.map((r) => {
+      const accs = results.map((m) => m.get(r)!)
+      const round = r === 0n ? accs[0].round : r
+      const error = accs.find((a) => a.error !== undefined)?.error
+      // Hits are at (call index in the part, path from the call): move them to (group, path in the group)
+      const protocolOverride =
+        error === undefined
+          ? mergeProtocolOverrides(
+              accs.map((acc, p) =>
+                mapProtocolOverrideHits(mergeProtocolOverrides(acc.overrides), (h) => {
+                  const ref = parts[p].refs[h.group]
+                  return ref ? { group: ref.group, path: [ref.txn, ...h.path.slice(1)] } : h
+                }),
+              ),
+            )
+          : undefined
+      const groups = built.map((b, g) =>
+        toQueryGroupOutcome(
+          b,
+          g,
+          round,
+          error,
+          where[g].map((w) => accs[w.part].calls[w.call]),
+          protocolOverride,
+        ),
+      )
+      return { round, groups, ...(protocolOverride ? { protocolOverride } : {}) }
+    })
+  }
+
+  /** Simulates the groups in parallel, as `algorand.simulate` does, and maps the outcomes. */
+  private async viaSimulate(
+    composers: TransactionComposer[],
+    at: { round: bigint } | { rounds: bigint[] },
+    options: Omit<SimulateRoundsOptions, 'parallel'>,
+  ): Promise<QueryRoundOutcome[]> {
+    if ('round' in at) {
+      const { maxRounds: _maxRounds, validityWindow: _validityWindow, ...rest } = options
+      const outcomes = await this._simulate.groups(composers, { ...rest, ...(at.round ? { round: at.round } : {}), parallel: true })
+      const protocolOverride = outcomes.find((o) => o.protocolOverride)?.protocolOverride
+      return [
+        {
+          round: outcomes[0]?.round ?? at.round,
+          groups: outcomes.map(fromSimulateOutcome),
+          ...(protocolOverride ? { protocolOverride } : {}),
+        },
+      ]
+    }
+    const results = await this._simulate.rounds(composers, at.rounds, { ...options, parallel: true })
+    return results.map((r) => ({
+      round: r.round,
+      groups: r.groups.map(fromSimulateOutcome),
+      ...(r.protocolOverride ? { protocolOverride: r.protocolOverride } : {}),
+    }))
+  }
+
   /** A run of query requests within the node's limits. */
   private newRun(
     tt: DTSdk,
@@ -653,4 +1058,158 @@ function toRunResult(acc: RoundResults, callCount: number): QueryRunResult {
     return { callIndex, round, ok: true, logs: c.logs, cost: c.cost ?? 0 }
   })
   return { round, ...(protocolOverride ? { protocolOverride } : {}), calls }
+}
+
+/** Whether groups can be queried: the built groups and what to query them with, or why not and the error for `via: 'query'`. */
+type QueryPlan =
+  { ok: true; tt: DTSdk; limits: QueryLimits; built: BuiltTransactions[] } | { ok: false; reason: string; error: () => Error }
+
+/** Why a transaction can't be a query call, or undefined if it can. */
+function notQueryable(txn: algosdk.Transaction): string | undefined {
+  const app = txn.applicationCall
+  if (txn.type !== algosdk.TransactionType.appl || !app) return `is a ${txn.type} transaction, not an app call`
+  if (app.onComplete !== algosdk.OnApplicationComplete.NoOpOC) {
+    return `has OnComplete ${algosdk.OnApplicationComplete[app.onComplete] ?? app.onComplete}, not NoOp`
+  }
+  if (app.access.length > 0) return 'has an access list'
+  if (app.rejectVersion) return 'sets rejectVersion'
+  if (app.appIndex === 0n) return app.approvalProgram.length > 0 ? undefined : 'creates an app without an approval program'
+  return app.approvalProgram.length > 0 || app.clearProgram.length > 0 ? 'calls an existing app with programs' : undefined
+}
+
+/** The query target of an app call. */
+function targetOf(txn: algosdk.Transaction): QueryTarget {
+  const app = txn.applicationCall!
+  const sender = txn.sender.toString()
+  if (app.appIndex !== 0n) return { appId: app.appIndex, sender }
+  const schema = (numUint: number, numByteSlice: number) => (numUint || numByteSlice ? { numUint, numByteSlice } : undefined)
+  const globalSchema = schema(app.numGlobalInts, app.numGlobalByteSlices)
+  const localSchema = schema(app.numLocalInts, app.numLocalByteSlices)
+  return {
+    program: app.approvalProgram,
+    ...(app.clearProgram.length > 0 ? { clearProgram: app.clearProgram } : {}),
+    ...(globalSchema ? { globalSchema } : {}),
+    ...(localSchema ? { localSchema } : {}),
+    sender,
+  }
+}
+
+const sameBytes = (a: Uint8Array | undefined, b: Uint8Array | undefined) => {
+  if (a === b) return true
+  if (!a || !b || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+const sameSchema = (a: QuerySchema | undefined, b: QuerySchema | undefined) =>
+  a?.numUint === b?.numUint && a?.numByteSlice === b?.numByteSlice
+
+/** Whether two targets are the same request target. */
+function sameTarget(a: QueryTarget, b: QueryTarget): boolean {
+  return (
+    a.sender === b.sender &&
+    a.appId === b.appId &&
+    sameSchema(a.globalSchema, b.globalSchema) &&
+    sameSchema(a.localSchema, b.localSchema) &&
+    sameBytes(a.program, b.program) &&
+    sameBytes(a.clearProgram, b.clearProgram)
+  )
+}
+
+/** The query call of an app call: its args and references. */
+function callOf(txn: algosdk.Transaction): QueryCallLike {
+  const app = txn.applicationCall!
+  return {
+    ...(app.appArgs.length ? { args: [...app.appArgs] } : {}),
+    ...(app.accounts.length ? { accounts: app.accounts.map((a) => a.toString()) } : {}),
+    ...(app.foreignApps.length ? { foreignApps: [...app.foreignApps] } : {}),
+    ...(app.foreignAssets.length ? { foreignAssets: [...app.foreignAssets] } : {}),
+    ...(app.boxes.length ? { boxes: app.boxes.map((b) => ({ app: b.appIndex, name: b.name })) } : {}),
+  }
+}
+
+/** The outcome of a queried group from the results of its calls. */
+function toQueryGroupOutcome(
+  built: BuiltTransactions,
+  groupIndex: number,
+  round: bigint,
+  roundError: string | undefined,
+  calls: (CallResult | undefined)[],
+  protocolOverride: SimulateProtocolOverride | undefined,
+): QueryGroupOutcome {
+  const base = { groupIndex, round, via: 'query' as const, ...(protocolOverride ? { protocolOverride } : {}) }
+  const fail = (error: QueryGroupError): QueryGroupOutcome => ({ ...base, ok: false, error })
+  if (roundError !== undefined) return fail(new QueryGroupError({ kind: 'round', groupIndex, round, failureMessage: roundError }))
+  if (calls.some((c) => !c)) return fail(new QueryGroupError({ kind: 'missing', groupIndex, round }))
+  const results = calls as CallResult[]
+  const txnResult = (c: CallResult) => ({ logs: c.logs, ...(c.cost !== undefined ? { cost: c.cost } : {}) })
+  const failed = results.findIndex((c) => c.error !== undefined)
+  if (failed >= 0) {
+    return fail(
+      new QueryGroupError({
+        kind: 'group',
+        groupIndex,
+        round,
+        // As simulate words it, for LogicError and other parsers of simulate's messages
+        failureMessage: `transaction ${built.transactions[failed].txID()}: ${results[failed].error}`,
+        failedAt: [failed],
+        txns: results.map((c) => ({ ...txnResult(c), ...(c.error !== undefined ? { error: c.error } : {}) })),
+      }),
+    )
+  }
+  const returns = [...built.methodCalls.entries()].map(([index, method]) =>
+    getABIReturnValue(
+      algosdk.AtomicTransactionComposer.parseMethodResponse(
+        method,
+        { txID: built.transactions[index].txID(), rawReturnValue: new Uint8Array(), method },
+        { logs: results[index].logs } as modelsv2.PendingTransactionResponse,
+      ),
+      method.returns.type,
+    ),
+  )
+  return { ...base, ok: true, txns: results.map(txnResult), returns }
+}
+
+/** The simulate transaction results of a response, by their confirmation (`txnResult`). */
+const simulateResults = new WeakMap<object, Map<modelsv2.PendingTransactionResponse, modelsv2.SimulateTransactionResult>>()
+
+function simulateResultsOf(response: modelsv2.SimulateResponse) {
+  let results = simulateResults.get(response)
+  if (!results) {
+    results = new Map()
+    const rounds = (response as { roundResults?: { txnGroups: modelsv2.SimulateTransactionGroupResult[] }[] }).roundResults ?? []
+    for (const group of [...response.txnGroups, ...rounds.flatMap((r) => r.txnGroups)]) {
+      for (const t of group.txnResults) results.set(t.txnResult, t)
+    }
+    simulateResults.set(response, results)
+  }
+  return results
+}
+
+/** A simulate outcome as a query outcome. */
+function fromSimulateOutcome(o: SimulateGroupOutcome): QueryGroupOutcome {
+  const { groupIndex, round } = o
+  const base = { groupIndex, round, via: 'simulate' as const, ...(o.protocolOverride ? { protocolOverride: o.protocolOverride } : {}) }
+  const cost = (t: modelsv2.SimulateTransactionResult | undefined) =>
+    t?.appBudgetConsumed !== undefined ? { cost: t.appBudgetConsumed } : {}
+  if (o.ok) {
+    const results = simulateResultsOf(o.result.simulateResponse)
+    return {
+      ...base,
+      ok: true,
+      txns: o.result.confirmations.map((c) => ({ logs: c.logs ?? [], ...cost(results.get(c)) })),
+      returns: o.result.returns ?? [],
+    }
+  }
+  const { kind, failureMessage, failedAt, result } = o.error
+  const txns = result?.txnResults.map((t, i) => ({
+    logs: t.txnResult.logs ?? [],
+    ...cost(t),
+    ...(failedAt?.[0] === i && failureMessage !== undefined ? { error: failureMessage } : {}),
+  }))
+  return {
+    ...base,
+    ok: false,
+    error: new QueryGroupError({ kind, groupIndex, round, failureMessage, failedAt, txns, cause: o.error }),
+  }
 }
