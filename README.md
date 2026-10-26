@@ -25,12 +25,12 @@ npm (`package.json`; each override must equal the dependency spec):
 ```json
 {
   "dependencies": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.0.1",
-    "algosdk": "npm:dtalgosdk@3.9.0-dt.2.0.0.1"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.1.0",
+    "algosdk": "npm:dtalgosdk@3.9.0-dt.2.0.1.0"
   },
   "overrides": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.0.1",
-    "algosdk": "npm:dtalgosdk@3.9.0-dt.2.0.0.1"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.1.0",
+    "algosdk": "npm:dtalgosdk@3.9.0-dt.2.0.1.0"
   }
 }
 ```
@@ -39,8 +39,8 @@ pnpm (`pnpm-workspace.yaml`, or `pnpm.overrides` in `package.json`), with the sa
 
 ```yaml
 overrides:
-  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.0.1
-  algosdk: npm:dtalgosdk@3.9.0-dt.2.0.0.1
+  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.1.0
+  algosdk: npm:dtalgosdk@3.9.0-dt.2.0.1.0
 ```
 
 yarn: the same entries under `resolutions` in `package.json` (yarn ignores `overrides`). Yarn 4 refuses versions published less than a day ago (`npmMinimalAgeGate`); to install a new release right away, add `npmPreapprovedPackages: ["@d13co/dt-algokit-utils", "dtalgosdk"]` to `.yarnrc.yml`. bun: the same entries under `overrides`.

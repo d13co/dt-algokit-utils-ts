@@ -1,14 +1,15 @@
 {
   "name": "@d13co/dt-algokit-utils",
-  "version": "9.2.3-dt.2.0.0.1",
+  "version": "9.2.3-dt.2.0.1.0",
   "private": false,
-  "description": "Fork of @algorandfoundation/algokit-utils with dtalgod support: reads at past rounds, object versions and extended simulate.",
+  "description": "Fork of @algorandfoundation/algokit-utils with dtalgod support: reads at past rounds, object versions, extended simulate and read-only TEAL queries.",
   "keywords": [
     "algorand",
     "algokit",
     "dtalgod",
     "time-travel",
-    "simulate"
+    "simulate",
+    "query"
   ],
   "author": "Algorand Foundation",
   "license": "MIT",
