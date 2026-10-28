@@ -412,6 +412,43 @@ describe('time travel', () => {
       expect(stub.calls[1].query.next).toBe('2')
     })
 
+    test('iterating passes the signal on every page, and an abort stops it without more requests', async () => {
+      const boxesPage = (round: number, next?: string) =>
+        json({
+          round: 900,
+          versions: [round, round + 1].map((r) => ({ round: r, timestamp: r, boxes: [{ name: b64('a'), deleted: false }] })),
+          ...(next ? { 'next-token': next } : {}),
+        })
+      stub.on('get', '/v2/applications/5/boxes/versions', boxesPage(1, '3')).on('get', '/v2/applications/5/boxes/versions', boxesPage(3))
+      const controller = new AbortController()
+      const rounds = []
+      for await (const v of algorand.dt.iterateBoxesVersions(5n, { signal: controller.signal })) rounds.push(v.round)
+      expect(rounds).toEqual([1n, 2n, 3n, 4n])
+      expect(stub.calls.map((c) => c.options?.signal)).toEqual([controller.signal, controller.signal])
+
+      // Aborted while holding the first entry of a page that has a next page
+      stub.calls = []
+      stub.on('get', '/v2/applications/5/boxes/versions', boxesPage(1, '3'), true)
+      const reason = new Error('navigated away')
+      const aborting = new AbortController()
+      const seen: bigint[] = []
+      await expect(
+        (async () => {
+          for await (const v of algorand.dt.iterateBoxesVersions(5n, { signal: aborting.signal })) {
+            seen.push(v.round)
+            aborting.abort(reason)
+          }
+        })(),
+      ).rejects.toBe(reason)
+      expect(seen).toEqual([1n])
+      expect(stub.calls).toHaveLength(1)
+
+      // Aborted before it starts: no request at all
+      stub.calls = []
+      await expect(algorand.dt.iterateAppVersions(5n, { signal: aborting.signal }).next()).rejects.toBe(reason)
+      expect(stub.calls).toHaveLength(0)
+    })
+
     test('app versions decode global state', async () => {
       stub.on(
         'get',

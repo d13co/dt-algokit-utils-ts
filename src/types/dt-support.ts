@@ -89,7 +89,7 @@ export interface VersionsRequestLike<Entry, Response extends { round: bigint; ve
   next(nextToken: string | undefined): this
   include(...include: 'values'[]): this
   do(...args: DoArgs): Promise<Response>
-  iterate(): AsyncGenerator<Entry>
+  iterate(...args: DoArgs): AsyncGenerator<Entry>
 }
 
 /** The order of a versions listing: oldest first (`asc`) or newest first (`desc`). */

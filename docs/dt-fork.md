@@ -123,7 +123,7 @@ const { versions: appVersions } = await algorand.dt.getAppVersions(appId, { incl
 appVersions.map((v) => v.app?.globalState)
 ```
 
-Also `getAssetVersions`, `getAccountVersions` (with `exclude`), `getAccountAssetVersions` and `getAccountAppVersions`. Options: `minRound`, `maxRound`, `order` (`'asc'` or `'desc'`), `limit`, `includeValues`, and for a page `next` (the previous page's `nextToken`) and `signal`. `algorand.dt.supported()` tells whether the node has time travel.
+Also `getAssetVersions`, `getAccountVersions` (with `exclude`), `getAccountAssetVersions` and `getAccountAppVersions`. Options: `minRound`, `maxRound`, `order` (`'asc'` or `'desc'`), `limit`, `includeValues`, `signal`, and for a page `next` (the previous page's `nextToken`). An iterator passes `signal` to every page request, and stops at an abort, even within a page, throwing the signal's reason. `algorand.dt.supported()` tells whether the node has time travel.
 
 ## Extended simulate
 
@@ -240,7 +240,7 @@ A busy node answers 503 with `Retry-After`: the clients that `AlgorandClient.fro
 
 ## Aborting requests
 
-`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages, `algorand.simulate.groups`/`rounds` and `algorand.query.run`/`groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). Aborting a query cancels all its requests in flight, and the node stops working on them. The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
+`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages and iterators, `algorand.simulate.groups`/`rounds` and `algorand.query.run`/`groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). Aborting a query cancels all its requests in flight, and the node stops working on them. The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
 
 ```typescript
 const controller = new AbortController()

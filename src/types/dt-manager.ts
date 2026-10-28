@@ -35,14 +35,17 @@ export interface VersionsOptions {
   limit?: number
   /** Include the value of each version (box values, app params, asset params, account objects). */
   includeValues?: boolean
+  /**
+   * Aborts the listing: passed to fetch for every page request. An iterator stops at the abort, even within a page, and
+   * throws the signal's reason without sending more requests.
+   */
+  signal?: AbortSignal
 }
 
 /** Options for one page of a `/versions` listing. */
 export interface VersionsPageOptions extends VersionsOptions {
   /** The `nextToken` of the previous page, with the same other options. */
   next?: string
-  /** Aborts the request: passed to fetch. */
-  signal?: AbortSignal
 }
 
 /** Options for an account `/versions` listing. */
@@ -514,8 +517,12 @@ export class DTManager {
   }
 
   private async *iterate<E, T>(request: () => AnyVersionsRequest<E>, options: VersionsOptions | undefined, map: (entry: E) => T) {
-    for await (const entry of this.configure(request(), options).iterate()) {
+    const signal = options?.signal
+    signal?.throwIfAborted()
+    for await (const entry of this.configure(request(), options).iterate(undefined, fetchOptions(options))) {
       yield map(entry)
+      // The caller may have aborted while it held this entry: stop before reading the rest of the page or the next one
+      signal?.throwIfAborted()
     }
   }
 }
