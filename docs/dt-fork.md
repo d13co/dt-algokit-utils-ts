@@ -48,16 +48,16 @@ At runtime, `await algorand.client.supportsDT()` (or `algorand.dt.supported()`) 
 
 New:
 
-| Where                                                                                                               | What                                                                                                                                                                                                                                                                                              |
-| ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `algorand.dt` (`DTManager`)                                                                                         | Version listings: `get…Versions` (a page) and `iterate…Versions` (async iterator) for boxes, all boxes of an app, apps, assets, accounts, account asset holdings and account app local states, in a range or as of `rounds`, with `changedRound` and `changedKeys` (`includeKeys`); `supported()` |
-| `algorand.simulate` (`SimulateManager`)                                                                             | `groups(composers, options)`, `rounds(composers, rounds, options)` and `limits()`                                                                                                                                                                                                                 |
-| `algorand.query` (`QueryManager`)                                                                                   | Read-only TEAL queries (`POST /v2/query`): `run(params, options)`, `groups(composers, options)` and `rounds(composers, rounds, options)` with simulate as the fallback, `limits()` and `supported()`                                                                                              |
-| `algorand.client.dtAlgod`                                                                                           | The algod client as the fork's `DTAlgodClient`                                                                                                                                                                                                                                                    |
-| `algorand.client.supportsDT()`                                                                                      | Whether the fork is loaded and the node has time travel                                                                                                                                                                                                                                           |
-| `AppClient.atRound(round)`, `AppClient.round`                                                                       | A clone of the client pinned to a past round, and the round it's pinned to                                                                                                                                                                                                                        |
-| `DTNotAvailableError`, `isDTUnsupportedError`, `QueryCallError`, `QueryGroupError` (exported from the package root) | See [Errors](#errors)                                                                                                                                                                                                                                                                             |
-| `accountInformationFromAlgod`, `AssetManager.assetInformationFromAlgod`, `AppManager.appInformationFromAlgod`       | The converters from algod models that the existing getters use, exposed for the version listings                                                                                                                                                                                                  |
+| Where                                                                                                               | What                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `algorand.dt` (`DTManager`)                                                                                         | Version listings: `get…Versions` (a page) and `iterate…Versions` (async iterator) for boxes, all boxes of an app, apps, assets, accounts, account asset holdings and account app local states, in a range or as of `rounds`, with `changedRound` and `changedKeys` (`includeKeys`), filtered by state `key` or box `prefix`; `supported()` |
+| `algorand.simulate` (`SimulateManager`)                                                                             | `groups(composers, options)`, `rounds(composers, rounds, options)` and `limits()`                                                                                                                                                                                                                                                          |
+| `algorand.query` (`QueryManager`)                                                                                   | Read-only TEAL queries (`POST /v2/query`): `run(params, options)`, `groups(composers, options)` and `rounds(composers, rounds, options)` with simulate as the fallback, `limits()` and `supported()`                                                                                                                                       |
+| `algorand.client.dtAlgod`                                                                                           | The algod client as the fork's `DTAlgodClient`                                                                                                                                                                                                                                                                                             |
+| `algorand.client.supportsDT()`                                                                                      | Whether the fork is loaded and the node has time travel                                                                                                                                                                                                                                                                                    |
+| `AppClient.atRound(round)`, `AppClient.round`                                                                       | A clone of the client pinned to a past round, and the round it's pinned to                                                                                                                                                                                                                                                                 |
+| `DTNotAvailableError`, `isDTUnsupportedError`, `QueryCallError`, `QueryGroupError` (exported from the package root) | See [Errors](#errors)                                                                                                                                                                                                                                                                                                                      |
+| `accountInformationFromAlgod`, `AssetManager.assetInformationFromAlgod`, `AppManager.appInformationFromAlgod`       | The converters from algod models that the existing getters use, exposed for the version listings                                                                                                                                                                                                                                           |
 
 Changed (all additions are optional):
 
@@ -155,6 +155,28 @@ versions.map((v) => v.changedKeys?.map((k) => Buffer.from(k).toString()))
 ```
 
 `rounds` and `includeKeys` need a dtalgod newer than `v5.0.4-dt3` and dtalgosdk 3.9.0-dt.3.0.0.1 or later (its `versions-rounds` / `versions-keys` features; an older one throws `DTNotAvailableError`). On a dt3 node, `rounds` is detected as ignored and `includeKeys` rejected, both thrown as `DTUnsupportedError`.
+
+### Key and prefix filters
+
+`key` on `get/iterateAppVersions` (a global state key) and `get/iterateAccountAppVersions` (a local state key) lists only the versions at which that key changed, each with `keyValue`, the key's decoded value after it (as in `AppState`; undefined when it was removed). `prefix` on `get/iterateBoxesVersions` lists only the changes of the boxes whose names start with it, such as one ARC-56 box map. Strings are UTF-8; both are at most 64 bytes.
+
+```typescript
+for await (const v of algorand.dt.iterateAppVersions(poolAppId, { key: 'algodVer', minRound, maxRound })) {
+  console.log(v.round, v.keyValue?.value)
+}
+for await (const { round, boxes } of algorand.dt.iterateBoxesVersions(registryAppId, { prefix: 'sps' })) {
+  // only the sps… boxes
+}
+```
+
+- An empty `key` is a valid key. An empty `prefix` means no filter (ARC-56 maps with `prefix: ""`): nothing is sent or filtered.
+- `key` can't go with `rounds` (an `Error` before sending); `prefix` can. With `rounds`, every round has an entry, possibly with no boxes.
+- With `key` on the account endpoint, entries hold only the local state, never the created app's params.
+- Pages can be short or empty and still have a `nextToken`: the node examines a bounded number of versions (key) or box index entries (prefix) per page. Keep paging until `nextToken` is absent; the iterators do.
+
+`key` and `prefix` go to the node as its `key` / `prefix` parameters, like any other versions parameter: there is no probe and no client-side emulation. They need dtalgosdk 3.9.0-dt.3.0.0.1 or later, checked by its `versions-pages` feature (an older fork throws `DTNotAvailableError` before sending).
+
+Recommended follow-up: ARC-56 state history helpers on `AppClient.state.*` (a global or local key's versions, a box map's changes, decoded with the app spec), built on these `key` / `prefix` listings.
 
 ## Extended simulate
 

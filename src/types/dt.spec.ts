@@ -669,6 +669,100 @@ describe('time travel', () => {
       expect(local.appsLocalState?.[0].changedKeys?.map((k) => Buffer.from(k).toString())).toEqual(['l'])
       expect(local.createdApps?.[0].changedKeys).toEqual([])
     })
+
+    describe('key and prefix filters', () => {
+      const tv = (v: number | string) => (typeof v === 'number' ? { type: 2, uint: v, bytes: '' } : { type: 1, uint: 0, bytes: b64(v) })
+
+      test('key=b64:… is sent as given and keyValue decoded; a short page keeps its nextToken', async () => {
+        stub
+          .on(
+            'get',
+            '/v2/applications/5/versions',
+            json({
+              round: 900,
+              versions: [
+                { round: 10, timestamp: 1, deleted: false, 'key-value': tv(7) },
+                { round: 11, timestamp: 1, deleted: false, 'key-value': tv('hi') },
+                { round: 12, timestamp: 1, deleted: false },
+              ],
+              'next-token': '13',
+            }),
+          )
+          .on(
+            'get',
+            `/v2/accounts/${address}/applications/5/versions`,
+            json({
+              round: 900,
+              versions: [{ round: 10, timestamp: 1, 'apps-local-state': [{ 'app-id': 5, deleted: false, 'key-value': tv(3) }] }],
+            }),
+          )
+        const page = await algorand.dt.getAppVersions(5n, { key: 'total', limit: 5000 })
+        expect(stub.calls[0].query).toMatchObject({ key: `b64:${b64('total')}`, limit: '5000' })
+        expect(stub.calls[0].query.include).toBeUndefined()
+        expect(page.versions.map((v) => v.keyValue?.value)).toEqual([7n, 'hi', undefined])
+        expect(page.versions[0].keyValue?.keyBase64).toBe(b64('total'))
+        expect(page.nextToken).toBe('13')
+        const local = await algorand.dt.getAccountAppVersions(address, 5n, { key: new Uint8Array([0, 1]) })
+        expect(stub.calls[1].query.key).toBe('b64:AAE=')
+        expect(local.versions[0].appsLocalState?.[0].keyValue?.value).toBe(3n)
+        // No other request: nothing is probed
+        expect(stub.calls).toHaveLength(2)
+      })
+
+      test('the iterators page through short and empty pages until there is no nextToken', async () => {
+        stub
+          .on('get', '/v2/applications/5/versions', json({ round: 900, versions: [], 'next-token': '100' }))
+          .on(
+            'get',
+            '/v2/applications/5/versions',
+            json({ round: 900, versions: [{ round: 150, timestamp: 1, deleted: false, 'key-value': tv(1) }], 'next-token': '200' }),
+          )
+          .on('get', '/v2/applications/5/versions', json({ round: 900, versions: [] }))
+        const seen = []
+        for await (const v of algorand.dt.iterateAppVersions(5n, { key: 'k' })) seen.push(v.round)
+        expect(seen).toEqual([150n])
+        expect(stub.calls.map((c) => [c.query.key, c.query.next])).toEqual([
+          [`b64:${b64('k')}`, undefined],
+          [`b64:${b64('k')}`, '100'],
+          [`b64:${b64('k')}`, '200'],
+        ])
+      })
+
+      test('prefix=b64:… is sent, with rounds too; an empty prefix sends nothing', async () => {
+        const feed = json({ round: 900, versions: [{ round: 10, timestamp: 1, boxes: [{ name: b64('spsA'), deleted: false }] }] })
+        stub.on('get', '/v2/applications/5/boxes/versions', feed, true)
+        const page = await algorand.dt.getBoxesVersions(5n, { prefix: 'sps' })
+        expect(stub.calls[0].query.prefix).toBe(`b64:${b64('sps')}`)
+        expect(page.versions[0].boxes[0].name.name).toBe('spsA')
+        for await (const _ of algorand.dt.iterateBoxesVersions(5n, { prefix: 'sps', rounds: [10] })) void _
+        expect(stub.calls[1].query).toMatchObject({ prefix: `b64:${b64('sps')}`, rounds: '10' })
+        await algorand.dt.getBoxesVersions(5n, { prefix: '' })
+        expect(stub.calls[2].query.prefix).toBeUndefined()
+      })
+
+      test('checks before sending: 64 bytes at most, no key with rounds, a fork with versions-pages', async () => {
+        await expect(algorand.dt.getAppVersions(5n, { key: new Uint8Array(65) })).rejects.toThrow(/65 bytes/)
+        await expect(algorand.dt.iterateBoxesVersions(5n, { prefix: 'x'.repeat(65) }).next()).rejects.toThrow(/65 bytes/)
+        await expect(algorand.dt.getAppVersions(5n, { key: 'k', rounds: [5] })).rejects.toThrow(/key cannot be combined with rounds/)
+        await withoutFeatures(['versions-pages'], async () => {
+          await expect(algorand.dt.getAppVersions(5n, { key: 'k' })).rejects.toThrow(DTNotAvailableError)
+          await expect(algorand.dt.getBoxesVersions(5n, { prefix: 'p' })).rejects.toThrow(/versions-pages/)
+        })
+        expect(stub.calls).toHaveLength(0)
+        // dtalgosdk 3.9.0-dt.3.0.0.1 as released lists no versions-filters feature: key and prefix don't need one
+        stub
+          .on('get', '/v2/applications/5/versions', json({ round: 9, versions: [] }))
+          .on('get', '/v2/applications/5/boxes/versions', json({ round: 9, versions: [] }))
+        await withoutFeatures(['versions-filters'], async () => {
+          await algorand.dt.getAppVersions(5n, { key: 'k' })
+          await algorand.dt.getBoxesVersions(5n, { prefix: 'p' })
+        })
+        expect(stub.calls.map((c) => [c.query.key, c.query.prefix])).toEqual([
+          ['b64:aw==', undefined],
+          [undefined, 'b64:cA=='],
+        ])
+      })
+    })
   })
 
   describe('app client at a round', () => {

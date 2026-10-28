@@ -304,4 +304,61 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       }),
     )
   })
+
+  describe('versions filters', () => {
+    /** An app whose global state changes every round (`total_effort`) */
+    const BUSY_APP = 1284326447n
+    /** Reti's validator registry: `sps` boxes (pool sets) and `v` boxes (validators) */
+    const REGISTRY = 2714516089n
+    const utf8 = (b: Uint8Array) => Buffer.from(b).toString()
+
+    test('key: the node filter matches the versions filtered by their changed keys', async () => {
+      const keyed = []
+      for await (const v of algorand.dt.iterateAppVersions(BUSY_APP, { key: 'total_effort', maxRound: latest, order: 'desc' })) {
+        keyed.push(v)
+        if (keyed.length === 3) break
+      }
+      expect(keyed).toHaveLength(3)
+      const expected = []
+      for await (const v of algorand.dt.iterateAppVersions(BUSY_APP, {
+        includeKeys: true,
+        includeValues: true,
+        minRound: keyed[2].round,
+        maxRound: latest,
+        order: 'desc',
+      })) {
+        if (v.deleted || v.changedKeys?.some((k) => utf8(k) === 'total_effort'))
+          expected.push([v.round, v.app?.globalState.total_effort?.value])
+      }
+      expect(keyed.map((v) => [v.round, v.keyValue?.value])).toEqual(expected)
+      expect(typeof keyed[0].keyValue?.value).toBe('bigint')
+    })
+
+    test('prefix: the node filter matches the box feed filtered client-side, over the same window', async () => {
+      const window = { minRound: latest - 20_000n, maxRound: latest, limit: 1000 }
+      const filtered = []
+      for await (const v of algorand.dt.iterateBoxesVersions(REGISTRY, { ...window, prefix: 'sps' })) {
+        filtered.push([v.round, v.boxes.map((b) => b.name.name)])
+      }
+      const all = []
+      let other = 0
+      for await (const v of algorand.dt.iterateBoxesVersions(REGISTRY, window)) {
+        const names = v.boxes.map((b) => b.name.name)
+        other += names.filter((n) => !n.startsWith('sps')).length
+        const sps = names.filter((n) => n.startsWith('sps'))
+        if (sps.length) all.push([v.round, sps])
+      }
+      // Never vacuous: the window holds changes of other boxes (validator boxes change every epoch)
+      expect(other).toBeGreaterThan(0)
+      expect(filtered).toEqual(all)
+    })
+
+    test('prefix with rounds: only the boxes under the prefix, at each round', async () => {
+      const { versions } = await algorand.dt.getBoxesVersions(REGISTRY, { rounds: [60_000_000n], prefix: 'v' })
+      expect(versions).toHaveLength(1)
+      const names = versions[0].boxes.map((b) => b.name.name)
+      expect(names.length).toBeGreaterThan(0)
+      expect(names.every((n) => n.startsWith('v'))).toBe(true)
+    })
+  })
 })

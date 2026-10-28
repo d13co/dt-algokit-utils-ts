@@ -27,14 +27,7 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
 
 /** `DTAlgodClient.features` that only some algokit-utils options need, checked when they are used. */
 export type OptionalDTFeature =
-  | 'validity-window'
-  | 'simulate-protocol'
-  | 'simulate-limits'
-  | 'query'
-  | 'versions-rounds'
-  | 'versions-keys'
-  | 'versions-filters'
-  | 'holders'
+  'validity-window' | 'simulate-protocol' | 'simulate-limits' | 'query' | 'versions-rounds' | 'versions-keys' | 'versions-pages' | 'holders'
 
 /** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork, or a version without it. */
 export class DTNotAvailableError extends Error {
@@ -114,6 +107,17 @@ export type StateVersionsRequestLike<
   Response extends { round: bigint; versions: Entry[]; nextToken?: string },
 > = VersionsRequestLike<Entry, Response, 'values' | 'keys'>
 
+/** A `/versions` request of an app's global state or an account's local state in one app, which can filter by state key. Needs `versions-pages` (see `DTManager`'s key filter). */
+export type KeyedVersionsRequestLike<
+  Entry,
+  Response extends { round: bigint; versions: Entry[]; nextToken?: string },
+> = StateVersionsRequestLike<Entry, Response> & { key(key: Uint8Array): unknown }
+
+/** The `/versions` request of an app's boxes, which can filter by box name prefix. Needs `versions-pages` (see `DTManager`'s prefix filter). */
+export type BoxesVersionsRequestLike = VersionsRequestLike<RawBoxesVersion, RawVersionsPage<RawBoxesVersion>> & {
+  prefix(prefix: Uint8Array): unknown
+}
+
 /** The order of a versions listing: oldest first (`asc`) or newest first (`desc`). */
 export type VersionsOrder = 'asc' | 'desc'
 
@@ -161,6 +165,7 @@ export interface RawApplicationVersion {
   application?: modelsv2.Application
   changedRound?: bigint
   changedKeys?: Uint8Array[]
+  keyValue?: modelsv2.TealValue
 }
 
 /** A raw account version from algod. */
@@ -175,6 +180,7 @@ export interface RawAccountVersion {
     appLocalState?: modelsv2.ApplicationLocalState
     changedRound?: bigint
     changedKeys?: Uint8Array[]
+    keyValue?: modelsv2.TealValue
   }[]
   createdAssets?: { assetId: bigint; deleted: boolean; asset?: modelsv2.Asset; changedRound?: bigint }[]
   createdApps?: {
@@ -466,8 +472,8 @@ export interface DTAlgodLike {
   getApplicationBoxByName(appId: Round, name: Uint8Array): RoundRequestLike<modelsv2.Box>
   getApplicationBoxes(appId: Round): BoxesRoundRequestLike
   getApplicationBoxVersions(appId: Round, name: Uint8Array): VersionsRequestLike<RawBoxVersion, RawVersionsPage<RawBoxVersion>>
-  getApplicationBoxesVersions(appId: Round): VersionsRequestLike<RawBoxesVersion, RawVersionsPage<RawBoxesVersion>>
-  getApplicationVersions(appId: Round): StateVersionsRequestLike<RawApplicationVersion, RawVersionsPage<RawApplicationVersion>>
+  getApplicationBoxesVersions(appId: Round): BoxesVersionsRequestLike
+  getApplicationVersions(appId: Round): KeyedVersionsRequestLike<RawApplicationVersion, RawVersionsPage<RawApplicationVersion>>
   getAssetVersions(assetId: Round): VersionsRequestLike<RawAssetVersion, RawVersionsPage<RawAssetVersion>>
   accountVersions(account: string | algosdk.Address): StateVersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>> & {
     exclude(...exclude: AccountVersionsExclude[]): unknown
@@ -479,7 +485,7 @@ export interface DTAlgodLike {
   accountApplicationVersions(
     account: string | algosdk.Address,
     appId: Round,
-  ): StateVersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
+  ): KeyedVersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
   /** The node's simulate limits, cached per client; stock algod's after a 404. Only in forks with the `simulate-limits` feature. */
   simulateLimits?(): Promise<SimulateLimits>

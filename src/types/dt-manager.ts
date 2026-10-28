@@ -1,4 +1,4 @@
-import { Address } from 'algosdk'
+import algosdk, { Address } from 'algosdk'
 import { Buffer } from 'buffer'
 import { AccountInformation } from './account'
 import { accountInformationFromAlgod } from './account-manager'
@@ -16,6 +16,9 @@ import {
   Round,
   DTAlgodLike,
   fetchOptions,
+  BoxesVersionsRequestLike,
+  KeyedVersionsRequestLike,
+  RawVersionsPage,
   requireDTSdkFeatures,
   VersionsOrder,
   VersionsRequestLike,
@@ -85,6 +88,34 @@ export interface AppStateVersionsOptions {
   includeKeys?: boolean
 }
 
+/** Options for the versions of an app's global state, or of an account's local state in one app, that can follow one state key. */
+export interface KeyVersionsOptions extends AppStateVersionsOptions {
+  /**
+   * List only the versions at which this state key changed (added, removed, or a new value or type, net over the round),
+   * each with `keyValue`, the key's value after it. A string is UTF-8; at most 64 bytes, and an empty key is valid. On
+   * `get/iterateAppVersions` it is a global state key; on `get/iterateAccountAppVersions` a local state key, and the
+   * entries then hold only the local state. Not with `rounds`.
+   *
+   * The node examines a bounded number of versions per page, so pages can be short or empty and still have a
+   * `nextToken`: keep paging until it is absent (the iterators do). Needs dtalgosdk 3.9.0-dt.3.0.0.1 or later (its `versions-pages` feature).
+   */
+  key?: string | Uint8Array
+}
+
+/** Options for an app's box change feed (`get/iterateBoxesVersions`). */
+export interface BoxesVersionsOptions {
+  /**
+   * List only the changes of the boxes whose names start with this prefix, such as one ARC-56 box map. A string is
+   * UTF-8; at most 64 bytes. An empty prefix means no filter. In a range, rounds in which none of them changed are left
+   * out; with `rounds`, every round has an entry, possibly with no boxes, and only the boxes under the prefix count
+   * toward the node's per-round box limit.
+   *
+   * The node steps through the app's box index, so pages can be short or empty and still have a `nextToken`: keep paging
+   * until it is absent (the iterators do). Needs dtalgosdk 3.9.0-dt.3.0.0.1 or later (its `versions-pages` feature).
+   */
+  prefix?: string | Uint8Array
+}
+
 /** Options for an account `/versions` listing. */
 export interface AccountVersionsOptions {
   /** Leave out sub-objects: `all` lists only base account changes; `created-apps-params` / `created-assets-params` leave out the params of created apps / assets. */
@@ -137,6 +168,9 @@ export interface BoxesVersion {
   boxes: BoxChange[]
 }
 
+/** A decoded state value, as in {@link AppState}. */
+export type AppStateValue = AppState[string]
+
 /** A version of an app. */
 export interface AppVersion {
   /** The round the app changed in. */
@@ -154,6 +188,8 @@ export interface AppVersion {
    * changed; undefined on deletions or when not asked for.
    */
   changedKeys?: Uint8Array[]
+  /** With `key`: the key's value after this round; undefined when the key was removed or the app deleted. */
+  keyValue?: AppStateValue
 }
 
 /** A version of an asset. */
@@ -206,6 +242,8 @@ export interface AccountVersion {
     changedRound?: bigint
     /** With `includeKeys`: the local state keys changed in this round, as bytes, sorted (`[]` on none; undefined on deletions). */
     changedKeys?: Uint8Array[]
+    /** With `key`: the local key's value after this round; undefined when the key was removed or the account opted out. */
+    keyValue?: AppStateValue
   }[]
   /** Assets created by the account that changed. */
   createdAssets?: {
@@ -254,13 +292,29 @@ const mapBoxesVersion = (v: RawBoxesVersion): BoxesVersion => ({
   boxes: v.boxes.map((b) => ({ name: boxName(b.name), deleted: b.deleted, value: b.value, changedRound: b.changedRound })),
 })
 
-const mapAppVersion = (v: RawApplicationVersion): AppVersion => ({
+/** The bytes of a `key` or `prefix` option, checked against the node's 64-byte limit. */
+const filterBytes = (what: 'key' | 'prefix', value: string | Uint8Array): Uint8Array => {
+  const bytes = typeof value === 'string' ? new Uint8Array(Buffer.from(value, 'utf-8')) : value
+  if (bytes.length > MAX_FILTER_BYTES)
+    throw new Error(`${what} is ${bytes.length} bytes, longer than the ${MAX_FILTER_BYTES} the node allows`)
+  return bytes
+}
+const MAX_FILTER_BYTES = 64
+
+/** A `keyValue` decoded as {@link AppManager.decodeAppState} decodes state. */
+const decodeKeyValue = (key: string | Uint8Array | undefined, value: algosdk.modelsv2.TealValue | undefined): AppStateValue | undefined =>
+  key === undefined || value === undefined
+    ? undefined
+    : Object.values(AppManager.decodeAppState([{ key: filterBytes('key', key), value }]))[0]
+
+const mapAppVersion = (v: RawApplicationVersion, key?: string | Uint8Array): AppVersion => ({
   round: v.round,
   timestamp: v.timestamp,
   deleted: v.deleted,
   app: v.application?.params ? AppManager.appInformationFromAlgod(v.application) : undefined,
   changedRound: v.changedRound,
   changedKeys: v.changedKeys,
+  keyValue: decodeKeyValue(key, v.keyValue),
 })
 
 const mapAssetVersion = (v: RawAssetVersion): AssetVersion => ({
@@ -271,7 +325,7 @@ const mapAssetVersion = (v: RawAssetVersion): AssetVersion => ({
   changedRound: v.changedRound,
 })
 
-const mapAccountVersion = (v: RawAccountVersion): AccountVersion => ({
+const mapAccountVersion = (v: RawAccountVersion, key?: string | Uint8Array): AccountVersion => ({
   round: v.round,
   timestamp: v.timestamp,
   base: v.base && {
@@ -291,6 +345,7 @@ const mapAccountVersion = (v: RawAccountVersion): AccountVersion => ({
     state: a.appLocalState ? AppManager.decodeAppState(a.appLocalState.keyValue ?? []) : undefined,
     changedRound: a.changedRound,
     changedKeys: a.changedKeys,
+    keyValue: decodeKeyValue(key, a.keyValue),
   })),
   createdAssets: v.createdAssets?.map((a) => ({
     assetId: a.assetId,
@@ -308,6 +363,11 @@ const mapAccountVersion = (v: RawAccountVersion): AccountVersion => ({
 })
 
 type AnyVersionsRequest<E> = VersionsRequestLike<E, { round: bigint; versions: E[]; nextToken?: string }, 'values' | 'keys'>
+
+type AllOptions = VersionsPageOptions & AppStateVersionsOptions
+
+/** Sets a `key` or `prefix` filter on a request, after checking the option. */
+type ApplyFilter<E> = (request: AnyVersionsRequest<E>) => void
 
 /** The distinct rounds of `rounds`, in `order`. */
 const sortedRounds = (rounds: readonly Round[], order: VersionsOrder | undefined): bigint[] => {
@@ -398,8 +458,8 @@ export class DTManager {
    * const { versions } = await algorand.dt.getBoxesVersions(appId, { minRound: 45_000_000n })
    * ```
    */
-  public async getBoxesVersions(appId: bigint, options?: VersionsPageOptions): Promise<VersionsPage<BoxesVersion>> {
-    return await this.page(this.algod.getApplicationBoxesVersions(appId), options, mapBoxesVersion)
+  public async getBoxesVersions(appId: bigint, options?: VersionsPageOptions & BoxesVersionsOptions): Promise<VersionsPage<BoxesVersion>> {
+    return await this.page(this.algod.getApplicationBoxesVersions(appId), options, mapBoxesVersion, () => this.prefixFilter(options))
   }
 
   /**
@@ -412,8 +472,13 @@ export class DTManager {
    * for await (const { round, boxes } of algorand.dt.iterateBoxesVersions(appId)) { ... }
    * ```
    */
-  public iterateBoxesVersions(appId: bigint, options?: VersionsOptions): AsyncGenerator<BoxesVersion> {
-    return this.iterate(() => this.algod.getApplicationBoxesVersions(appId), options, mapBoxesVersion)
+  public iterateBoxesVersions(appId: bigint, options?: VersionsOptions & BoxesVersionsOptions): AsyncGenerator<BoxesVersion> {
+    return this.iterate(
+      () => this.algod.getApplicationBoxesVersions(appId),
+      options,
+      mapBoxesVersion,
+      () => this.prefixFilter(options),
+    )
   }
 
   /**
@@ -427,8 +492,13 @@ export class DTManager {
    * const counters = versions.map((v) => v.app?.globalState.counter?.value)
    * ```
    */
-  public async getAppVersions(appId: bigint, options?: VersionsPageOptions & AppStateVersionsOptions): Promise<VersionsPage<AppVersion>> {
-    return await this.page(this.algod.getApplicationVersions(appId), options, mapAppVersion)
+  public async getAppVersions(appId: bigint, options?: VersionsPageOptions & KeyVersionsOptions): Promise<VersionsPage<AppVersion>> {
+    return await this.page(
+      this.algod.getApplicationVersions(appId),
+      options,
+      (v) => mapAppVersion(v, options?.key),
+      () => this.keyFilter(options),
+    )
   }
 
   /**
@@ -441,8 +511,13 @@ export class DTManager {
    * for await (const v of algorand.dt.iterateAppVersions(appId, { includeValues: true })) { ... }
    * ```
    */
-  public iterateAppVersions(appId: bigint, options?: VersionsOptions & AppStateVersionsOptions): AsyncGenerator<AppVersion> {
-    return this.iterate(() => this.algod.getApplicationVersions(appId), options, mapAppVersion)
+  public iterateAppVersions(appId: bigint, options?: VersionsOptions & KeyVersionsOptions): AsyncGenerator<AppVersion> {
+    return this.iterate(
+      () => this.algod.getApplicationVersions(appId),
+      options,
+      (v) => mapAppVersion(v, options?.key),
+      () => this.keyFilter(options),
+    )
   }
 
   /**
@@ -560,9 +635,14 @@ export class DTManager {
   public async getAccountAppVersions(
     address: string | Address,
     appId: bigint,
-    options?: VersionsPageOptions & AppStateVersionsOptions,
+    options?: VersionsPageOptions & KeyVersionsOptions,
   ): Promise<VersionsPage<AccountVersion>> {
-    return await this.page(this.algod.accountApplicationVersions(address, appId), options, mapAccountVersion)
+    return await this.page(
+      this.algod.accountApplicationVersions(address, appId),
+      options,
+      (v) => mapAccountVersion(v, options?.key),
+      () => this.keyFilter(options),
+    )
   }
 
   /**
@@ -579,9 +659,14 @@ export class DTManager {
   public iterateAccountAppVersions(
     address: string | Address,
     appId: bigint,
-    options?: VersionsOptions & AppStateVersionsOptions,
+    options?: VersionsOptions & KeyVersionsOptions,
   ): AsyncGenerator<AccountVersion> {
-    return this.iterate(() => this.algod.accountApplicationVersions(address, appId), options, mapAccountVersion)
+    return this.iterate(
+      () => this.algod.accountApplicationVersions(address, appId),
+      options,
+      (v) => mapAccountVersion(v, options?.key),
+      () => this.keyFilter(options),
+    )
   }
 
   private accountVersionsRequest(address: string | Address, options?: AccountVersionsOptions) {
@@ -621,32 +706,60 @@ export class DTManager {
   }
 
   private async page<E, T>(
-    request: AnyVersionsRequest<E>,
-    options: (VersionsPageOptions & AppStateVersionsOptions) | undefined,
+    request: VersionsRequestLike<E, RawVersionsPage<E>, never>,
+    options: AllOptions | undefined,
     map: (entry: E) => T,
+    filter?: () => ApplyFilter<E> | undefined,
   ) {
     this.check(options)
-    this.configure(request, options, options?.rounds)
-    if (options?.next) request.next(options.next)
-    const page = await request.do(undefined, fetchOptions(options))
+    const apply = filter?.()
+    const configured = this.configure(request as AnyVersionsRequest<E>, options, options?.rounds)
+    apply?.(configured)
+    if (options?.next) configured.next(options.next)
+    const page = await configured.do(undefined, fetchOptions(options))
     return { round: page.round, versions: page.versions.map(map), nextToken: page.nextToken || undefined }
   }
 
   private async *iterate<E, T>(
-    request: () => AnyVersionsRequest<E>,
-    options: (VersionsOptions & AppStateVersionsOptions) | undefined,
+    request: () => VersionsRequestLike<E, RawVersionsPage<E>, never>,
+    options: AllOptions | undefined,
     map: (entry: E) => T,
+    filter?: () => ApplyFilter<E> | undefined,
   ) {
     const signal = options?.signal
     signal?.throwIfAborted()
     this.check(options)
+    const apply = filter?.()
     for (const rounds of this.roundsChunks(options)) {
-      for await (const entry of this.configure(request(), options, rounds).iterate(undefined, fetchOptions(options))) {
+      const configured = this.configure(request() as AnyVersionsRequest<E>, options, rounds)
+      apply?.(configured)
+      for await (const entry of configured.iterate(undefined, fetchOptions(options))) {
         yield map(entry)
         // The caller may have aborted while it held this entry: stop before reading the rest of the page or the next one
         signal?.throwIfAborted()
       }
     }
+  }
+
+  /** The `key` filter of a listing, if any: checked, and set on the request as the node's `key` parameter. */
+  private keyFilter<E>(options: (AllOptions & KeyVersionsOptions) | undefined): ApplyFilter<E> | undefined {
+    if (options?.key === undefined) return undefined
+    const key = filterBytes('key', options.key)
+    if (options.rounds) throw new Error('key cannot be combined with rounds')
+    // dtalgosdk lists no feature of its own for key() and prefix(): they shipped in the release that added
+    // versions-pages (3.9.0-dt.3.0.0.1), whose iterators page through the short and empty pages the filters give
+    requireDTSdkFeatures('Versions with key', ['versions-pages'])
+    return (request) => (request as unknown as KeyedVersionsRequestLike<E, RawVersionsPage<E>>).key(key)
+  }
+
+  /** The `prefix` filter of a box change feed, if any: checked, and set on the request as the node's `prefix` parameter. */
+  private prefixFilter(options: (AllOptions & BoxesVersionsOptions) | undefined): ApplyFilter<RawBoxesVersion> | undefined {
+    if (options?.prefix === undefined) return undefined
+    const prefix = filterBytes('prefix', options.prefix)
+    // An empty prefix (an ARC-56 map with prefix "") is no filter; the node rejects it
+    if (prefix.length === 0) return undefined
+    requireDTSdkFeatures('Versions with prefix', ['versions-pages'])
+    return (request) => (request as unknown as BoxesVersionsRequestLike).prefix(prefix)
   }
 
   /**
