@@ -268,7 +268,7 @@ DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts
 
 The query tests branch on whether the node has queries: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
 
-The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.2.0.1.0.tgz` (a dev dependency), so the repo's own build and tests use it.
+The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.3.0.0.1.tgz` (a dev dependency), so the repo's own build and tests use it.
 
 ## Building and publishing
 
