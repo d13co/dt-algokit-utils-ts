@@ -41,8 +41,28 @@ export class Arc56Method extends algosdk.ABIMethod {
   }
 }
 
+/** Parsed ABI types by type string. ABI types are never modified once made, so they are shared. */
+const parsedABITypes = new Map<string, algosdk.ABIType>()
+/** The most parsed types kept: past it the cache starts again, so type strings from untrusted specs can't grow it without bound. */
+const MAX_PARSED_ABI_TYPES = 1000
+
+/** `algosdk.ABIType.from(type)`, parsed once per type string. */
+function parseABIType(type: string): algosdk.ABIType {
+  let parsed = parsedABITypes.get(type)
+  if (!parsed) {
+    parsed = algosdk.ABIType.from(type)
+    if (parsedABITypes.size >= MAX_PARSED_ABI_TYPES) parsedABITypes.clear()
+    parsedABITypes.set(type, parsed)
+  }
+  return parsed
+}
+
+/** Struct tuple types, by the app spec's structs object and then by struct definition (both by identity). */
+const structTupleTypes = new WeakMap<Record<string, StructField[]>, WeakMap<StructField[], algosdk.ABITupleType>>()
+
 /**
- * Returns the `ABITupleType` for the given ARC-56 struct definition
+ * Returns the `ABITupleType` for the given ARC-56 struct definition. The type is made once per struct definition and
+ * structs object, and shared: app specs are not expected to change once loaded.
  * @param struct The ARC-56 struct definition
  * @returns The `ABITupleType`
  */
@@ -50,15 +70,23 @@ export function getABITupleTypeFromABIStructDefinition(
   struct: StructField[],
   structs: Record<string, StructField[]>,
 ): algosdk.ABITupleType {
-  return new algosdk.ABITupleType(
-    struct.map((v) =>
-      typeof v.type === 'string'
-        ? structs[v.type]
-          ? getABITupleTypeFromABIStructDefinition(structs[v.type], structs)
-          : algosdk.ABIType.from(v.type)
-        : getABITupleTypeFromABIStructDefinition(v.type, structs),
-    ),
-  )
+  let byDefinition = structTupleTypes.get(structs)
+  if (!byDefinition) {
+    byDefinition = new WeakMap()
+    structTupleTypes.set(structs, byDefinition)
+  }
+  let tupleType = byDefinition.get(struct)
+  if (!tupleType) {
+    tupleType = new algosdk.ABITupleType(struct.map((v) => abiTypeOfField(v.type, structs)))
+    byDefinition.set(struct, tupleType)
+  }
+  return tupleType
+}
+
+/** The ABI type of a struct field's type: a struct name, an ABI type string, or an inline struct definition. */
+function abiTypeOfField(type: string | StructField[], structs: Record<string, StructField[]>): algosdk.ABIType {
+  if (typeof type !== 'string') return getABITupleTypeFromABIStructDefinition(type, structs)
+  return structs[type] ? getABITupleTypeFromABIStructDefinition(structs[type], structs) : parseABIType(type)
 }
 
 /**
@@ -75,17 +103,10 @@ export function getABIStructFromABITuple<TReturn extends ABIStruct = Record<stri
 ): TReturn {
   return Object.fromEntries(
     structFields.map(({ name: key, type }, i) => {
-      let abiType: algosdk.ABIType
-
-      if (typeof type === 'string') {
-        if (type in structs) {
-          abiType = getABITupleTypeFromABIStructDefinition(structs[type], structs)
-        } else {
-          abiType = algosdk.ABIType.from(type)
-        }
-      } else {
-        abiType = getABITupleTypeFromABIStructDefinition(type, structs)
-      }
+      const abiType =
+        typeof type === 'string' && type in structs
+          ? getABITupleTypeFromABIStructDefinition(structs[type], structs)
+          : abiTypeOfField(type, structs)
 
       const abiValue = convertAbiByteArrays(decodedABITuple[i], abiType)
       const convertedValue = convertABIDecodedBigIntToNumber(abiValue, abiType)
@@ -138,13 +159,13 @@ export function getABIDecodedValue(
 ): algosdk.ABIValue | ABIStruct {
   if (type === 'AVMBytes' || typeof value !== 'object') return value
   if (type === 'AVMString') return Buffer.from(value).toString('utf-8')
-  if (type === 'AVMUint64') return algosdk.ABIType.from('uint64').decode(value)
+  if (type === 'AVMUint64') return parseABIType('uint64').decode(value)
   if (structs[type]) {
     const tupleValue = getABITupleTypeFromABIStructDefinition(structs[type], structs).decode(value)
     return getABIStructFromABITuple(tupleValue, structs[type], structs)
   }
 
-  const abiType = algosdk.ABIType.from(type)
+  const abiType = parseABIType(type)
   const decodedValue = convertAbiByteArrays(abiType.decode(value), abiType)
   return convertABIDecodedBigIntToNumber(decodedValue, abiType)
 }

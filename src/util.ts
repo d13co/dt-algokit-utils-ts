@@ -108,10 +108,22 @@ export const calculateExtraProgramPages = (approvalProgram: Uint8Array, clearSta
   return Math.floor((approvalProgram.length + (clearStateProgram?.length ?? 0) - 1) / APP_PAGE_MAX_SIZE)
 }
 
+/** Whether ABI types have a `byte` in them, by type object: `toString()` builds the whole type string each time. */
+const byteTypes = new WeakMap<object, boolean>()
+const hasByteType = (type: ABIReturnType): boolean => {
+  if (typeof type !== 'object') return String(type).includes('byte')
+  let has = byteTypes.get(type)
+  if (has === undefined) {
+    has = type.toString().includes('byte')
+    byteTypes.set(type, has)
+  }
+  return has
+}
+
 /** Take a decoded ABI value and convert all byte arrays (including nested ones) from number[] to Uint8Arrays */
 export function convertAbiByteArrays(value: ABIValue, type: ABIReturnType): ABIValue {
   // Return value as is if the type doesn't have any bytes or if it's already an Uint8Array
-  if (!type.toString().includes('byte') || value instanceof Uint8Array) {
+  if (value instanceof Uint8Array || !hasByteType(type)) {
     return value
   }
 
