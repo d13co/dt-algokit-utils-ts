@@ -185,3 +185,119 @@ describe('AlgoHttpClientWithRetry Retry-After and query time-outs', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('AlgoHttpClientWithRetry dtalgod 503s and listing time-outs', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+  const client = () => new AlgoHttpClientWithRetry({}, 'http://localhost', 4001)
+  const failing =
+    (status: number, message: string, headers: Record<string, string> = {}) =>
+    async () =>
+      new Response(JSON.stringify({ message }), { status, headers })
+  const busy = 'the node is busy: try again later or on another node'
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  test.each([
+    [
+      '/v2/applications/5/boxes/versions',
+      'timetravel: the box index is incomplete: build it with ttimport -index-boxes while the node is stopped',
+    ],
+    [
+      '/v2/assets/31566704/holders',
+      'timetravel: the asset holders index is not complete: build it with ttimport -holders-index while the node is stopped',
+    ],
+    ['/v2/accounts/A/versions', 'the time travel history is not served'],
+  ])('a 503 for history the node cannot serve is not retried (%s)', async (path, message) => {
+    fetchMock.mockImplementation(failing(503, message))
+    await expect(client().get(path)).rejects.toMatchObject({ response: { status: 503 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('the history text is also found in a body that the error message leaves out', async () => {
+    const c = client()
+    // A base client whose errors carry only the status in their message
+    vi.spyOn(Object.getPrototypeOf(AlgoHttpClientWithRetry.prototype), 'get').mockImplementation(async () => {
+      throw Object.assign(new Error('Received status 503'), {
+        response: {
+          status: 503,
+          headers: {},
+          body: new TextEncoder().encode(JSON.stringify({ message: 'the time travel history is not served' })),
+        },
+      })
+    })
+    try {
+      await expect(c.get('/v2/accounts/A/versions')).rejects.toMatchObject({ response: { status: 503 } })
+      expect(Object.getPrototypeOf(AlgoHttpClientWithRetry.prototype).get).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.restoreAllMocks()
+    }
+  })
+
+  test('a busy node without Retry-After gets its first retry after 1 s, then the usual backoff', async () => {
+    fetchMock.mockImplementation(failing(503, busy))
+    const settled = client()
+      .post('/v2/transactions/simulate', new Uint8Array([1]))
+      .catch((e) => e)
+    await vi.advanceTimersByTimeAsync(999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(await settled).toMatchObject({ response: { status: 503 } })
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+  })
+
+  test('a busy node with Retry-After waits as the header says', async () => {
+    fetchMock.mockImplementationOnce(failing(503, busy, { 'Retry-After': '2' })).mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/accounts/A')
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect((await request).status).toBe(200)
+  })
+
+  test('another 503 keeps the immediate first retry', async () => {
+    fetchMock.mockImplementationOnce(failing(503, 'upstream unavailable')).mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/status')
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await request).status).toBe(200)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test.each(['/v2/assets/1/versions', '/v2/applications/5/box/versions', '/v2/accounts/A/apps/5/versions/', '/v2/assets/1/holders'])(
+    'a 504 from GET %s is not retried',
+    async (path) => {
+      fetchMock.mockImplementation(failing(504, 'time limit exceeded'))
+      await expect(client().get(path)).rejects.toMatchObject({ response: { status: 504 } })
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  test('a 504 from GET /v2/status is still retried', async () => {
+    fetchMock.mockImplementationOnce(failing(504, 'gateway')).mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/status')
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await request).status).toBe(200)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('a 503 from a versions listing is still retried', async () => {
+    fetchMock.mockImplementationOnce(failing(503, 'upstream unavailable')).mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/assets/1/versions')
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await request).status).toBe(200)
+  })
+})
