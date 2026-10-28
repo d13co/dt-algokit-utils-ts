@@ -274,4 +274,34 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(isDTUnsupportedError(await algorand.query.run({ program: ECHO, calls: [{}] }).catch((e) => e))).toBe(true)
     })
   })
+
+  describe('versions as of rounds and changed keys', () => {
+    /** An app whose global state changes every round (`total_effort`) */
+    const BUSY_APP = 1284326447n
+
+    test(
+      'rounds: an asset as of rounds before and after its creation',
+      onNewerNode(async () => {
+        const versions = []
+        for await (const v of algorand.dt.iterateAssetVersions(USDC, { rounds: [60_000_000n, 1000n] })) versions.push(v)
+        expect(versions.map((v) => [v.round, v.deleted, v.changedRound])).toEqual([
+          [1000n, true, undefined],
+          [60_000_000n, false, 8_874_561n],
+        ])
+      }),
+    )
+
+    test(
+      'includeKeys: the global state keys of the last changes',
+      onNewerNode(async () => {
+        const page = await algorand.dt.getAppVersions(BUSY_APP, { order: 'desc', limit: 2, includeKeys: true })
+        expect(page.versions).toHaveLength(2)
+        for (const v of page.versions) {
+          expect(Array.isArray(v.changedKeys)).toBe(true)
+          expect(v.app).toBeUndefined()
+        }
+        expect(page.versions[0].changedKeys!.map((k) => Buffer.from(k).toString())).toContain('total_effort')
+      }),
+    )
+  })
 })

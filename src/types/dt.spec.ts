@@ -488,6 +488,187 @@ describe('time travel', () => {
       expect(page.versions[0].base?.account?.balance.microAlgo).toBe(77n)
       expect(page.versions[0].assets).toEqual([{ assetId: 9n, deleted: false, holding: { balance: 3n, frozen: true } }])
     })
+
+    describe('as of rounds', () => {
+      /**
+       * Answers a rounds request with one asset entry per requested round from `next` on, `limit` (or `pageSize`) at a
+       * time; round 1000 did not exist.
+       */
+      const roundsEcho =
+        (pageSize?: number) =>
+        (call: Call): Answer => {
+          const rounds = call.query.rounds.split(',').map(BigInt)
+          const start = call.query.next ? rounds.indexOf(BigInt(call.query.next)) : 0
+          const size = pageSize ?? Number(call.query.limit ?? 100)
+          const taken = rounds.slice(start, start + size)
+          const rest = rounds[start + size]
+          return {
+            status: 200,
+            json: {
+              round: LAST_ROUND,
+              versions: taken.map((r) =>
+                r === 1000n
+                  ? { round: Number(r), timestamp: 1, deleted: true }
+                  : { round: Number(r), timestamp: 2, deleted: false, 'changed-round': 77 },
+              ),
+              ...(rest !== undefined ? { 'next-token': rest.toString() } : {}),
+            },
+          }
+        }
+      const sentRounds = () => stub.calls.map((c) => c.query.rounds.split(',').map(Number))
+
+      test('a page sends the rounds as given, and maps changedRound; deleted without changedRound means it did not exist', async () => {
+        stub.on('get', '/v2/assets/9/versions', roundsEcho())
+        const page = await algorand.dt.getAssetVersions(9n, { rounds: [2000, 1000n, 0], limit: 5 })
+        expect(stub.calls[0].query).toMatchObject({ rounds: '2000,1000,0', limit: '5' })
+        expect(stub.calls[0].query['min-round']).toBeUndefined()
+        expect(page.versions.map((v) => [v.round, v.deleted, v.changedRound])).toEqual([
+          [2000n, false, 77n],
+          [1000n, true, undefined],
+          [0n, false, 77n],
+        ])
+      })
+
+      test('iterators dedupe and sort the rounds, and split them into requests of min(limit, 500)', async () => {
+        stub.on('get', '/v2/assets/9/versions', roundsEcho(), true)
+        const rounds = Array.from({ length: 1200 }, (_, i) => 1_000_000 + i).reverse()
+        const seen: bigint[] = []
+        for await (const v of algorand.dt.iterateAssetVersions(9n, { rounds: [...rounds, rounds[3]], limit: 1000 })) seen.push(v.round)
+        expect(sentRounds().map((r) => r.length)).toEqual([500, 500, 200])
+        expect(seen).toEqual([...rounds].sort((a, b) => a - b).map(BigInt))
+
+        stub.calls = []
+        const desc: bigint[] = []
+        for await (const v of algorand.dt.iterateAssetVersions(9n, { rounds: rounds.slice(0, 250), order: 'desc' })) desc.push(v.round)
+        expect(sentRounds().map((r) => r.length)).toEqual([100, 100, 50])
+        expect(stub.calls[0].query.order).toBe('desc')
+        expect(desc).toEqual(rounds.slice(0, 250).map(BigInt))
+
+        stub.calls = []
+        for await (const _ of algorand.dt.iterateAssetVersions(9n, { rounds: rounds.slice(0, 10), maxRoundsPerRequest: 4 })) void _
+        expect(sentRounds().map((r) => r.length)).toEqual([4, 4, 2])
+      })
+
+      test('a chunk is paged to its end before the next chunk starts', async () => {
+        stub.on('get', '/v2/assets/9/versions', roundsEcho(2), true)
+        const seen: bigint[] = []
+        for await (const v of algorand.dt.iterateAssetVersions(9n, { rounds: [5, 1, 4, 2, 3], limit: 3 })) seen.push(v.round)
+        expect(seen).toEqual([1n, 2n, 3n, 4n, 5n])
+        expect(stub.calls.map((c) => [c.query.rounds, c.query.next])).toEqual([
+          ['1,2,3', undefined],
+          ['1,2,3', '3'],
+          ['4,5', undefined],
+        ])
+      })
+
+      test('checks: no requests for an empty list in an iterator, errors for a page and for minRound', async () => {
+        const none = []
+        for await (const v of algorand.dt.iterateAssetVersions(9n, { rounds: [] })) none.push(v)
+        expect(none).toEqual([])
+        expect(stub.calls).toHaveLength(0)
+        await expect(algorand.dt.getAssetVersions(9n, { rounds: [] })).rejects.toThrow(/at least one round/)
+        await expect(algorand.dt.getAssetVersions(9n, { rounds: [5], minRound: 1 })).rejects.toThrow(/minRound or maxRound/)
+        await expect(algorand.dt.iterateAssetVersions(9n, { rounds: [5], maxRound: 9 }).next()).rejects.toThrow(/minRound or maxRound/)
+        await expect(algorand.dt.iterateAssetVersions(9n, { rounds: [5], maxRoundsPerRequest: 0 }).next()).rejects.toThrow(
+          /maxRoundsPerRequest/,
+        )
+        expect(stub.calls).toHaveLength(0)
+      })
+
+      test('an older fork without versions-rounds or versions-keys throws DTNotAvailableError', async () => {
+        await withoutFeatures(['versions-rounds', 'versions-keys'], async () => {
+          await expect(algorand.dt.getAssetVersions(9n, { rounds: [5] })).rejects.toThrow(DTNotAvailableError)
+          await expect(algorand.dt.getAppVersions(9n, { includeKeys: true })).rejects.toThrow(/versions-keys/)
+        })
+        expect(stub.calls).toHaveLength(0)
+      })
+
+      test('changedRound on every type, account sub-objects included', async () => {
+        stub
+          .on(
+            'get',
+            '/v2/applications/5/box/versions',
+            json({ round: 900, versions: [{ round: 10, timestamp: 1, deleted: false, 'changed-round': 8 }] }),
+          )
+          .on(
+            'get',
+            '/v2/applications/5/boxes/versions',
+            json({ round: 900, versions: [{ round: 10, timestamp: 1, boxes: [{ name: b64('a'), deleted: false, 'changed-round': 7 }] }] }),
+          )
+          .on(
+            'get',
+            '/v2/applications/5/versions',
+            json({ round: 900, versions: [{ round: 10, timestamp: 1, deleted: false, 'changed-round': 6 }] }),
+          )
+          .on(
+            'get',
+            `/v2/accounts/${address}/versions`,
+            json({
+              round: 900,
+              versions: [
+                {
+                  round: 10,
+                  timestamp: 1,
+                  base: { deleted: false, 'changed-round': 1 },
+                  assets: [{ 'asset-id': 9, deleted: false, 'changed-round': 2 }],
+                  'apps-local-state': [{ 'app-id': 5, deleted: false, 'changed-round': 3 }],
+                  'created-assets': [{ 'asset-id': 9, deleted: false, 'changed-round': 4 }],
+                  'created-apps': [{ 'app-id': 5, deleted: false, 'changed-round': 5 }],
+                },
+              ],
+            }),
+          )
+        expect((await algorand.dt.getBoxVersions(5n, 'a', { rounds: [10] })).versions[0].changedRound).toBe(8n)
+        expect((await algorand.dt.getBoxesVersions(5n, { rounds: [10] })).versions[0].boxes[0].changedRound).toBe(7n)
+        expect((await algorand.dt.getAppVersions(5n, { rounds: [10] })).versions[0].changedRound).toBe(6n)
+        const [account] = (await algorand.dt.getAccountVersions(address, { rounds: [10] })).versions
+        expect([
+          account.base?.changedRound,
+          account.assets?.[0].changedRound,
+          account.appsLocalState?.[0].changedRound,
+          account.createdAssets?.[0].changedRound,
+          account.createdApps?.[0].changedRound,
+        ]).toEqual([1n, 2n, 3n, 4n, 5n])
+      })
+    })
+
+    test('includeKeys sends include=values,keys and maps changedKeys, keeping [] apart from absent', async () => {
+      stub
+        .on(
+          'get',
+          '/v2/applications/5/versions',
+          json({
+            round: 900,
+            versions: [
+              { round: 10, timestamp: 1, deleted: false, 'changed-keys': [b64('b'), b64('a')] },
+              { round: 11, timestamp: 1, deleted: false, 'changed-keys': [] },
+              { round: 12, timestamp: 1, deleted: true },
+            ],
+          }),
+        )
+        .on(
+          'get',
+          `/v2/accounts/${address}/applications/5/versions`,
+          json({
+            round: 900,
+            versions: [
+              {
+                round: 10,
+                timestamp: 1,
+                'apps-local-state': [{ 'app-id': 5, deleted: false, 'changed-keys': [b64('l')] }],
+                'created-apps': [{ 'app-id': 5, deleted: false, 'changed-keys': [] }],
+              },
+            ],
+          }),
+        )
+      const page = await algorand.dt.getAppVersions(5n, { includeKeys: true, includeValues: true })
+      expect(stub.calls[0].query.include).toBe('values,keys')
+      expect(page.versions.map((v) => v.changedKeys?.map((k) => Buffer.from(k).toString()))).toEqual([['b', 'a'], [], undefined])
+      const [local] = (await algorand.dt.getAccountAppVersions(address, 5n, { includeKeys: true })).versions
+      expect(stub.calls[1].query.include).toBe('keys')
+      expect(local.appsLocalState?.[0].changedKeys?.map((k) => Buffer.from(k).toString())).toEqual(['l'])
+      expect(local.createdApps?.[0].changedKeys).toEqual([])
+    })
   })
 
   describe('app client at a round', () => {

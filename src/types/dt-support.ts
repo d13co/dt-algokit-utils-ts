@@ -26,7 +26,15 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
 ] as const)
 
 /** `DTAlgodClient.features` that only some algokit-utils options need, checked when they are used. */
-export type OptionalDTFeature = 'validity-window' | 'simulate-protocol' | 'simulate-limits' | 'query'
+export type OptionalDTFeature =
+  | 'validity-window'
+  | 'simulate-protocol'
+  | 'simulate-limits'
+  | 'query'
+  | 'versions-rounds'
+  | 'versions-keys'
+  | 'versions-filters'
+  | 'holders'
 
 /** Thrown when a time travel or extended simulate feature is used but the loaded algosdk is not the time-travel fork, or a version without it. */
 export class DTNotAvailableError extends Error {
@@ -80,17 +88,31 @@ export interface BoxesRoundRequestLike extends RoundRequestLike<modelsv2.BoxesRe
   next(nextToken: string | undefined): this
 }
 
-/** A `/versions` request. */
-export interface VersionsRequestLike<Entry, Response extends { round: bigint; versions: Entry[]; nextToken?: string }> {
+/**
+ * A `/versions` request. `rounds` needs the fork's `versions-rounds` feature, and `include('keys')` its `versions-keys`
+ * feature: they are only called after checking it.
+ */
+export interface VersionsRequestLike<
+  Entry,
+  Response extends { round: bigint; versions: Entry[]; nextToken?: string },
+  Include extends string = 'values',
+> {
   minRound(round: Round): this
   maxRound(round: Round): this
+  rounds(rounds: readonly Round[]): this
   order(order: VersionsOrder): this
   limit(limit: number): this
   next(nextToken: string | undefined): this
-  include(...include: 'values'[]): this
+  include(...include: Include[]): this
   do(...args: DoArgs): Promise<Response>
   iterate(...args: DoArgs): AsyncGenerator<Entry>
 }
+
+/** A `/versions` request of application state (global or local), which can include the changed keys. */
+export type StateVersionsRequestLike<
+  Entry,
+  Response extends { round: bigint; versions: Entry[]; nextToken?: string },
+> = VersionsRequestLike<Entry, Response, 'values' | 'keys'>
 
 /** The order of a versions listing: oldest first (`asc`) or newest first (`desc`). */
 export type VersionsOrder = 'asc' | 'desc'
@@ -104,6 +126,7 @@ export interface RawBoxVersion {
   timestamp: number
   deleted: boolean
   value?: Uint8Array
+  changedRound?: bigint
 }
 
 /** A raw box change from algod's box change feed. */
@@ -111,6 +134,7 @@ export interface RawBoxChange {
   name: Uint8Array
   deleted: boolean
   value?: Uint8Array
+  changedRound?: bigint
 }
 
 /** A raw entry of algod's box change feed. */
@@ -126,6 +150,7 @@ export interface RawAssetVersion {
   timestamp: number
   deleted: boolean
   asset?: modelsv2.Asset
+  changedRound?: bigint
 }
 
 /** A raw application version from algod. */
@@ -134,17 +159,31 @@ export interface RawApplicationVersion {
   timestamp: number
   deleted: boolean
   application?: modelsv2.Application
+  changedRound?: bigint
+  changedKeys?: Uint8Array[]
 }
 
 /** A raw account version from algod. */
 export interface RawAccountVersion {
   round: bigint
   timestamp: number
-  base?: { deleted: boolean; account?: modelsv2.Account }
-  assets?: { assetId: bigint; deleted: boolean; assetHolding?: modelsv2.AssetHolding }[]
-  appsLocalState?: { appId: bigint; deleted: boolean; appLocalState?: modelsv2.ApplicationLocalState }[]
-  createdAssets?: { assetId: bigint; deleted: boolean; asset?: modelsv2.Asset }[]
-  createdApps?: { appId: bigint; deleted: boolean; application?: modelsv2.Application }[]
+  base?: { deleted: boolean; account?: modelsv2.Account; changedRound?: bigint }
+  assets?: { assetId: bigint; deleted: boolean; assetHolding?: modelsv2.AssetHolding; changedRound?: bigint }[]
+  appsLocalState?: {
+    appId: bigint
+    deleted: boolean
+    appLocalState?: modelsv2.ApplicationLocalState
+    changedRound?: bigint
+    changedKeys?: Uint8Array[]
+  }[]
+  createdAssets?: { assetId: bigint; deleted: boolean; asset?: modelsv2.Asset; changedRound?: bigint }[]
+  createdApps?: {
+    appId: bigint
+    deleted: boolean
+    application?: modelsv2.Application
+    changedRound?: bigint
+    changedKeys?: Uint8Array[]
+  }[]
 }
 
 /** A raw page of a `/versions` listing. */
@@ -428,9 +467,9 @@ export interface DTAlgodLike {
   getApplicationBoxes(appId: Round): BoxesRoundRequestLike
   getApplicationBoxVersions(appId: Round, name: Uint8Array): VersionsRequestLike<RawBoxVersion, RawVersionsPage<RawBoxVersion>>
   getApplicationBoxesVersions(appId: Round): VersionsRequestLike<RawBoxesVersion, RawVersionsPage<RawBoxesVersion>>
-  getApplicationVersions(appId: Round): VersionsRequestLike<RawApplicationVersion, RawVersionsPage<RawApplicationVersion>>
+  getApplicationVersions(appId: Round): StateVersionsRequestLike<RawApplicationVersion, RawVersionsPage<RawApplicationVersion>>
   getAssetVersions(assetId: Round): VersionsRequestLike<RawAssetVersion, RawVersionsPage<RawAssetVersion>>
-  accountVersions(account: string | algosdk.Address): VersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>> & {
+  accountVersions(account: string | algosdk.Address): StateVersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>> & {
     exclude(...exclude: AccountVersionsExclude[]): unknown
   }
   accountAssetVersions(
@@ -440,7 +479,7 @@ export interface DTAlgodLike {
   accountApplicationVersions(
     account: string | algosdk.Address,
     appId: Round,
-  ): VersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
+  ): StateVersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
   /** The node's simulate limits, cached per client; stock algod's after a 404. Only in forks with the `simulate-limits` feature. */
   simulateLimits?(): Promise<SimulateLimits>
