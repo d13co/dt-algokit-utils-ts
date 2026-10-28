@@ -2,6 +2,7 @@ import algosdk from 'algosdk'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { algo, microAlgo } from '../amount'
 import stateArc56 from '../../tests/example-contracts/state/State.arc56.json'
+import boxMapArc56 from '../../tests/example-contracts/box_map/artifacts/BoxMapTest.arc56.json'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
 import { DTAlgodLike, DTNotAvailableError, isDTUnsupportedError } from './dt-support'
@@ -762,6 +763,100 @@ describe('time travel', () => {
           [undefined, 'b64:cA=='],
         ])
       })
+    })
+  })
+
+  describe('box listings', () => {
+    const boxesPath = '/v2/applications/5/boxes'
+    const listing = (boxes: [string | Uint8Array, (string | Uint8Array)?][], round?: number, next?: string) =>
+      json({
+        ...(round !== undefined ? { round } : {}),
+        boxes: boxes.map(([name, value]) => ({ name: b64(name), ...(value !== undefined ? { value: b64(value) } : {}) })),
+        ...(next ? { 'next-token': next } : {}),
+      })
+    const boxValue = (call: Call): Answer => {
+      const name = Buffer.from(call.query.name.slice(4), 'base64').toString()
+      return { status: 200, json: { round: LAST_ROUND, name: b64(name), value: b64(`value of ${name}`) } }
+    }
+
+    test('one paged listing with prefix, values and limit; pages pinned to a given round', async () => {
+      stub.on('get', boxesPath, listing([['ua', 'A']], 70, 'b64:dWE=')).on('get', boxesPath, listing([['ub', '']], 70))
+      const boxes = await algorand.app.getBoxes(5n, { prefix: 'u', includeValues: true, limit: 1, round: 70 })
+      expect(stub.calls.map((c) => c.query)).toEqual([
+        { prefix: `b64:${b64('u')}`, include: 'values', limit: 1, round: '70' },
+        { prefix: `b64:${b64('u')}`, include: 'values', limit: 1, round: '70', next: 'b64:dWE=' },
+      ])
+      expect(boxes.map((b) => [b.name.name, Buffer.from(b.value!).toString()])).toEqual([
+        ['ua', 'A'],
+        ['ub', ''],
+      ])
+
+      // At the latest round nothing is pinned; without values none are returned
+      stub.calls = []
+      stub.on('get', boxesPath, listing([['ua']], LAST_ROUND))
+      const names = await algorand.app.getBoxes(5n, { prefix: 'u' })
+      expect(stub.calls[0].query.round).toBeUndefined()
+      expect(names).toEqual([{ name: expect.objectContaining({ name: 'ua' }) }])
+    })
+
+    test('a node that ignores paging: the names are filtered here and the values read', async () => {
+      stub.on('get', boxesPath, listing([['ua'], ['v'], ['ub']])).on('get', '/v2/applications/5/box', boxValue, true)
+      const boxes = await algorand.app.getBoxes(5n, { prefix: 'u', includeValues: true })
+      expect(boxes.map((b) => [b.name.name, Buffer.from(b.value!).toString()])).toEqual([
+        ['ua', 'value of ua'],
+        ['ub', 'value of ub'],
+      ])
+      expect(stub.calls).toHaveLength(3)
+    })
+
+    test('an algosdk without the paged builder: the same fallback', async () => {
+      const algod = algorand.client.algod
+      const original = algod.getApplicationBoxes.bind(algod)
+      const spy = vi
+        .spyOn(algod, 'getApplicationBoxes')
+        .mockImplementation((id) => Object.assign(original(id), { prefix: undefined, include: undefined }))
+      try {
+        stub.on('get', boxesPath, listing([['ua'], ['v']])).on('get', '/v2/applications/5/box', boxValue, true)
+        const boxes = await algorand.app.getBoxes(5n, { prefix: new Uint8Array(Buffer.from('u')), includeValues: true })
+        expect(stub.calls[0].query.prefix).toBeUndefined()
+        expect(boxes.map((b) => b.name.name)).toEqual(['ua'])
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    test('box getMap reads the map with one listing, as before', async () => {
+      const bName = (k: bigint) => new Uint8Array([...Buffer.from('b'), ...algosdk.encodeUint64(k)])
+      const abiString = (v: string) => new algosdk.ABIStringType().encode(v)
+      stub.on(
+        'get',
+        boxesPath,
+        listing(
+          [
+            [bName(1n), abiString('one')],
+            [bName(2n), abiString('two')],
+          ],
+          LAST_ROUND,
+        ),
+      )
+      const client = new AppClient({ appId: 5n, appSpec: JSON.stringify(boxMapArc56), algorand, defaultSender: address })
+      const map = await client.state.box.getMap('bMap')
+      expect([...map.entries()]).toEqual([
+        [1n, 'one'],
+        [2n, 'two'],
+      ])
+      expect(stub.calls).toHaveLength(1)
+      expect(stub.calls[0].query).toMatchObject({ prefix: `b64:${b64('b')}`, include: 'values' })
+
+      // A map with prefix "" lists every box, without a prefix
+      stub.calls = []
+      stub.on('get', '/v2/applications/123/boxes', listing([[new Uint8Array([1, 2, 3, 4]), abiString('x')]], 1000))
+      const state = new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand, defaultSender: address }).atRound(1000)
+      probeOk(stub)
+      expect([...(await state.state.box.getMap('box')).entries()]).toEqual([[new Uint8Array([1, 2, 3, 4]), 'x']])
+      const listed = stub.calls.find((c) => c.path === '/v2/applications/123/boxes')!
+      expect(listed.query.prefix).toBeUndefined()
+      expect(listed.query.round).toBe('1000')
     })
   })
 

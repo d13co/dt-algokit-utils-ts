@@ -56,7 +56,7 @@ import {
   StorageMap,
 } from './app-arc56'
 import { AppLookup } from './app-deployer'
-import { AppManager, BoxIdentifier } from './app-manager'
+import { AppManager, BoxIdentifier, BoxWithValue, GetBoxesOptions } from './app-manager'
 import { AppSpec, arc32ToArc56 } from './app-spec'
 import { AtRoundOptions, Round, getSimulateLimits } from './dt-support'
 import {
@@ -870,6 +870,21 @@ export class AppClient {
    */
   public async getBoxNames(options?: AtRoundOptions): Promise<BoxName[]> {
     return await this._algorand.app.getBoxNames(this.appId, this.readOptions(options))
+  }
+
+  /**
+   * Returns the boxes of the current app, optionally only those under a name prefix and with their values, from the
+   * node's paged box listing (see `AppManager.getBoxes`).
+   * @param options The name prefix, whether to include values, the page size, and a past `round` (defaults to the
+   *   client's pinned round, if any)
+   * @returns The boxes
+   * @example
+   * ```typescript
+   * const boxes = await appClient.getBoxes({ prefix: 'u', includeValues: true })
+   * ```
+   */
+  public async getBoxes(options?: GetBoxesOptions): Promise<BoxWithValue[]> {
+    return await this._algorand.app.getBoxes(this.appId, { ...options, ...this.readOptions(options) })
   }
 
   /**
@@ -1779,19 +1794,17 @@ export class AppClient {
        */
       getMap: async (mapName: string) => {
         const metadata = that._appSpec.state.maps.box[mapName]
-        const prefix = Buffer.from(metadata.prefix ?? '', 'base64')
-        const boxNames = await that.getBoxNames()
+        const prefix = new Uint8Array(Buffer.from(metadata.prefix ?? '', 'base64'))
+        // One paged listing of the map's boxes with their values, instead of a listing and one read per box
+        const boxes = await that.getBoxes({ prefix, includeValues: true })
 
         return new Map(
-          await Promise.all(
-            boxNames
-              .filter((b) => binaryStartsWith(b.nameRaw, prefix))
-              .map(async (b) => {
-                return [
-                  getABIDecodedValue(b.nameRaw.slice(prefix.length), metadata.keyType, that._appSpec.structs),
-                  getABIDecodedValue(await that.getBoxValue(b.nameRaw), metadata.valueType, that._appSpec.structs),
-                ] as const
-              }),
+          boxes.map(
+            (b) =>
+              [
+                getABIDecodedValue(b.name.nameRaw.slice(prefix.length), metadata.keyType, that._appSpec.structs),
+                getABIDecodedValue(b.value!, metadata.valueType, that._appSpec.structs),
+              ] as const,
           ),
         )
       },

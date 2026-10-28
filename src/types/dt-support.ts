@@ -371,6 +371,33 @@ export function txIdsOf(built: BuiltTransactions): { groupId: string; txIds: rea
   return ids
 }
 
+/**
+ * Maps `items` with `fn`, at most `concurrency` at a time, keeping the order. The first failure rejects the result; the
+ * calls already started run on, and no new one starts after it.
+ */
+export async function mapConcurrently<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+  let failed = false
+  const worker = async () => {
+    while (!failed && nextIndex < items.length) {
+      const index = nextIndex++
+      try {
+        results[index] = await fn(items[index], index)
+      } catch (error) {
+        failed = true
+        throw error
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker))
+  return results
+}
+
 /** Splits `items` into consecutive chunks of at most `size`. */
 export const chunk = <T>(items: T[], size: number): T[][] => {
   const chunks: T[][] = []

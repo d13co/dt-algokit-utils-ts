@@ -10,8 +10,42 @@ import {
   type CompiledTeal,
   type TealTemplateParams,
 } from './app'
-import { AtRoundOptions, dtAlgodForRead, fetchOptions } from './dt-support'
+import { AtRoundOptions, dtAlgodForRead, fetchOptions, mapConcurrently } from './dt-support'
 import modelsv2 = algosdk.modelsv2
+
+/** Options for {@link AppManager.getBoxes}. */
+export interface GetBoxesOptions extends AtRoundOptions {
+  /** Only the boxes whose names start with this prefix (a string is UTF-8). Empty or undefined: every box. */
+  prefix?: string | Uint8Array
+  /** Include each box's value. */
+  includeValues?: boolean
+  /** The most boxes per page; the node caps it at its `MaxAPIBoxPerApplication`. Pages also end at about 1 MB of values. */
+  limit?: number
+}
+
+/** A box of an app, with its value if it was asked for. */
+export interface BoxWithValue {
+  /** The box's name. */
+  name: BoxName
+  /** The box's value, with `includeValues`. */
+  value?: Uint8Array
+}
+
+/** The paged box listing builder of algosdk 3.6 and later (the methods are absent before). */
+interface PagedBoxesRequest {
+  prefix?(prefix: Uint8Array): unknown
+  include?(...include: 'values'[]): unknown
+  limit(limit: number): unknown
+  next(next: string | undefined): unknown
+  do(headers?: Record<string, string>, customOptions?: Record<string, unknown>): Promise<PagedBoxesResponse>
+}
+
+/** A box listing: paged (algosdk 3.6+, with `round`) or not. */
+interface PagedBoxesResponse {
+  round?: bigint
+  nextToken?: string
+  boxes: { name: Uint8Array; value?: Uint8Array }[]
+}
 
 /** Information about an app. */
 export interface AppInformation {
@@ -365,6 +399,84 @@ export class AppManager {
         name: Buffer.from(b.name).toString('utf-8'),
       }
     })
+  }
+
+  /**
+   * Returns the boxes of an app, optionally only those whose names start with `prefix`, optionally with their values,
+   * from the node's paged box listing: one request per page (up to the node's `MaxAPIBoxPerApplication` boxes or about
+   * 1 MB of values) instead of a listing and one read per box.
+   *
+   * With `round`, every page is read at that round (needs dtalgod time travel), so the listing is one consistent
+   * snapshot. Without it, later pages follow `next` at the latest round, as stock clients do, so a long listing can
+   * straddle rounds.
+   *
+   * On a node or algosdk without the paged listing (algosdk before 3.6, or a node that answers without `round`), the
+   * names are listed in one request, filtered by the prefix here, and the values read 8 boxes at a time.
+   *
+   * @param appId The ID of the app
+   * @param options The name prefix (a string is UTF-8; empty means every box), whether to include values, the page size,
+   *   a past `round` and an abort signal
+   * @returns The boxes, in the order the node lists them (by name in the paged listing)
+   * @example
+   * ```typescript
+   * const boxes = await algorand.app.getBoxes(appId, { prefix: 'u', includeValues: true })
+   * ```
+   */
+  public async getBoxes(appId: bigint, options?: GetBoxesOptions): Promise<BoxWithValue[]> {
+    const { prefix: prefixOption, includeValues = false, limit, round } = options ?? {}
+    const prefix =
+      typeof prefixOption === 'string' ? new Uint8Array(Buffer.from(prefixOption, 'utf-8')) : (prefixOption ?? new Uint8Array())
+    const tt = round === undefined ? undefined : await dtAlgodForRead(this._algod, 'Listing boxes', round, false)
+    const listing = (): PagedBoxesRequest =>
+      (tt ? tt.getApplicationBoxes(appId).round(round!) : this._algod.getApplicationBoxes(appId)) as unknown as PagedBoxesRequest
+    const toBoxName = (name: Uint8Array): BoxName => ({
+      nameRaw: name,
+      nameBase64: Buffer.from(name).toString('base64'),
+      name: Buffer.from(name).toString('utf-8'),
+    })
+
+    const boxes: BoxWithValue[] = []
+    let request = listing()
+    if (typeof request.prefix === 'function' && typeof request.include === 'function') {
+      let next: string | undefined = undefined
+      for (;;) {
+        if (prefix.length > 0) request.prefix!(prefix)
+        if (includeValues) request.include!('values')
+        if (limit !== undefined) request.limit(limit)
+        if (next !== undefined) request.next(next)
+        const page: PagedBoxesResponse = await request.do(undefined, fetchOptions(options))
+        // A paged answer has its round; a node that ignored the paging parameters lists every name, without values
+        if (page.round === undefined) return await this.filteredBoxes(appId, page.boxes, prefix, includeValues, options)
+        for (const b of page.boxes)
+          boxes.push({ name: toBoxName(b.name), ...(includeValues ? { value: b.value ?? new Uint8Array() } : {}) })
+        next = page.nextToken || undefined
+        if (!next) return boxes
+        request = listing()
+      }
+    }
+    const names = round === undefined ? undefined : await this.getBoxNames(appId, options)
+    return await this.filteredBoxes(
+      appId,
+      names?.map((n) => ({ name: n.nameRaw })) ?? (await request.do(undefined, fetchOptions(options))).boxes,
+      prefix,
+      includeValues,
+      options,
+    )
+  }
+
+  /** The boxes of a listing without paging: the names under `prefix`, with their values read 8 at a time. */
+  private async filteredBoxes(
+    appId: bigint,
+    listed: { name: Uint8Array }[],
+    prefix: Uint8Array,
+    includeValues: boolean,
+    options: AtRoundOptions | undefined,
+  ): Promise<BoxWithValue[]> {
+    const names = listed
+      .filter((b) => b.name.length >= prefix.length && prefix.every((x, i) => b.name[i] === x))
+      .map((b) => ({ nameRaw: b.name, nameBase64: Buffer.from(b.name).toString('base64'), name: Buffer.from(b.name).toString('utf-8') }))
+    if (!includeValues) return names.map((name) => ({ name }))
+    return await mapConcurrently(names, 8, async (name) => ({ name, value: await this.getBoxValue(appId, name, options) }))
   }
 
   /**

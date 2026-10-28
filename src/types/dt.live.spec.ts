@@ -374,4 +374,14 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(typeof second.holders[0].amount).toBe('bigint')
     }),
   )
+
+  test('getBoxes: one box under a full name prefix, with its value', async () => {
+    const REGISTRY = 2714516089n
+    // One sps box name (there are thousands, so not a full listing)
+    const listed = await algorand.client.algod.getApplicationBoxes(REGISTRY).prefix(new TextEncoder().encode('sps')).limit(1).do()
+    const name = listed.boxes[0].name
+    const boxes = await algorand.app.getBoxes(REGISTRY, { prefix: name, includeValues: true })
+    expect(boxes.map((b) => b.name.nameBase64)).toEqual([Buffer.from(name).toString('base64')])
+    expect(boxes[0].value!.length).toBeGreaterThan(0)
+  })
 })
