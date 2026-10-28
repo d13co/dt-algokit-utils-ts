@@ -192,6 +192,30 @@ export interface RawAccountVersion {
   }[]
 }
 
+/** A raw holder of an asset from algod. */
+export interface RawAssetHolder {
+  address: string
+  amount: bigint
+  isFrozen: boolean
+}
+
+/** A raw page of an asset's holders from algod. */
+export interface RawAssetHoldersPage {
+  round: bigint
+  nextToken?: string
+  holders: RawAssetHolder[]
+}
+
+/** An asset holders request (`GET /v2/assets/{id}/holders`). Needs the fork's `holders` feature. */
+export interface AssetHoldersRequestLike {
+  round(round: Round): this
+  limit(limit: number): this
+  next(nextToken: string | undefined): this
+  do(...args: DoArgs): Promise<RawAssetHoldersPage>
+  /** Every holder at one round: the first page's round is pinned for the later pages. */
+  iterate(...args: DoArgs): AsyncGenerator<RawAssetHolder>
+}
+
 /** A raw page of a `/versions` listing. */
 export interface RawVersionsPage<Entry> {
   round: bigint
@@ -486,6 +510,8 @@ export interface DTAlgodLike {
     account: string | algosdk.Address,
     appId: Round,
   ): KeyedVersionsRequestLike<RawAccountVersion, RawVersionsPage<RawAccountVersion>>
+  /** The holders of an asset at a round. Only in forks with the `holders` feature. */
+  getAssetHolders?(assetId: Round): AssetHoldersRequestLike
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
   /** The node's simulate limits, cached per client; stock algod's after a 404. Only in forks with the `simulate-limits` feature. */
   simulateLimits?(): Promise<SimulateLimits>

@@ -361,4 +361,17 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(names.every((n) => n.startsWith('v'))).toBe(true)
     })
   })
+
+  test(
+    'asset holders: two pages at the same round',
+    onNewerNode(async () => {
+      const first = await algorand.dt.getAssetHolders(USDC, { limit: 2 })
+      expect(first.holders).toHaveLength(2)
+      expect(first.nextToken).toBeDefined()
+      const second = await algorand.dt.getAssetHolders(USDC, { round: first.round, next: first.nextToken, limit: 2 })
+      expect(second.round).toBe(first.round)
+      expect(second.holders[0].address > first.holders[1].address).toBe(true)
+      expect(typeof second.holders[0].amount).toBe('bigint')
+    }),
+  )
 })

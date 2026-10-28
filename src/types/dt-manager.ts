@@ -10,6 +10,7 @@ import {
   AccountVersionsExclude,
   RawAccountVersion,
   RawApplicationVersion,
+  RawAssetHolder,
   RawAssetVersion,
   RawBoxesVersion,
   RawBoxVersion,
@@ -130,6 +131,42 @@ export interface VersionsPage<T> {
   versions: T[]
   /** Pass as `next` to get the next page; `undefined` on the last page. */
   nextToken?: string
+}
+
+/** An account that holds an asset. */
+export interface AssetHolder {
+  /** The account's address. */
+  address: string
+  /** Its balance of the asset, in base units. Accounts opted in with a zero balance are listed. */
+  amount: bigint
+  /** Whether its holding is frozen. */
+  frozen: boolean
+}
+
+/** A page of an asset's holders, in address order. */
+export interface AssetHoldersPage {
+  /** The round the holders are listed at: pass it as `round` with `next` for the following pages. */
+  round: bigint
+  /** The holders on this page. */
+  holders: AssetHolder[]
+  /** Pass as `next` (with `round`) to get the next page; `undefined` on the last page. Pages can be short or empty and still have one. */
+  nextToken?: string
+}
+
+/** Options for listing an asset's holders. */
+export interface AssetHoldersOptions {
+  /** List the holders at this round. Defaults to the latest round. */
+  round?: Round
+  /** Holders per page: default 1,000, at most 10,000. */
+  limit?: number
+  /** Aborts the listing: passed to fetch for every page request. */
+  signal?: AbortSignal
+}
+
+/** Options for one page of an asset's holders. */
+export interface AssetHoldersPageOptions extends AssetHoldersOptions {
+  /** The `nextToken` of the previous page. Needs `round`: the previous page's `round`, so every page lists the same round. */
+  next?: string
 }
 
 /** A version of a box: its value as of the end of `round`. */
@@ -268,6 +305,8 @@ export interface AccountVersion {
     changedKeys?: Uint8Array[]
   }[]
 }
+
+const mapAssetHolder = (h: RawAssetHolder): AssetHolder => ({ address: h.address, amount: h.amount, frozen: h.isFrozen })
 
 const boxName = (name: Uint8Array): BoxName => ({
   nameRaw: name,
@@ -739,6 +778,58 @@ export class DTManager {
         signal?.throwIfAborted()
       }
     }
+  }
+
+  /**
+   * Returns a page of the accounts that hold an asset at a round, in address order. Needs a dtalgod with the asset
+   * holders index (`TimeTravelHoldersIndex`); otherwise the fork's `DTUnsupportedError`. An index still being built is
+   * a 503 that is thrown at once (not retried). For every holder, prefer {@link iterateAssetHolders}.
+   * @param assetId The ID of the asset
+   * @param options The round, the page size, the `next` token (with the first page's `round`) and an abort signal
+   * @returns The page of holders
+   * @example
+   * ```typescript
+   * const first = await algorand.dt.getAssetHolders(assetId, { limit: 100 })
+   * const second = first.nextToken
+   *   ? await algorand.dt.getAssetHolders(assetId, { round: first.round, next: first.nextToken, limit: 100 })
+   *   : undefined
+   * ```
+   */
+  public async getAssetHolders(assetId: bigint, options?: AssetHoldersPageOptions): Promise<AssetHoldersPage> {
+    if (options?.next !== undefined && options.round === undefined) {
+      throw new Error("Pass the first page's round with next, so every page of the holders lists the same round")
+    }
+    const page = await this.holdersRequest(assetId, options).next(options?.next).do(undefined, fetchOptions(options))
+    return { round: page.round, holders: page.holders.map(mapAssetHolder), nextToken: page.nextToken || undefined }
+  }
+
+  /**
+   * Iterates over the accounts that hold an asset at a round, in address order, following the pages, which all list the
+   * first page's round.
+   * @param assetId The ID of the asset
+   * @param options The round, the page size and an abort signal
+   * @returns The holders
+   * @example
+   * ```typescript
+   * let held = 0n
+   * for await (const h of algorand.dt.iterateAssetHolders(assetId, { round: 50_000_000n })) held += h.amount
+   * ```
+   */
+  public async *iterateAssetHolders(assetId: bigint, options?: AssetHoldersOptions): AsyncGenerator<AssetHolder> {
+    const signal = options?.signal
+    signal?.throwIfAborted()
+    for await (const holder of this.holdersRequest(assetId, options).iterate(undefined, fetchOptions(options))) {
+      yield mapAssetHolder(holder)
+      signal?.throwIfAborted()
+    }
+  }
+
+  private holdersRequest(assetId: bigint, options: AssetHoldersOptions | undefined) {
+    requireDTSdkFeatures('Asset holders', ['holders'])
+    const request = this.algod.getAssetHolders!(assetId)
+    if (options?.round !== undefined) request.round(options.round)
+    if (options?.limit !== undefined) request.limit(options.limit)
+    return request
   }
 
   /** The `key` filter of a listing, if any: checked, and set on the request as the node's `key` parameter. */

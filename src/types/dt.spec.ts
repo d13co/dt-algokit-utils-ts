@@ -765,6 +765,54 @@ describe('time travel', () => {
     })
   })
 
+  describe('asset holders', () => {
+    const other = algosdk.generateAccount().addr.toString()
+    const holdersPage = (round: number, holders: [string, number, boolean][], next?: string) =>
+      json({
+        round,
+        holders: holders.map(([a, amount, frozen]) => ({ address: a, amount, 'is-frozen': frozen })),
+        ...(next ? { 'next-token': next } : {}),
+      })
+
+    test('a page maps the holders; next needs the first page round', async () => {
+      stub.on('get', '/v2/assets/9/holders', holdersPage(900, [[address, 5, true]], address))
+      const controller = new AbortController()
+      const page = await algorand.dt.getAssetHolders(9n, { round: 900, limit: 1, next: other, signal: controller.signal })
+      expect(stub.calls[0].query).toMatchObject({ round: '900', limit: '1', next: other })
+      expect(stub.calls[0].options?.signal).toBe(controller.signal)
+      expect(page).toEqual({ round: 900n, holders: [{ address, amount: 5n, frozen: true }], nextToken: address })
+      await expect(algorand.dt.getAssetHolders(9n, { next: address })).rejects.toThrow(/round with next/)
+      expect(stub.calls).toHaveLength(1)
+    })
+
+    test('the iterator pins the first page round and goes on through an empty page with a token', async () => {
+      stub
+        .on('get', '/v2/assets/9/holders', holdersPage(900, [[address, 1, false]], address))
+        .on('get', '/v2/assets/9/holders', holdersPage(900, [], other))
+        .on('get', '/v2/assets/9/holders', holdersPage(900, [[other, 2, false]]))
+      const controller = new AbortController()
+      const holders = []
+      for await (const h of algorand.dt.iterateAssetHolders(9n, { limit: 1, signal: controller.signal })) holders.push(h)
+      expect(holders).toEqual([
+        { address, amount: 1n, frozen: false },
+        { address: other, amount: 2n, frozen: false },
+      ])
+      expect(stub.calls.map((c) => [c.query.round, c.query.next])).toEqual([
+        [undefined, undefined],
+        ['900', address],
+        ['900', other],
+      ])
+      expect(stub.calls.every((c) => c.options?.signal === controller.signal)).toBe(true)
+    })
+
+    test('an older fork without holders throws DTNotAvailableError', async () => {
+      await withoutFeatures(['holders'], async () => {
+        await expect(algorand.dt.getAssetHolders(9n)).rejects.toThrow(DTNotAvailableError)
+        await expect(algorand.dt.iterateAssetHolders(9n).next()).rejects.toThrow(/holders/)
+      })
+    })
+  })
+
   describe('app client at a round', () => {
     const appClient = () => new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand, defaultSender: address })
 
