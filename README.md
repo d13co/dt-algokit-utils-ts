@@ -8,7 +8,9 @@ It is a drop-in replacement: existing APIs, types and generated typed clients wo
 
 - **Reads at a past round**: `{ round }` on account, asset, app, global/local state and box reads returns the state as of the end of that round.
 - **App clients pinned to a round**: `appClient.atRound(round)` reads state and simulates readonly ABI calls at that round, for generated typed clients too.
-- **Versions**: `algorand.dt` lists the rounds at which a box, an app's boxes, an app, an asset or an account changed, with the values if asked, by page or as an async iterator.
+- **Versions**: `algorand.dt` lists the rounds at which a box, an app's boxes, an app, an asset or an account changed, with the values if asked, by page or as an async iterator; as of a list of `rounds`, with the changed state keys, or only the changes of one state `key` or box name `prefix`.
+- **Asset holders**: `algorand.dt.getAssetHolders` / `iterateAssetHolders` list an asset's holders at a round.
+- **Box listings**: `algorand.app.getBoxes` lists boxes under a prefix with their values in one paged listing; `state.box.getMap` uses it.
 - **Extended simulate**: `algorand.simulate.groups` simulates several groups in one request, and `algorand.simulate.rounds` simulates groups at many rounds, packed into as few requests as the node's limits allow, optionally with validity windows rewritten or skipped and under a later consensus protocol.
 - **Node limits**: simulate follows the limits dtalgod reports, and readonly app calls get the node's full extra opcode budget.
 - **Queries**: `algorand.query.run` runs read-only TEAL calls of a program or app at many rounds (`POST /v2/query`), split within the node's limits; `algorand.query.groups`/`rounds` query composed app calls, with simulate as the fallback.
@@ -25,12 +27,12 @@ npm (`package.json`; each override must equal the dependency spec):
 ```json
 {
   "dependencies": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.1.0",
-    "algosdk": "npm:dtalgosdk@3.9.0-dt.2.0.1.0"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.3.0.0.1",
+    "algosdk": "npm:dtalgosdk@3.9.0-dt.3.0.0.1"
   },
   "overrides": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.1.0",
-    "algosdk": "npm:dtalgosdk@3.9.0-dt.2.0.1.0"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.3.0.0.1",
+    "algosdk": "npm:dtalgosdk@3.9.0-dt.3.0.0.1"
   }
 }
 ```
@@ -39,8 +41,8 @@ pnpm (`pnpm-workspace.yaml`, or `pnpm.overrides` in `package.json`), with the sa
 
 ```yaml
 overrides:
-  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.2.0.1.0
-  algosdk: npm:dtalgosdk@3.9.0-dt.2.0.1.0
+  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.3.0.0.1
+  algosdk: npm:dtalgosdk@3.9.0-dt.3.0.0.1
 ```
 
 yarn: the same entries under `resolutions` in `package.json` (yarn ignores `overrides`). Yarn 4 refuses versions published less than a day ago (`npmMinimalAgeGate`); to install a new release right away, add `npmPreapprovedPackages: ["@d13co/dt-algokit-utils", "dtalgosdk"]` to `.yarnrc.yml`. bun: the same entries under `overrides`.

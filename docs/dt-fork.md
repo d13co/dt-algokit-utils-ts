@@ -23,7 +23,7 @@ The fork is additive: every new parameter is optional and every new feature live
 
 - It runs on stock `algosdk` (`^3.5.2`). The fork of algosdk is detected at runtime; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
-- Queries (`algorand.query`) need a `dtalgosdk` with the `query` feature (3.9.0-dt.2.0.1.0 or later). With an older one, `algorand.query.groups`/`rounds` use simulate and `run()` throws a `DTNotAvailableError`.
+- Queries (`algorand.query`) need a `dtalgosdk` with the `query` feature (3.9.0-dt.2.0.1.0 or later); versions `rounds`, `includeKeys`, `key` / `prefix` and asset holders need 3.9.0-dt.3.0.0.1 or later (its `versions-rounds`, `versions-keys`, `versions-pages` and `holders` features). With an older one, `algorand.query.groups`/`rounds` use simulate and `run()` throws a `DTNotAvailableError`.
 - Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round` throw rather than return the latest state.
 
 ## Installing
