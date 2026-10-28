@@ -372,6 +372,32 @@ export function txIdsOf(built: BuiltTransactions): { groupId: string; txIds: rea
 }
 
 /**
+ * Returns a function that runs tasks at most `concurrency` at a time, in the order they are given. After a task fails,
+ * the tasks not yet started reject with that error instead of running.
+ */
+export function concurrencyLimiter(concurrency: number): <T>(task: () => Promise<T>) => Promise<T> {
+  let active = 0
+  let failure: { error: unknown } | undefined
+  const waiting: (() => void)[] = []
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    if (active >= concurrency) await new Promise<void>((resolve) => waiting.push(resolve))
+    else active++
+    try {
+      if (failure) throw failure.error
+      return await task()
+    } catch (error) {
+      failure ??= { error }
+      throw error
+    } finally {
+      // Hand the slot to the next task, if any
+      const next = waiting.shift()
+      if (next) next()
+      else active--
+    }
+  }
+}
+
+/**
  * Maps `items` with `fn`, at most `concurrency` at a time, keeping the order. The first failure rejects the result; the
  * calls already started run on, and no new one starts after it.
  */

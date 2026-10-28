@@ -1154,6 +1154,42 @@ describe('time travel', () => {
       }
     })
 
+    test('rounds and parallel groups send at most `concurrency` requests at once (default 4)', async () => {
+      let inFlight = 0
+      let most = 0
+      const echo = echoSimulate()
+      const slow = async (call: Call) => {
+        most = Math.max(most, ++inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        inFlight--
+        return echo(call)
+      }
+      stub
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('get', '/v2/status', nodeStatus, true)
+        .on('post', '/v2/transactions/simulate', slow, true)
+      const rounds = Array.from({ length: 10 }, (_, i) => 1000n + BigInt(i) * 5000n)
+      const outcomes = await algorand.simulate.rounds([payment(1), payment(2)], rounds, { maxRounds: 1, parallel: true, maxGroups: 1 })
+      expect(stub.calls.filter((c) => c.method === 'post')).toHaveLength(20)
+      expect(most).toBe(4)
+      expect(outcomes.map((o) => o.round)).toEqual(rounds)
+      expect(outcomes.every((o) => o.groups.every((g) => g.ok))).toBe(true)
+
+      most = 0
+      await algorand.simulate.groups([payment(1), payment(2), payment(3)], { parallel: true, maxGroups: 1, concurrency: 2 })
+      expect(most).toBe(2)
+      await expect(algorand.simulate.rounds(payment(1), rounds, { concurrency: 0 })).rejects.toThrow(/concurrency/)
+    })
+
+    test('after a failed request, the ones not yet sent are not sent', async () => {
+      stub
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', () => ({ status: 400, json: { message: 'nope' } }), true)
+      const rounds = Array.from({ length: 10 }, (_, i) => 1000n + BigInt(i) * 5000n)
+      await expect(algorand.simulate.rounds(payment(1), rounds, { maxRounds: 1, concurrency: 1 })).rejects.toThrow(/nope/)
+      expect(stub.calls.filter((c) => c.method === 'post')).toHaveLength(1)
+    })
+
     test('rounds with a validity window mode: packs rounds far apart into one request, with a valid window', async () => {
       stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
       const outcomes = await algorand.simulate.rounds(payment(1), [20_000_000n, 1000n, 45_000_000n], { validityWindow: 'rewrite' })

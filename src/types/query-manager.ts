@@ -209,7 +209,7 @@ export type QueryVia = 'auto' | 'query' | 'simulate'
 export interface QueryRouting {
   /** Query or simulate (default `auto`). */
   via?: QueryVia
-  /** The most query requests in flight at once (default 4). The simulate path sends as `algorand.simulate` does. */
+  /** The most requests in flight at once (default 4), on either path. */
   concurrency?: number
 }
 
@@ -892,7 +892,7 @@ export class QueryManager {
         Config.logger.debug(`Querying through simulate: ${plan.reason}`)
       }
     }
-    return await this.viaSimulate(composers, at, simulateOptions)
+    return await this.viaSimulate(composers, at, { ...simulateOptions, ...(concurrency !== undefined ? { concurrency } : {}) })
   }
 
   /** Whether the groups can be queried with these options, with the built groups if so. */

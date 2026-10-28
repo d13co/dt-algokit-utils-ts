@@ -238,6 +238,10 @@ Each outcome is `{ ok: true, result }`, with the same result shape as `composer.
 
 A node without the limits endpoint (stock algod, or a dtalgod built before it) gets stock algod's limits, with `reported: false`. Each request then holds one group (sequential groups beyond one throw; `parallel` groups get one request each), and `simulate.rounds` sends one request per round with `round` set instead of `rounds`. On an older dtalgod, pass `maxGroups` and `maxRounds` (its defaults are 16) to use its extended simulate.
 
+`simulate.groups` and `simulate.rounds` send at most `concurrency` requests at once (default 4), across the windows of `rounds` and the requests parallel groups are split into; after a request fails, the ones not yet sent aren't. `algorand.query.groups` / `rounds` pass their `concurrency` to the simulate fallback too.
+
+Recommended, not done: a simulate request that runs over the node's time limit (504) is still retried by `AlgoHttpClientWithRetry` and then thrown, as upstream does. Splitting it in halves and sending again, as `QueryManager` does for queries, would turn a long `rounds` request into ones the node can finish.
+
 ### Rounds far apart, under a later protocol
 
 A transaction is valid for at most 1,000 rounds, so `simulate.rounds` normally puts rounds more than 1,000 apart in separate requests. With `validityWindow: 'rewrite'`, the node moves each transaction's validity window to every simulated round (dropping its signature), and with `'skip'` it evaluates the transactions as built outside their window; either way rounds of any span share a request. `protocol` (on `groups` and `rounds`) simulates under a later consensus protocol (`v24` to `v42`, `latest`, `future` on a node with the developer API, or a version string), as if an upgrade took effect right after the round, and each outcome's `protocolOverride` says how it applied:

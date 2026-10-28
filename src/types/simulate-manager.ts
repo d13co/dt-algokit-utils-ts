@@ -10,6 +10,7 @@ import {
   SimulateLimits,
   SimulateProtocolOverride,
   chunk,
+  concurrencyLimiter,
   getSimulateLimits,
   mergeProtocolOverrides,
   offsetProtocolOverride,
@@ -30,6 +31,9 @@ export const DEFAULT_MAX_SIMULATE_GROUPS = 16
  */
 export const DEFAULT_MAX_SIMULATE_ROUNDS = 16
 
+/** The most simulate requests in flight at once, by default. */
+export const DEFAULT_SIMULATE_CONCURRENCY = 4
+
 /** Options for an extended simulate request. */
 export type ExtendedSimulateOptions = Omit<RawSimulateOptions, 'allowEmptySignatures' | 'fixSigners' | 'round'> & {
   /**
@@ -44,6 +48,11 @@ export type ExtendedSimulateOptions = Omit<RawSimulateOptions, 'allowEmptySignat
    * node allows, the node rejects the request.
    */
   maxGroups?: number
+  /**
+   * The most simulate requests in flight at once (default {@link DEFAULT_SIMULATE_CONCURRENCY}, 4), across the windows of
+   * `rounds` and the requests parallel groups are split into. After a request fails, the ones not yet sent aren't.
+   */
+  concurrency?: number
   /**
    * Simulate under a later consensus protocol, as if an upgrade to it took effect right after the round simulated at:
    * its programs, limits, fees and other parameters apply, to programs deployed earlier too. A consensus version string,
@@ -182,6 +191,13 @@ export function checkSimulateLimits(
   }
 }
 
+/** The `concurrency` option, checked: a positive integer, or the default. */
+function checkConcurrency(concurrency: number | undefined): number {
+  if (concurrency === undefined) return DEFAULT_SIMULATE_CONCURRENCY
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw new RangeError(`concurrency must be a positive integer, not ${concurrency}`)
+  return concurrency
+}
+
 /** Turns a successful group result into the same shape as `TransactionComposer.simulate` returns. */
 function toGroupResult(
   built: BuiltTransactions,
@@ -279,8 +295,9 @@ export class SimulateManager {
     rest.signal?.throwIfAborted()
     // The limits are cached per client and shared, so they are read without the signal
     const limits = await getSimulateLimits(this._clientManager.algod)
+    const limit = concurrencyLimiter(checkConcurrency(rest.concurrency))
     const built = await this.buildGroups(composers, validityAt(round))
-    const [outcomes] = await this.send(built, rest, { round }, limits)
+    const [outcomes] = await this.send(built, rest, { round }, limits, limit)
     return outcomes.groups
   }
 
@@ -339,20 +356,21 @@ export class SimulateManager {
     const groups = Array.isArray(composers) ? composers : [composers]
     if (rounds.length === 0) return []
     const tt = requireDTSdkFeatures('Simulating at several rounds', simulateOptionFeatures(rest))
+    const limit = concurrencyLimiter(checkConcurrency(rest.concurrency))
     rest.signal?.throwIfAborted()
     // The limits are cached per client and shared, so they are read without the signal
     const limits = await getSimulateLimits(this._clientManager.algod)
     const maxRounds = maxRoundsOption ?? limits?.maxRounds ?? DEFAULT_MAX_SIMULATE_ROUNDS
-    if (maxRounds === 0) return await this.roundByRound(groups, rounds, rest, limits)
+    if (maxRounds === 0) return await this.roundByRound(groups, rounds, rest, limits, limit)
     // With a validity window mode the rounds of a request needn't fit in one transaction's validity window
     const { windows, positions } = tt.packSimulateRounds(rounds, { maxRounds, ...(rest.validityWindow ? { maxSpan: null } : {}) })
 
-    // Build one after the other (a composer can only build one validity window at a time), then send in parallel
+    // Build one after the other (a composer can only build one validity window at a time), then send `concurrency` at a time
     const builtWindows: BuiltTransactions[][] = []
     for (const w of windows) {
       builtWindows.push(await this.buildGroups(groups, { firstValidRound: w.firstValid, lastValidRound: w.lastValid }))
     }
-    const results = await Promise.all(windows.map((w, i) => this.send(builtWindows[i], rest, { rounds: w.rounds }, limits)))
+    const results = await Promise.all(windows.map((w, i) => this.send(builtWindows[i], rest, { rounds: w.rounds }, limits, limit)))
 
     return positions.map(({ window, roundIndex }, i) => {
       const { groups, protocolOverride } = results[window][roundIndex]
@@ -366,6 +384,7 @@ export class SimulateManager {
     rounds: Round[],
     options: Omit<SimulateRoundsOptions, 'maxRounds'>,
     limits: SimulateLimits | undefined,
+    limit: ReturnType<typeof concurrencyLimiter>,
   ): Promise<SimulateRoundOutcome[]> {
     // The transactions are built valid at each round, so a validity window mode isn't needed (and needs `rounds`)
     const { validityWindow, ...rest } = options
@@ -374,10 +393,10 @@ export class SimulateManager {
     if (zero !== undefined) {
       throw new RangeError(`Can't simulate at round ${zero} in rounds: give past rounds (look the latest round up with status())`)
     }
-    // Build one after the other (a composer can only build one validity window at a time), then send in parallel
+    // Build one after the other (a composer can only build one validity window at a time), then send `concurrency` at a time
     const built: BuiltTransactions[][] = []
     for (const r of unique) built.push(await this.buildGroups(composers, validityAt(r)))
-    const results = await Promise.all(unique.map((r, i) => this.send(built[i], rest, { round: r }, limits)))
+    const results = await Promise.all(unique.map((r, i) => this.send(built[i], rest, { round: r }, limits, limit)))
     return rounds.map((r) => {
       const [{ groups, protocolOverride }] = results[unique.indexOf(BigInt(r))]
       return { round: BigInt(r), groups, ...(protocolOverride ? { protocolOverride } : {}) }
@@ -406,9 +425,10 @@ export class SimulateManager {
     options: ExtendedSimulateOptions & Pick<SimulateRoundsOptions, 'validityWindow'>,
     at: { round?: Round; rounds?: bigint[] },
     limits: SimulateLimits | undefined,
+    limit: ReturnType<typeof concurrencyLimiter>,
   ): Promise<{ groups: SimulateGroupOutcome[]; protocolOverride?: SimulateProtocolOverride }[]> {
     const tt = requireDTSdkFeatures('Simulating several groups', simulateOptionFeatures(options))
-    const { parallel = false, maxGroups: maxGroupsOption, protocol, validityWindow, signal, ...raw } = options
+    const { parallel = false, maxGroups: maxGroupsOption, protocol, validityWindow, signal, concurrency, ...raw } = options
     signal?.throwIfAborted()
     // Fetch options for each request: the signal goes to fetch, never into the request body
     const fetchOptions = signal ? { signal } : undefined
@@ -442,7 +462,7 @@ export class SimulateManager {
         if (validityWindow === 'skip') call = call.skipValidityWindow()
         if (validityWindow === 'rewrite') call = call.rewriteValidityWindow()
         if (protocol) call = call.protocol(protocol)
-        return await call.do(undefined, fetchOptions)
+        return await limit(() => call.do(undefined, fetchOptions))
       }),
     )
 
