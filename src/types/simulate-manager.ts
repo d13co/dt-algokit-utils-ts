@@ -1,5 +1,4 @@
 import algosdk from 'algosdk'
-import { Buffer } from 'buffer'
 import { getABIReturnValue } from '../transaction/transaction'
 import { ClientManager } from './client-manager'
 import { BuiltTransactions, RawSimulateOptions, TransactionComposer } from './composer'
@@ -15,6 +14,7 @@ import {
   mergeProtocolOverrides,
   offsetProtocolOverride,
   requireDTSdkFeatures,
+  txIdsOf,
 } from './dt-support'
 import { SendAtomicTransactionComposerResults } from './transaction'
 import modelsv2 = algosdk.modelsv2
@@ -189,12 +189,13 @@ function toGroupResult(
   simulateResponse: modelsv2.SimulateResponse,
 ): SimulateGroupResult {
   const { transactions, methodCalls } = built
+  const { groupId, txIds } = txIdsOf(built)
   const confirmations = group.txnResults.map((t) => t.txnResult)
   const returns = [...methodCalls.entries()].map(([index, method]) =>
     getABIReturnValue(
       algosdk.AtomicTransactionComposer.parseMethodResponse(
         method,
-        { txID: transactions[index].txID(), rawReturnValue: new Uint8Array(), method },
+        { txID: txIds[index], rawReturnValue: new Uint8Array(), method },
         confirmations[index],
       ),
       method.returns.type,
@@ -203,8 +204,8 @@ function toGroupResult(
   return {
     confirmations,
     transactions,
-    txIds: transactions.map((t) => t.txID()),
-    groupId: Buffer.from(transactions[0].group ?? new Uint8Array()).toString('base64'),
+    txIds: [...txIds],
+    groupId,
     simulateResponse,
     returns,
   }

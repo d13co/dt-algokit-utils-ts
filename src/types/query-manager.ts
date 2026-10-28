@@ -23,6 +23,7 @@ import {
   offsetProtocolOverride,
   requireDTSdk,
   requireDTSdkFeatures,
+  txIdsOf,
 } from './dt-support'
 import {
   SimulateGroupOutcome,
@@ -1171,20 +1172,19 @@ function toQueryGroupOutcome(
         round,
         // A logic error worded as simulate words it, for LogicError and other parsers of simulate's messages
         failureMessage: /^logic eval error/.test(results[failed].error!)
-          ? `transaction ${built.transactions[failed].txID()}: ${results[failed].error}`
+          ? `transaction ${txIdsOf(built).txIds[failed]}: ${results[failed].error}`
           : results[failed].error,
         failedAt: [failed],
         txns: results.map((c) => ({ ...txnResult(c), ...(c.error !== undefined ? { error: c.error } : {}) })),
       }),
     )
   }
+  const { txIds } = txIdsOf(built)
   const returns = [...built.methodCalls.entries()].map(([index, method]) =>
     getABIReturnValue(
-      algosdk.AtomicTransactionComposer.parseMethodResponse(
-        method,
-        { txID: built.transactions[index].txID(), rawReturnValue: new Uint8Array(), method },
-        { logs: results[index].logs } as modelsv2.PendingTransactionResponse,
-      ),
+      algosdk.AtomicTransactionComposer.parseMethodResponse(method, { txID: txIds[index], rawReturnValue: new Uint8Array(), method }, {
+        logs: results[index].logs,
+      } as modelsv2.PendingTransactionResponse),
       method.returns.type,
     ),
   )

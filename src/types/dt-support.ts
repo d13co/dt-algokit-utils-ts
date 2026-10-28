@@ -1,4 +1,6 @@
 import algosdk from 'algosdk'
+import { Buffer } from 'buffer'
+import type { BuiltTransactions } from './composer'
 import modelsv2 = algosdk.modelsv2
 
 /**
@@ -281,6 +283,23 @@ export function mergeProtocolOverrides(overrides: (SimulateProtocolOverride | un
   const rank = (code: string) => (PROTOCOL_NOTE_ORDER.includes(code) ? PROTOCOL_NOTE_ORDER.indexOf(code) : PROTOCOL_NOTE_ORDER.length)
   notes.sort((a, b) => rank(a.code) - rank(b.code)) // stable: unknown codes keep their order
   return { from: present[0].from, to: present[0].to, applied: present.some((o) => o.applied), ...(notes.length ? { notes } : {}) }
+}
+
+/** The IDs of built groups' transactions, by the built group, with the group ID they were hashed under. */
+const builtTxIds = new WeakMap<BuiltTransactions, { groupId: string; txIds: readonly string[] }>()
+
+/**
+ * The base64 group ID and the transaction IDs of a built group, hashed once per group ID. Requests with `rounds` return
+ * the same group at every round, and hashing its transactions again for each was a large part of the time spent on the
+ * response. The `txIds` array is shared: copy it before handing it out.
+ */
+export function txIdsOf(built: BuiltTransactions): { groupId: string; txIds: readonly string[] } {
+  const groupId = Buffer.from(built.transactions[0].group ?? new Uint8Array()).toString('base64')
+  const cached = builtTxIds.get(built)
+  if (cached && cached.groupId === groupId) return cached
+  const ids = { groupId, txIds: built.transactions.map((t) => t.txID()) }
+  builtTxIds.set(built, ids)
+  return ids
 }
 
 /** Splits `items` into consecutive chunks of at most `size`. */

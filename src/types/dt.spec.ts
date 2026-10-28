@@ -1,5 +1,5 @@
 import algosdk from 'algosdk'
-import { beforeEach, describe, expect, test } from 'vitest'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { algo, microAlgo } from '../amount'
 import stateArc56 from '../../tests/example-contracts/state/State.arc56.json'
 import { AlgorandClient } from './algorand-client'
@@ -677,6 +677,26 @@ describe('time travel', () => {
         [1500n, 1001n],
         [5001n, 5001n],
       ])
+    })
+
+    test("rounds: hashes each transaction once, and gives every round its group's IDs", async () => {
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const group = payment(1).addPayment({ sender, receiver: sender, amount: microAlgo(2) })
+      const txID = vi.spyOn(algosdk.Transaction.prototype, 'txID')
+      try {
+        const outcomes = await algorand.simulate.rounds(group, [1000n, 2000n, 3000n], { validityWindow: 'rewrite' })
+        const results = outcomes.map((o) => (o.groups[0].ok ? o.groups[0].result : undefined))
+        // two transactions, hashed once each across the three rounds
+        expect(txID).toHaveBeenCalledTimes(2)
+        txID.mockRestore()
+        const { transactions, txIds, groupId } = results[0]!
+        expect(transactions[0].group).toBeDefined()
+        expect(groupId).toBe(Buffer.from(transactions[0].group!).toString('base64'))
+        expect(txIds).toEqual(transactions.map((t) => t.txID()))
+        for (const r of results) expect([r!.txIds, r!.groupId]).toEqual([txIds, groupId])
+      } finally {
+        txID.mockRestore()
+      }
     })
 
     test('rounds with a validity window mode: packs rounds far apart into one request, with a valid window', async () => {
@@ -1637,6 +1657,24 @@ describe('query', () => {
       const [alone] = await algorand.query.groups([ghost()], { round: 2000, via: 'query' })
       if (!alone.ok) expect(alone.error.failureMessage).toBe('query response too large: over 1000 bytes')
       expect(queried.ok || alone.ok).toBe(false)
+    })
+
+    test("rounds: hashes each transaction once for every round's method returns", async () => {
+      queryLimitsOk(stub).on('post', '/v2/query', queryEcho({ abi: true }), true)
+      const txID = vi.spyOn(algosdk.Transaction.prototype, 'txID')
+      try {
+        const results = await algorand.query.rounds(ghost(ghost()), [1000, 2000, 3000])
+        // two transactions, hashed once each across the three rounds
+        expect(txID).toHaveBeenCalledTimes(2)
+        txID.mockRestore()
+        expect(results.map((r) => (r.groups[0].ok ? r.groups[0].returns.map((x) => x.returnValue) : undefined))).toEqual([
+          [1001n, 1001n],
+          [2001n, 2001n],
+          [3001n, 3001n],
+        ])
+      } finally {
+        txID.mockRestore()
+      }
     })
 
     test('protocol note hits are moved to the group and transaction index', async () => {
