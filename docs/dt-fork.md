@@ -373,7 +373,7 @@ The repo's own build and tests use the algosdk fork as a dev dependency, `"algos
 
 ## Building and publishing
 
-`npm run build` builds into `dist/`, with its own `package.json` and README, and the package is published from there (`npm publish ./dist`), never from the repo root (the root `prepublishOnly` refuses). The build rewrites the README's relative links to `https://github.com/d13co/dt-algokit-utils-ts/blob/main/`, so this branch must be the repo's `main`.
+`npm run build` builds into `dist/`, with its own `package.json` and README, and the package is published from there (`npm publish ./dist`), never from the repo root (the root `prepublishOnly` refuses). The build rewrites the README's relative links to `https://github.com/d13co/dt-algokit-utils-ts/blob/dtalgorand/`, the fork's default branch; the fork's `main` tracks upstream.
 
 ### CI and CD
 
@@ -392,7 +392,7 @@ One-time setup:
 1. Choose the version (see below) and set it with `npm version <version> --no-git-tag-version`, which updates `package.json` and `package-lock.json`.
 2. Update the version in the README's install snippets, and `dt-algosdk`'s too. Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dt-algosdk version>` with the oldest dt-algosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
 3. Publish `dt-algosdk` at that version first, since the snippets point at it.
-4. Commit, then tag and push: `git tag v<version> && git push origin main v<version>`. The CD workflow publishes it.
+4. Commit, then tag and push to the fork, `github.com/d13co/dt-algokit-utils-ts` (not upstream): `git tag v<version> && git push <fork remote> dtalgorand v<version>`. The CD workflow publishes it.
 
 Versions follow the same scheme as `dt-algosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`.
 
