@@ -171,7 +171,7 @@ const stockAlgod = (stub: StubClient) => stub.on('get', CAPABILITIES_PATH, () =>
 
 const limitsCalls = (stub: StubClient) => stub.capabilitiesCalls
 
-/** Runs `run` with dtalgosdk's `DTAlgodClient.features` lacking `without`, which makes it count as stock algosdk. */
+/** Runs `run` with dt-algosdk's `DTAlgodClient.features` lacking `without`, which makes it count as stock algosdk. */
 const withoutFeatures = async (without: string[], run: () => Promise<void>) => {
   const DT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
   const features = DT.features
@@ -2017,7 +2017,7 @@ describe('query', () => {
       expect(isDTUnsupportedError(await algorand.query.run({ program, calls: [{}] }).catch((e) => e))).toBe(true)
     })
 
-    test('without dtalgosdk', async () => {
+    test('without dt-algosdk', async () => {
       queryLimitsOk(stub)
       await withoutFeatures(['query'], async () => {
         expect(await algorand.query.supported()).toBe(false)
@@ -2272,7 +2272,7 @@ describe('query', () => {
         expect(queries(stub)).toHaveLength(0)
       })
 
-      test('without dtalgosdk, both paths throw DTNotAvailableError', async () => {
+      test('without dt-algosdk, both paths throw DTNotAvailableError', async () => {
         queryLimitsOk(stub)
         await withoutFeatures(['query'], async () => {
           await expect(algorand.query.groups([ghost()])).rejects.toThrow(DTNotAvailableError)

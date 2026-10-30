@@ -21,11 +21,11 @@
 
 The fork is additive: every new parameter is optional and every new feature lives in a new method or module, so existing code, types and generated typed clients work unchanged.
 
-- It runs on stock `algosdk` (`^3.5.2`). dtalgosdk (`3.9.0-dt.4.1.0.0` or later) is detected at runtime by its `DTAlgodClient.features`; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
+- It runs on stock `algosdk` (`^3.5.2`). dt-algosdk (`3.9.0-dt.4.1.0.0` or later) is detected at runtime by its `DTAlgodClient.features`; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
 - The node side targets the current dt-algorand release, dt4 (`v5.0.5-dt4`). Older dtalgod releases are not supported.
 - dtalgod is told from stock algod by one check: its capabilities (`GET /v2/capabilities`, `algorand.client.capabilities()`), which every dtalgod node serves and stock algod doesn't (it answers 404). They are read once per algod client and also say which optional features the node has on (time travel, queries, simulate `rounds`, the developer API) and the limits of its simulate and query requests.
-- Each answer to a read at a round is also checked, by dtalgosdk: dtalgod marks it with an `X-Algod-TT-Round` header carrying the round (a 404 too), and an answer without it, or for another round, throws a `DTUnsupportedError`. This catches a load balancer that mixes nodes, where a read lands on a stock algod that ignores `round` and answers with the latest state. Box listings check the round in the body instead, since stock algod serves its last few rounds there. A proxy in front of the node must pass the header through: one that strips it makes every read at a round throw.
+- Each answer to a read at a round is also checked, by dt-algosdk: dtalgod marks it with an `X-Algod-TT-Round` header carrying the round (a 404 too), and an answer without it, or for another round, throws a `DTUnsupportedError`. This catches a load balancer that mixes nodes, where a read lands on a stock algod that ignores `round` and answers with the latest state. Box listings check the round in the body instead, since stock algod serves its last few rounds there. A proxy in front of the node must pass the header through: one that strips it makes every read at a round throw.
 - Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round`, `algorand.dt`, `algorand.simulate.groups` / `rounds` and `algorand.query` throw a `DTUnsupportedError` before sending anything, rather than return the latest state or a stock error.
 
 The node features that are optional on a current dtalgod, and how each shows up:
@@ -46,18 +46,18 @@ The new features need two packages:
 | Package                                                                            | Replaces                            | Adds                                                            |
 | ---------------------------------------------------------------------------------- | ----------------------------------- | --------------------------------------------------------------- |
 | [`@d13co/dt-algokit-utils`](https://www.npmjs.com/package/@d13co/dt-algokit-utils) | `@algorandfoundation/algokit-utils` | the APIs below                                                  |
-| [`dtalgosdk`](https://www.npmjs.com/package/dtalgosdk)                             | `algosdk`                           | `DTAlgodClient`, the time-travel and extended-simulate requests |
+| [`dt-algosdk`](https://www.npmjs.com/package/dt-algosdk)                           | `algosdk`                           | `DTAlgodClient`, the time-travel and extended-simulate requests |
 
 algokit-utils, your code, generated typed clients and any other library must all load the same copy of each, so install both under their upstream names (npm aliases) and override them for the whole dependency tree. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`. See [the README](../README.md#installing-the-fork) for the npm, pnpm, yarn and bun snippets.
 
 To check the result:
 
 ```sh
-npm ls algosdk @algorandfoundation/algokit-utils   # every entry should be the dtalgosdk / @d13co/dt-algokit-utils alias
-pnpm why algosdk                                    # should list only dtalgosdk
+npm ls algosdk @algorandfoundation/algokit-utils   # every entry should be the dt-algosdk / @d13co/dt-algokit-utils alias
+pnpm why algosdk                                    # should list only dt-algosdk
 ```
 
-At runtime, `await algorand.client.supportsDT()` (or `algorand.dt.supported()`) is `true` only when dtalgosdk is loaded and the node is dtalgod with time travel on.
+At runtime, `await algorand.client.supportsDT()` (or `algorand.dt.supported()`) is `true` only when dt-algosdk is loaded and the node is dtalgod with time travel on.
 
 ## API changes at a glance
 
@@ -317,7 +317,7 @@ Each outcome is `{ ok: true, txns, returns }` (each transaction's `logs` and `co
 
 **The contract**: with query, every app call runs alone, against the round's state: the calls of one group don't see each other (no shared budget pool, `global GroupSize` 1, no `gtxn`), and the composers' fees, validity, notes and leases are ignored. With the simulate fallback, the groups run as composed, each on its own (`parallel: true`). So use these for independent read-only calls, such as ghost calls.
 
-`via` picks the path: `auto` (the default) queries when it can and simulates otherwise; `query` throws when it can't (a `DTUnsupportedError` for a node with queries disabled, an `Error` naming the reason otherwise); `simulate` always simulates. Both paths need dtalgosdk and dtalgod: without them they throw a `DTNotAvailableError` or a `DTUnsupportedError` before sending anything. Query is used when the node reports query limits, `execTraceConfig` is off, `allowMoreLogging` is off or the node's `maxCallLogBytes` is at least simulate's 65,536, an `extraOpcodeBudget` plus 700 per transaction fits the node's `maxCallBudget` for every group, and every transaction is a NoOp app call that creates an app (with an approval program) or calls one (without programs), without an access list or `rejectVersion`, and no method call has transaction arguments. The options are checked the same way on both paths. A node with queries disabled met mid-way (a load balancer mixing nodes with different settings) falls back to simulate with `auto`.
+`via` picks the path: `auto` (the default) queries when it can and simulates otherwise; `query` throws when it can't (a `DTUnsupportedError` for a node with queries disabled, an `Error` naming the reason otherwise); `simulate` always simulates. Both paths need dt-algosdk and dtalgod: without them they throw a `DTNotAvailableError` or a `DTUnsupportedError` before sending anything. Query is used when the node reports query limits, `execTraceConfig` is off, `allowMoreLogging` is off or the node's `maxCallLogBytes` is at least simulate's 65,536, an `extraOpcodeBudget` plus 700 per transaction fits the node's `maxCallBudget` for every group, and every transaction is a NoOp app call that creates an app (with an approval program) or calls one (without programs), without an access list or `rejectVersion`, and no method call has transaction arguments. The options are checked the same way on both paths. A node with queries disabled met mid-way (a load balancer mixing nodes with different settings) falls back to simulate with `auto`.
 
 |                                              | Query path                                                                                                     | Simulate path                                                |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
@@ -353,7 +353,7 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 
 | Error                                          | Meaning                                                                                                                          |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `DTNotAvailableError`                          | The loaded algosdk isn't dtalgosdk (it lacks a `DTAlgodClient.features` entry algokit-utils uses)                                |
+| `DTNotAvailableError`                          | The loaded algosdk isn't dt-algosdk (it lacks a `DTAlgodClient.features` entry algokit-utils uses)                               |
 | `isDTUnsupportedError(e)`                      | The node doesn't support the request: stock algod, a dtalgod with the feature off, or a round it can't serve                     |
 | `QueryCallError`                               | A call of `algorand.query.run` at a round failed (`kind: 'call'`) or its round did (`kind: 'round'`); in the outcome, not thrown |
 | `QueryGroupError`                              | A group of `algorand.query.groups`/`rounds` failed, on either path (`kind` as simulate's); in the outcome, not thrown            |
@@ -369,7 +369,7 @@ DT_ALGOD_SERVER=https://mainnet-api-dt.d13.co npx vitest run --dir src src/types
 
 The node must run the current dt-algorand release (dt4) with time travel on. The query tests branch on whether the node has queries, and the holders test is skipped on a node without the holders index, since both are optional: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
 
-The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.4.1.0.0.tgz` (a dev dependency), so the repo's own build and tests use it.
+The repo's own build and tests use the algosdk fork as a dev dependency, `"algosdk": "npm:dt-algosdk@<version>"`, pinned to an exact version.
 
 ## Building and publishing
 
@@ -390,11 +390,11 @@ One-time setup:
 ### Releasing
 
 1. Choose the version (see below) and set it with `npm version <version> --no-git-tag-version`, which updates `package.json` and `package-lock.json`.
-2. Update the version in the README's install snippets, and `dtalgosdk`'s too. Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dtalgosdk version>` with the oldest dtalgosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
-3. Publish `dtalgosdk` at that version first, since the snippets point at it.
+2. Update the version in the README's install snippets, and `dt-algosdk`'s too. Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dt-algosdk version>` with the oldest dt-algosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
+3. Publish `dt-algosdk` at that version first, since the snippets point at it.
 4. Commit, then tag and push: `git tag v<version> && git push origin main v<version>`. The CD workflow publishes it.
 
-Versions follow the same scheme as `dtalgosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`.
+Versions follow the same scheme as `dt-algosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`.
 
 - `9.2.3`: the upstream algokit-utils version the code is built on (`v9.2.3-beta.2`). Bump it when merging a new upstream release.
 - `dt.4`: the dt-algorand release whose API this covers (tag `v5.0.5-dt4`). Older dt-algorand releases are not supported; only the features that are optional on that release are detected at runtime (see [Compatibility](#compatibility)). Keep it a separate identifier (`dt.4`, not `dt4`) so npm compares the number numerically.

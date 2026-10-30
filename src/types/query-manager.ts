@@ -661,7 +661,7 @@ class QueryRun {
  * their logs and cost. No signatures, fees or minimum balances; every resource is available without references; nothing
  * is written.
  *
- * Needs dtalgosdk and a dtalgod with queries on (`MaxAPIQueryCalls` above 0), which its capabilities report.
+ * Needs dt-algosdk and a dtalgod with queries on (`MaxAPIQueryCalls` above 0), which its capabilities report.
  */
 export class QueryManager {
   private _clientManager: ClientManager
@@ -683,7 +683,7 @@ export class QueryManager {
    * dtalgod with queries disabled). The limits are asked for once per algod client, with the node's capabilities.
    *
    * @returns The node's query limits, if it has queries
-   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+   * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
    * @example
    * ```typescript
    * const limits = await algorand.query.limits()
@@ -696,7 +696,7 @@ export class QueryManager {
   }
 
   /**
-   * Returns whether queries can be used: the loaded algosdk is dtalgosdk, and the node reports query limits. Never throws
+   * Returns whether queries can be used: the loaded algosdk is dt-algosdk, and the node reports query limits. Never throws
    * `DTNotAvailableError`.
    *
    * @returns Whether `run` can be used
@@ -731,8 +731,8 @@ export class QueryManager {
    * @param params The program or app, the calls, the rounds and the request options
    * @param options How to send the requests
    * @returns The results at each round, in the order of `rounds` (one, at the latest round, without `rounds`)
-   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
-   * @throws dtalgosdk's `DTUnsupportedError` if the node has no queries (stock algod, or dtalgod with queries disabled)
+   * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
+   * @throws dt-algosdk's `DTUnsupportedError` if the node has no queries (stock algod, or dtalgod with queries disabled)
    * @example
    * ```typescript
    * const program = (await algorand.app.compileTeal('#pragma version 10\nglobal Round\nitob\nlog\nint 1')).compiledBase64ToBytes
@@ -904,7 +904,7 @@ export class QueryManager {
       error,
     })
     const tt = getDTSdk()
-    if (!tt) return no('the loaded algosdk is not dtalgosdk', () => new DTNotAvailableError('Querying'))
+    if (!tt) return no('the loaded algosdk is not dt-algosdk', () => new DTNotAvailableError('Querying'))
     const capabilities = await getCapabilities(this._clientManager.algod)
     const limits = capabilities?.query
     if (!limits) return no('the node has queries disabled', () => new tt.DTUnsupportedError(noQueryMessage(capabilities)))

@@ -96,17 +96,17 @@ export class ClientManager {
   }
 
   /**
-   * Returns a time-travel algod client (dtalgosdk's `DTAlgodClient`) that shares the connection of `algod`, for reads
+   * Returns a time-travel algod client (dt-algosdk's `DTAlgodClient`) that shares the connection of `algod`, for reads
    * at past rounds, `/versions` listings, extended simulate and queries on dtalgod.
    * @returns The time-travel algod client
-   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+   * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
    */
   public get dtAlgod(): DTAlgodLike {
     return toDTAlgod(this._algod, 'The time-travel algod client')
   }
 
   /**
-   * Returns whether time travel can be used: the loaded algosdk is dtalgosdk and the algod node is dtalgod with time
+   * Returns whether time travel can be used: the loaded algosdk is dt-algosdk and the algod node is dtalgod with time
    * travel on (`EnableTimeTravel`). It is read from the node's capabilities, asked for once per algod client.
    * @returns Whether time travel is supported
    */
@@ -122,7 +122,7 @@ export class ClientManager {
    * endpoint, gets stock algod's values with `reported` false. They are asked for once per algod client.
    *
    * @returns The node's capabilities
-   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+   * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
    * @example
    * ```typescript
    * const { reported, timeTravel, simulate, query } = await algorand.client.capabilities()

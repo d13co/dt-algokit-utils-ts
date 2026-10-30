@@ -96,7 +96,7 @@ const capabilitiesFailed = new WeakSet<algosdk.Algodv2>()
 
 /**
  * The extra opcode budget for a readonly call: the most the node allows (on dtalgod, more or less than stock algod).
- * The capabilities are only asked for with dtalgosdk; without it, or if asking fails, stock algod's limit is used.
+ * The capabilities are only asked for with dt-algosdk; without it, or if asking fails, stock algod's limit is used.
  */
 async function readonlyOpcodeBudget(algod: algosdk.Algodv2): Promise<number> {
   if (capabilitiesFailed.has(algod)) return MAX_SIMULATE_OPCODE_BUDGET

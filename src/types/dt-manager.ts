@@ -95,7 +95,7 @@ export interface KeyVersionsOptions extends AppStateVersionsOptions {
    * entries then hold only the local state. Not with `rounds`.
    *
    * The node examines a bounded number of versions per page, so pages can be short or empty and still have a
-   * `nextToken`: keep paging until it is absent (the iterators do). Needs dtalgosdk 3.9.0-dt.3.0.0.1 or later (its `versions-pages` feature).
+   * `nextToken`: keep paging until it is absent (the iterators do). Needs dt-algosdk (its `versions-pages` feature).
    */
   key?: string | Uint8Array
 }
@@ -109,7 +109,7 @@ export interface BoxesVersionsOptions {
    * toward the node's per-round box limit.
    *
    * The node steps through the app's box index, so pages can be short or empty and still have a `nextToken`: keep paging
-   * until it is absent (the iterators do). Needs dtalgosdk 3.9.0-dt.3.0.0.1 or later (its `versions-pages` feature).
+   * until it is absent (the iterators do). Needs dt-algosdk (its `versions-pages` feature).
    */
   prefix?: string | Uint8Array
 }
@@ -415,8 +415,8 @@ const sortedRounds = (rounds: readonly Round[], order: VersionsOrder | undefined
  * Time travel on a time-travel algod (dtalgod with `EnableTimeTravel`): the rounds at which boxes, apps, assets and
  * accounts changed, with their values.
  *
- * Needs dtalgosdk (the time-travel fork of algosdk); without it every method throws a `DTNotAvailableError`. A node
- * without time travel (stock algod, or dtalgod with `EnableTimeTravel` off) throws dtalgosdk's `DTUnsupportedError`
+ * Needs dt-algosdk (the time-travel fork of algosdk); without it every method throws a `DTNotAvailableError`. A node
+ * without time travel (stock algod, or dtalgod with `EnableTimeTravel` off) throws dt-algosdk's `DTUnsupportedError`
  * before any request is sent; whether the node has time travel is read once per algod client, from its capabilities.
  *
  * To read state at a past round, pass `{ round }` to the usual reads (`algorand.app.getGlobalState(appId, { round })`,
@@ -438,7 +438,7 @@ export class DTManager {
   }
 
   /**
-   * Returns whether time travel can be used: the loaded algosdk is dtalgosdk and the node is dtalgod with time travel
+   * Returns whether time travel can be used: the loaded algosdk is dt-algosdk and the node is dtalgod with time travel
    * on (`EnableTimeTravel`). It is read from the node's capabilities, asked for once per algod client.
    * @returns Whether time travel is supported
    * @example
@@ -778,7 +778,7 @@ export class DTManager {
 
   /**
    * Returns a page of the accounts that hold an asset at a round, in address order. Needs dtalgod with time travel and
-   * the asset holders index (`TimeTravelHoldersIndex`); otherwise dtalgosdk's `DTUnsupportedError`. An index still being
+   * the asset holders index (`TimeTravelHoldersIndex`); otherwise dt-algosdk's `DTUnsupportedError`. An index still being
    * built is a 503 that is thrown at once (not retried). For every holder, prefer {@link iterateAssetHolders}.
    * @param assetId The ID of the asset
    * @param options The round, the page size, the `next` token (with the first page's `round`) and an abort signal

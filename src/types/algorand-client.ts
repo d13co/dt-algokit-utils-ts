@@ -226,7 +226,7 @@ export class AlgorandClient {
    * Time travel on dtalgod (a time-travel algod): the rounds at which boxes, apps, assets and accounts changed.
    *
    * To read state at a past round, pass `{ round }` to the usual reads, or use `appClient.atRound(round)`.
-   * Needs dtalgosdk (the time-travel fork of algosdk).
+   * Needs dt-algosdk (the time-travel fork of algosdk).
    * @returns The `DTManager` instance.
    * @example
    * const { versions } = await algorand.dt.getBoxVersions(appId, 'counter', { includeValues: true });
@@ -237,7 +237,7 @@ export class AlgorandClient {
 
   /**
    * Extended simulate on dtalgod: several transaction groups per request, and the same groups at several rounds.
-   * Needs dtalgosdk (the time-travel fork of algosdk).
+   * Needs dt-algosdk (the time-travel fork of algosdk).
    * @returns The `SimulateManager` instance.
    * @example
    * const outcomes = await algorand.simulate.rounds(composer, [45_000_000n, 45_001_000n]);
@@ -248,7 +248,7 @@ export class AlgorandClient {
 
   /**
    * Read-only TEAL queries on dtalgod (`POST /v2/query`): many calls of one program or app, each alone, at many rounds,
-   * with their logs. Needs dtalgosdk (the time-travel fork of algosdk).
+   * with their logs. Needs dt-algosdk (the time-travel fork of algosdk).
    * @returns The `QueryManager` instance.
    * @example
    * const [{ calls }] = await algorand.query.run({ program, rounds: [45_000_000n], calls: [{ args: [arg] }] });

@@ -236,8 +236,8 @@ function protocolOverrideAt(
  * parallel), and the same groups at several rounds in one request.
  *
  * The groups are simulated without signatures (like `simulate({ skipSignatures: true })`), so this is for reads and
- * dry runs. Needs dtalgosdk (without it, every method throws a `DTNotAvailableError`) and dtalgod: on stock algod,
- * `groups` and `rounds` throw dtalgosdk's `DTUnsupportedError` before sending anything. The node's capabilities
+ * dry runs. Needs dt-algosdk (without it, every method throws a `DTNotAvailableError`) and dtalgod: on stock algod,
+ * `groups` and `rounds` throw dt-algosdk's `DTUnsupportedError` before sending anything. The node's capabilities
  * (`algorand.client.capabilities()`), which tell the two apart, are asked for once per algod client.
  */
 export class SimulateManager {
@@ -294,7 +294,7 @@ export class SimulateManager {
    * capabilities endpoint, gets stock algod's limits.
    *
    * @returns The node's simulate limits
-   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+   * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
    * @example
    * ```typescript
    * const { maxTxnGroups, maxRounds } = await algorand.simulate.limits()

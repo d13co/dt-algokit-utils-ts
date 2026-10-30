@@ -13,7 +13,7 @@ import modelsv2 = algosdk.modelsv2
  */
 
 /**
- * The `DTAlgodClient.features` that algokit-utils uses. They tell dtalgosdk from stock algosdk: they describe the SDK
+ * The `DTAlgodClient.features` that algokit-utils uses. They tell dt-algosdk from stock algosdk: they describe the SDK
  * build, not the node.
  */
 export const REQUIRED_DT_FEATURES = Object.freeze([
@@ -37,13 +37,13 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'round-header',
 ] as const)
 
-/** Thrown when a time travel, extended simulate or query feature is used but the loaded algosdk is not dtalgosdk (the time-travel fork). */
+/** Thrown when a time travel, extended simulate or query feature is used but the loaded algosdk is not dt-algosdk (the time-travel fork). */
 export class DTNotAvailableError extends Error {
   /** @param feature The feature that was used, for the message */
   constructor(feature: string) {
     super(
-      `${feature} needs dtalgosdk, the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
-        'but the loaded algosdk is not it. Install dtalgosdk in place of algosdk and make sure the app loads a single copy of algosdk.',
+      `${feature} needs dt-algosdk, the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
+        'but the loaded algosdk is not it. Install dt-algosdk in place of algosdk and make sure the app loads a single copy of algosdk.',
     )
     this.name = 'DTNotAvailableError'
   }
@@ -57,7 +57,7 @@ export interface AtRoundOptions {
   /**
    * Read the state as of the end of this round instead of the latest round.
    *
-   * Needs dtalgod with time travel (`EnableTimeTravel`) and dtalgosdk. Any other node throws instead of returning the
+   * Needs dtalgod with time travel (`EnableTimeTravel`) and dt-algosdk. Any other node throws instead of returning the
    * latest state: whether the node has time travel is read once per algod client, from its capabilities.
    */
   round?: Round
@@ -618,14 +618,14 @@ interface DTSdk {
 
 const sdk = algosdk as unknown as Partial<DTSdk>
 
-/** Returns the parts of dtalgosdk (the time-travel fork of algosdk) that algokit-utils uses, or `undefined` with stock algosdk. */
+/** Returns the parts of dt-algosdk (the time-travel fork of algosdk) that algokit-utils uses, or `undefined` with stock algosdk. */
 export function getDTSdk(): DTSdk | undefined {
   const features = sdk.DTAlgodClient?.features
   if (!features || !REQUIRED_DT_FEATURES.every((f) => features.includes(f))) return undefined
   return sdk as DTSdk
 }
 
-/** Returns the parts of dtalgosdk that algokit-utils uses, or throws a {@link DTNotAvailableError}. */
+/** Returns the parts of dt-algosdk that algokit-utils uses, or throws a {@link DTNotAvailableError}. */
 export function requireDTSdk(feature: string): DTSdk {
   const tt = getDTSdk()
   if (!tt) throw new DTNotAvailableError(feature)
@@ -638,15 +638,15 @@ export function requireDTSdk(feature: string): DTSdk {
  *
  * @param algod The algod client to share the connection of
  * @param feature The feature that needs the client, for the error message
- * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+ * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
  */
 export function toDTAlgod(algod: algosdk.Algodv2, feature = 'This feature'): DTAlgodLike {
   return requireDTSdk(feature).DTAlgodClient.from(algod)
 }
 
 /**
- * Returns the node's capabilities, through dtalgosdk's cached `DTAlgodClient.capabilities()`: stock algod's values
- * (`reported` false) on stock algod. Returns `undefined` when the loaded algosdk is not dtalgosdk, so they are unknown.
+ * Returns the node's capabilities, through dt-algosdk's cached `DTAlgodClient.capabilities()`: stock algod's values
+ * (`reported` false) on stock algod. Returns `undefined` when the loaded algosdk is not dt-algosdk, so they are unknown.
  * @param algod The algod client to ask
  * @throws The request's error, other than a 404
  */
@@ -683,7 +683,7 @@ export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilit
 
 /**
  * Returns the node's query limits (`query` of its capabilities), or `undefined` when the node has no queries (stock
- * algod, or dtalgod with queries disabled) or the loaded algosdk is not dtalgosdk.
+ * algod, or dtalgod with queries disabled) or the loaded algosdk is not dt-algosdk.
  * @param algod The algod client to ask
  * @throws The capabilities request's error, other than a 404
  */
@@ -698,7 +698,7 @@ export const noQueryMessage = (capabilities: Capabilities | undefined): string =
     : 'Querying needs dtalgod, but the node is stock algod (it has no POST /v2/query)'
 
 /**
- * Returns whether an error is dtalgosdk's `DTUnsupportedError`: the node lacks a feature the request needs (it is stock
+ * Returns whether an error is dt-algosdk's `DTUnsupportedError`: the node lacks a feature the request needs (it is stock
  * algod, or dtalgod with the feature off), or can't serve the round asked for.
  */
 export function isDTUnsupportedError(error: unknown): boolean {
@@ -712,7 +712,7 @@ export function isDTUnsupportedError(error: unknown): boolean {
  *
  * @param algod The algod client to ask
  * @param feature The feature that needs dtalgod, for the error message
- * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+ * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
  * @throws DTUnsupportedError if the node is stock algod
  */
 export async function requireDTNode(algod: algosdk.Algodv2, feature: string): Promise<Capabilities> {
@@ -730,7 +730,7 @@ export async function requireDTNode(algod: algosdk.Algodv2, feature: string): Pr
  * @param algod The algod client to share the connection of
  * @param feature The feature that needs time travel, for the error message
  * @param round The round asked for, if any
- * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+ * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
  * @throws DTUnsupportedError if the node is stock algod, or dtalgod with time travel off
  */
 export async function requireTimeTravel(algod: algosdk.Algodv2, feature: string, round?: Round): Promise<DTAlgodLike> {
