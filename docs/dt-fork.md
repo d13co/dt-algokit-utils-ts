@@ -157,7 +157,7 @@ for await (const v of algorand.dt.iterateAssetVersions(assetId, { rounds: [1000n
 
 - Entries come in `order` (ascending by default), not in the order given, and a round listed twice comes once: match them by `round`.
 - `deleted: true` without `changedRound` means the object did not exist at that round. On the account endpoints, the objects that did not exist then are left out.
-- **Round 0 is the genesis round here.** In `algorand.simulate.rounds` and `algorand.query.*`, 0 means the latest round.
+- **Round 0 is the genesis round here.** Elsewhere 0 means the latest round: in the `round` option of `algorand.simulate.groups` and `algorand.query.groups`, and in the `rounds` of `algorand.query.run`. `algorand.simulate.rounds` and `algorand.query.rounds` take only past rounds and throw a `RangeError` on 0.
 - Not with `minRound` / `maxRound` (an `Error` before sending). `limit` counts rounds.
 - A page (`get…Versions`) sends the rounds as given in one request, at most 10,000. The iterators sort and dedupe them and send them in requests of `min(limit, maxRoundsPerRequest)` rounds (`limit` defaults to 100, `maxRoundsPerRequest` to 500, about 4.5 KB of URL), each paged to its end before the next: a request carries only the rounds its page can return, and stays under proxies' URL limits. An empty list yields nothing and sends nothing.
 - `changedRound` is on every version type: `BoxVersion`, `BoxChange` (each box of the boxes feed lists every box of the app at that round), `AppVersion`, `AssetVersion`, `AccountVersion.base` and each item of the account lists.
@@ -360,6 +360,8 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 | `QueryGroupError`                              | A group of `algorand.query.groups`/`rounds` failed, on either path (`kind` as simulate's); in the outcome, not thrown            |
 | `DTUnsupportedError` from `algorand.query.run` | The node has no queries (stock algod, or dtalgod with queries disabled)                                                          |
 
+`DTNotAvailableError`, `isDTUnsupportedError`, `QueryCallError` and `QueryGroupError` are exported from `@algorandfoundation/algokit-utils`. `DTUnsupportedError` itself comes from dt-algosdk: `import { DTUnsupportedError } from 'algosdk'` (with the alias in place), or test with `isDTUnsupportedError(e)`, which also works when stock algosdk is loaded.
+
 ## Tests
 
 `src/types/dt.spec.ts` runs offline against a stub algod. `src/types/dt.live.spec.ts` runs against a MainNet dtalgod:
@@ -395,10 +397,10 @@ One-time setup:
 3. Publish `dt-algosdk` at that version first, since the snippets point at it.
 4. Commit, then tag and push to the fork, `github.com/d13co/dt-algokit-utils-ts` (not upstream): `git tag v<version> && git push <fork remote> dtalgorand v<version>`. The CD workflow publishes it.
 
-Versions follow the same scheme as `dt-algosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`.
+Versions follow the same scheme as `dt-algosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`, built on algokit-utils 9.2.3, covering dt-algorand dt4, and this package's release 1.0.0.
 
 - `9.2.3`: the upstream algokit-utils version the code is built on (`v9.2.3-beta.2`). Bump it when merging a new upstream release.
 - `dt.4`: the dt-algorand release whose API this covers (tag `v5.0.5-dt4`). Older dt-algorand releases are not supported; only the features that are optional on that release are detected at runtime (see [Compatibility](#compatibility)). Keep it a separate identifier (`dt.4`, not `dt4`) so npm compares the number numerically.
-- `0.0.1`: this package's own release, semver-style (a major bump for breaking changes). Reset to `0.0.1` whenever the base or the dt number changes.
+- `1.0.0`: this package's own release, `x.y.z`: bump `x` for a breaking change to the fork's API, `y` for features and `z` for fixes. It never starts again: when the upstream base or the dt number changes, it keeps counting from the last release (bumped as the change calls for), as `dt-algosdk`'s does.
 
 These are prereleases, so `^` ranges don't match them; consumers pin exact versions in their overrides. `publishConfig.tag` is `latest`, so each publish becomes the default install.

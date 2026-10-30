@@ -2,7 +2,7 @@
 
 > `@d13co/dt-algokit-utils` is a fork of [`@algorandfoundation/algokit-utils`](https://github.com/algorandfoundation/algokit-utils-ts) that adds support for [dtalgod](https://github.com/d13co/dt-algorand), an algod with time travel and extended simulate. The upstream README follows below.
 
-It is a drop-in replacement: existing APIs, types and generated typed clients work unchanged, and on stock `algosdk` or a stock algod everything behaves as upstream while the new features throw.
+It is a drop-in replacement: existing APIs, types and generated typed clients work unchanged, and on stock `algosdk` or a stock algod everything behaves as upstream while the new features throw, except for a few changes to existing methods, such as `state.box.getMap` reading a map in one listing and retries honouring `Retry-After`: see [the changed methods](./docs/dt-fork.md#api-changes-at-a-glance).
 
 ## Main changes
 
