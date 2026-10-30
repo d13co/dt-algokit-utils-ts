@@ -6,7 +6,7 @@ import { AppFactory, AppFactoryParams } from './app-factory'
 import { TestNetDispenserApiClient, TestNetDispenserApiClientParams } from './dispenser-client'
 import { Expand } from './expand'
 import { AlgoClientConfig, AlgoConfig, NetworkDetails, genesisIdIsLocalNet } from './network-client'
-import { DTAlgodLike, getDTSdk, toDTAlgod } from './dt-support'
+import { Capabilities, DTAlgodLike, getCapabilities, getDTSdk, requireDTSdk, toDTAlgod } from './dt-support'
 import Kmd = algosdk.Kmd
 import Indexer = algosdk.Indexer
 import Algodv2 = algosdk.Algodv2
@@ -107,12 +107,30 @@ export class ClientManager {
 
   /**
    * Returns whether time travel can be used: the loaded algosdk is dtalgosdk and the algod node is dtalgod with time
-   * travel on (`EnableTimeTravel`). It is read from the node's simulate limits, asked for once per algod client.
+   * travel on (`EnableTimeTravel`). It is read from the node's capabilities, asked for once per algod client.
    * @returns Whether time travel is supported
    */
   public async supportsDT(): Promise<boolean> {
     if (!getDTSdk()) return false
     return await this.dtAlgod.supportsDT()
+  }
+
+  /**
+   * Returns what the algod node can do, as dtalgod reports it (`GET /v2/capabilities`): whether it is dtalgod at all
+   * (`reported`), which optional features it has on (time travel, the developer API, queries), its time limit for
+   * expensive requests, and the limits of its simulate and query requests. Stock algod, which has no capabilities
+   * endpoint, gets stock algod's values with `reported` false. They are asked for once per algod client.
+   *
+   * @returns The node's capabilities
+   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+   * @example
+   * ```typescript
+   * const { reported, timeTravel, simulate, query } = await algorand.client.capabilities()
+   * ```
+   */
+  public async capabilities(): Promise<Capabilities> {
+    requireDTSdk('Reading the node capabilities')
+    return (await getCapabilities(this._algod))!
   }
 
   /**

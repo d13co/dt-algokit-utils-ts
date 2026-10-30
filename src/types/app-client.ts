@@ -58,7 +58,7 @@ import {
 import { AppLookup } from './app-deployer'
 import { AppManager, BoxIdentifier, BoxWithValue, GetBoxesOptions } from './app-manager'
 import { AppSpec, arc32ToArc56 } from './app-spec'
-import { AtRoundOptions, Round, getSimulateLimits } from './dt-support'
+import { AtRoundOptions, Round, getCapabilities } from './dt-support'
 import {
   AppCallMethodCall,
   AppCallParams,
@@ -91,21 +91,21 @@ import TransactionSigner = algosdk.TransactionSigner
 /** The maximum opcode budget for a simulate call as per https://github.com/algorand/go-algorand/blob/807b29a91c371d225e12b9287c5d56e9b33c4e4c/ledger/simulation/trace.go#L104 */
 const MAX_SIMULATE_OPCODE_BUDGET = 20_000 * 16
 
-/** The algod clients whose simulate limits couldn't be read, so readonly calls don't ask again. */
-const simulateLimitsFailed = new WeakSet<algosdk.Algodv2>()
+/** The algod clients whose capabilities couldn't be read, so readonly calls don't ask again. */
+const capabilitiesFailed = new WeakSet<algosdk.Algodv2>()
 
 /**
  * The extra opcode budget for a readonly call: the most the node allows (on dtalgod, more or less than stock algod).
- * The limits are only asked for with dtalgosdk; without it, or if asking fails, stock algod's limit is used.
+ * The capabilities are only asked for with dtalgosdk; without it, or if asking fails, stock algod's limit is used.
  */
 async function readonlyOpcodeBudget(algod: algosdk.Algodv2): Promise<number> {
-  if (simulateLimitsFailed.has(algod)) return MAX_SIMULATE_OPCODE_BUDGET
+  if (capabilitiesFailed.has(algod)) return MAX_SIMULATE_OPCODE_BUDGET
   try {
-    const limits = await getSimulateLimits(algod)
+    const capabilities = await getCapabilities(algod)
     // Stock algod gets stock algod's limits, so this is its limit there too
-    return limits?.maxExtraOpcodeBudget ?? MAX_SIMULATE_OPCODE_BUDGET
+    return capabilities?.simulate.maxExtraOpcodeBudget ?? MAX_SIMULATE_OPCODE_BUDGET
   } catch {
-    simulateLimitsFailed.add(algod)
+    capabilitiesFailed.add(algod)
     return MAX_SIMULATE_OPCODE_BUDGET
   }
 }

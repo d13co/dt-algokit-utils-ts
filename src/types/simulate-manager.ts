@@ -5,12 +5,13 @@ import { BuiltTransactions, RawSimulateOptions, TransactionComposer } from './co
 import {
   DTSimulateResponseLike,
   RawSimulateGroupOutcome,
+  Capabilities,
   Round,
   SimulateLimits,
   SimulateProtocolOverride,
   chunk,
   concurrencyLimiter,
-  getSimulateLimits,
+  getCapabilities,
   mergeProtocolOverrides,
   offsetProtocolOverride,
   requireDTNode,
@@ -150,15 +151,15 @@ const validityAt = (round: Round | undefined) =>
   round ? { firstValidRound: BigInt(round) + 1n, lastValidRound: BigInt(round) + 11n } : undefined
 
 /**
- * Checks extended simulate options against the limits the node reported, throwing for what it doesn't allow. Shared with
- * `QueryManager`, which validates the same options.
+ * Checks extended simulate options against the capabilities the node reported, throwing for what it doesn't allow.
+ * Shared with `QueryManager`, which validates the same options.
  */
 export function checkSimulateLimits(
-  limits: SimulateLimits,
+  capabilities: Capabilities,
   protocol: string | undefined,
   raw: Pick<RawSimulateOptions, 'execTraceConfig' | 'extraOpcodeBudget'>,
 ): void {
-  if (!limits.developerApi) {
+  if (!capabilities.developerApi) {
     if (protocol === 'future') {
       throw new Error("protocol 'future' needs a node with the developer API (EnableDeveloperAPI), and this node has it off")
     }
@@ -167,10 +168,9 @@ export function checkSimulateLimits(
     }
   }
   const { extraOpcodeBudget } = raw
-  if (extraOpcodeBudget !== undefined && BigInt(extraOpcodeBudget) > BigInt(limits.maxExtraOpcodeBudget)) {
-    throw new Error(
-      `extraOpcodeBudget ${extraOpcodeBudget} is more than the node allows (maxExtraOpcodeBudget ${limits.maxExtraOpcodeBudget})`,
-    )
+  const { maxExtraOpcodeBudget } = capabilities.simulate
+  if (extraOpcodeBudget !== undefined && BigInt(extraOpcodeBudget) > BigInt(maxExtraOpcodeBudget)) {
+    throw new Error(`extraOpcodeBudget ${extraOpcodeBudget} is more than the node allows (maxExtraOpcodeBudget ${maxExtraOpcodeBudget})`)
   }
 }
 
@@ -237,8 +237,8 @@ function protocolOverrideAt(
  *
  * The groups are simulated without signatures (like `simulate({ skipSignatures: true })`), so this is for reads and
  * dry runs. Needs dtalgosdk (without it, every method throws a `DTNotAvailableError`) and dtalgod: on stock algod,
- * `groups` and `rounds` throw dtalgosdk's `DTUnsupportedError` before sending anything. The node's limits, which tell
- * the two apart, are asked for once per algod client.
+ * `groups` and `rounds` throw dtalgosdk's `DTUnsupportedError` before sending anything. The node's capabilities
+ * (`algorand.client.capabilities()`), which tell the two apart, are asked for once per algod client.
  */
 export class SimulateManager {
   private _clientManager: ClientManager
@@ -277,31 +277,32 @@ export class SimulateManager {
     requireDTSdk('Simulating several groups')
     checkValidityWindow(rest as { validityWindow?: string })
     rest.signal?.throwIfAborted()
-    // The limits are cached per client and shared, so they are read without the signal
-    const limits = await requireDTNode(this._clientManager.algod, 'Simulating several groups')
+    // The capabilities are cached per client and shared, so they are read without the signal
+    const capabilities = await requireDTNode(this._clientManager.algod, 'Simulating several groups')
     const limit = concurrencyLimiter(checkConcurrency(rest.concurrency))
     const built = await this.buildGroups(composers, validityAt(round))
-    const [outcomes] = await this.send(built, rest, { round }, limits, limit)
+    const [outcomes] = await this.send(built, rest, { round }, capabilities, limit)
     return outcomes.groups
   }
 
   /**
    * Returns the node's simulate limits: how many groups and `rounds` entries a request may hold, the most
-   * `extraOpcodeBudget`, and whether time travel and the developer API are on. `groups` and `rounds` keep to them.
+   * `extraOpcodeBudget`, and the factor on the unnamed-resource limits. `groups` and `rounds` keep to them.
    *
-   * Every dtalgod node reports them. Stock algod, which has no limits endpoint, gets stock algod's limits, with
-   * `reported` false: `reported` is how to tell dtalgod from stock algod. The limits are asked for once per algod client.
+   * They are the `simulate` part of the node's capabilities (`algorand.client.capabilities()`, which also says whether the
+   * node is dtalgod at all, and which features it has on), asked for once per algod client. Stock algod, which has no
+   * capabilities endpoint, gets stock algod's limits.
    *
    * @returns The node's simulate limits
    * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
    * @example
    * ```typescript
-   * const { maxTxnGroups, maxRounds, reported } = await algorand.simulate.limits()
+   * const { maxTxnGroups, maxRounds } = await algorand.simulate.limits()
    * ```
    */
   public async limits(): Promise<SimulateLimits> {
     requireDTSdk('Reading the simulate limits')
-    return (await getSimulateLimits(this._clientManager.algod))!
+    return (await getCapabilities(this._clientManager.algod))!.simulate
   }
 
   /**
@@ -343,10 +344,10 @@ export class SimulateManager {
     checkValidityWindow(rest)
     const limit = concurrencyLimiter(checkConcurrency(rest.concurrency))
     rest.signal?.throwIfAborted()
-    // The limits are cached per client and shared, so they are read without the signal
-    const limits = await requireDTNode(this._clientManager.algod, 'Simulating at several rounds')
-    const maxRounds = maxRoundsOption ?? limits.maxRounds
-    if (maxRounds === 0) return await this.roundByRound(groups, rounds, rest, limits, limit)
+    // The capabilities are cached per client and shared, so they are read without the signal
+    const capabilities = await requireDTNode(this._clientManager.algod, 'Simulating at several rounds')
+    const maxRounds = maxRoundsOption ?? capabilities.simulate.maxRounds
+    if (maxRounds === 0) return await this.roundByRound(groups, rounds, rest, capabilities, limit)
     // With a validity window mode the rounds of a request needn't fit in one transaction's validity window
     const { windows, positions } = tt.packSimulateRounds(rounds, { maxRounds, ...(rest.validityWindow ? { maxSpan: null } : {}) })
 
@@ -355,7 +356,7 @@ export class SimulateManager {
     for (const w of windows) {
       builtWindows.push(await this.buildGroups(groups, { firstValidRound: w.firstValid, lastValidRound: w.lastValid }))
     }
-    const results = await Promise.all(windows.map((w, i) => this.send(builtWindows[i], rest, { rounds: w.rounds }, limits, limit)))
+    const results = await Promise.all(windows.map((w, i) => this.send(builtWindows[i], rest, { rounds: w.rounds }, capabilities, limit)))
 
     return positions.map(({ window, roundIndex }, i) => {
       const { groups, protocolOverride } = results[window][roundIndex]
@@ -368,7 +369,7 @@ export class SimulateManager {
     composers: TransactionComposer[],
     rounds: Round[],
     options: Omit<SimulateRoundsOptions, 'maxRounds'>,
-    limits: SimulateLimits,
+    capabilities: Capabilities,
     limit: ReturnType<typeof concurrencyLimiter>,
   ): Promise<SimulateRoundOutcome[]> {
     // The transactions are built valid at each round, so a validity window mode isn't needed (and needs `rounds`)
@@ -381,7 +382,7 @@ export class SimulateManager {
     // Build one after the other (a composer can only build one validity window at a time), then send `concurrency` at a time
     const built: BuiltTransactions[][] = []
     for (const r of unique) built.push(await this.buildGroups(composers, validityAt(r)))
-    const results = await Promise.all(unique.map((r, i) => this.send(built[i], rest, { round: r }, limits, limit)))
+    const results = await Promise.all(unique.map((r, i) => this.send(built[i], rest, { round: r }, capabilities, limit)))
     return rounds.map((r) => {
       const [{ groups, protocolOverride }] = results[unique.indexOf(BigInt(r))]
       return { round: BigInt(r), groups, ...(protocolOverride ? { protocolOverride } : {}) }
@@ -409,7 +410,7 @@ export class SimulateManager {
     built: BuiltTransactions[],
     options: ExtendedSimulateOptions & Pick<SimulateRoundsOptions, 'validityWindow'>,
     at: { round?: Round; rounds?: bigint[] },
-    limits: SimulateLimits,
+    capabilities: Capabilities,
     limit: ReturnType<typeof concurrencyLimiter>,
   ): Promise<{ groups: SimulateGroupOutcome[]; protocolOverride?: SimulateProtocolOverride }[]> {
     const tt = requireDTSdk('Simulating several groups')
@@ -417,14 +418,14 @@ export class SimulateManager {
     signal?.throwIfAborted()
     // Fetch options for each request: the signal goes to fetch, never into the request body
     const fetchOptions = signal ? { signal } : undefined
-    const maxGroups = maxGroupsOption ?? limits.maxTxnGroups
+    const maxGroups = maxGroupsOption ?? capabilities.simulate.maxTxnGroups
     if (!Number.isInteger(maxGroups) || maxGroups < 1) throw new RangeError(`maxGroups must be a positive integer, not ${maxGroups}`)
     if (!parallel && built.length > maxGroups) {
       throw new Error(
         `Can't simulate ${built.length} groups one after the other: ${maxGroupsOption === undefined ? 'the node takes' : 'maxGroups allows'} at most ${maxGroups} per request (use parallel to split them across requests)`,
       )
     }
-    checkSimulateLimits(limits, protocol, raw)
+    checkSimulateLimits(capabilities, protocol, raw)
     const chunks = parallel ? chunk(built, maxGroups) : [built]
     const algod = this._clientManager.dtAlgod
     // Parallel groups split across requests must all run at the same round, even if a new block comes in between

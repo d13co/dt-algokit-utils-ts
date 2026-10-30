@@ -16,7 +16,7 @@ import {
   chunk,
   getDTSdk,
   getQueryLimits,
-  getSimulateLimits,
+  getCapabilities,
   isDTUnsupportedError,
   mapProtocolOverrideHits,
   mergeProtocolOverrides,
@@ -661,7 +661,7 @@ class QueryRun {
  * their logs and cost. No signatures, fees or minimum balances; every resource is available without references; nothing
  * is written.
  *
- * Needs dtalgosdk and a dtalgod with queries on (`MaxAPIQueryCalls` above 0), which its simulate limits report.
+ * Needs dtalgosdk and a dtalgod with queries on (`MaxAPIQueryCalls` above 0), which its capabilities report.
  */
 export class QueryManager {
   private _clientManager: ClientManager
@@ -680,7 +680,7 @@ export class QueryManager {
   /**
    * Returns the node's query limits: how many calls and rounds a request may hold, the most budget and log bytes of a
    * call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries (stock algod, or
-   * dtalgod with queries disabled). The limits are asked for once per algod client, with the simulate limits.
+   * dtalgod with queries disabled). The limits are asked for once per algod client, with the node's capabilities.
    *
    * @returns The node's query limits, if it has queries
    * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
@@ -762,10 +762,10 @@ export class QueryManager {
     const rounds = params.rounds && params.rounds.length > 0 ? params.rounds.map((r) => BigInt(r)) : [0n]
     const negative = rounds.find((r) => r < 0n)
     if (negative !== undefined) throw new RangeError(`Can't query at round ${negative}`)
-    // The limits are cached per client and shared, so they are read without the signal
-    const nodeLimits = await getSimulateLimits(this._clientManager.algod)
-    const limits = nodeLimits?.query
-    if (!limits) throw new tt.DTUnsupportedError(noQueryMessage(nodeLimits))
+    // The capabilities are cached per client and shared, so they are read without the signal
+    const capabilities = await getCapabilities(this._clientManager.algod)
+    const limits = capabilities?.query
+    if (!limits) throw new tt.DTUnsupportedError(noQueryMessage(capabilities))
     if (budget !== undefined && (!Number.isInteger(budget) || budget < 1 || budget > limits.maxCallBudget)) {
       throw new RangeError(`budget must be a positive integer of at most the node's maxCallBudget ${limits.maxCallBudget}, not ${budget}`)
     }
@@ -869,7 +869,7 @@ export class QueryManager {
     requireDTSdk('Querying composed app calls')
     checkValidityWindow(simulateOptions)
     simulateOptions.signal?.throwIfAborted()
-    // Both paths need dtalgod. The limits are cached per client and shared, so they are read without the signal
+    // Both paths need dtalgod. The capabilities are cached per client and shared, so they are read without the signal
     checkSimulateLimits(
       await requireDTNode(this._clientManager.algod, 'Querying composed app calls'),
       simulateOptions.protocol,
@@ -905,9 +905,9 @@ export class QueryManager {
     })
     const tt = getDTSdk()
     if (!tt) return no('the loaded algosdk is not dtalgosdk', () => new DTNotAvailableError('Querying'))
-    const nodeLimits = await getSimulateLimits(this._clientManager.algod)
-    const limits = nodeLimits?.query
-    if (!limits) return no('the node has queries disabled', () => new tt.DTUnsupportedError(noQueryMessage(nodeLimits)))
+    const capabilities = await getCapabilities(this._clientManager.algod)
+    const limits = capabilities?.query
+    if (!limits) return no('the node has queries disabled', () => new tt.DTUnsupportedError(noQueryMessage(capabilities)))
     if (options.execTraceConfig?.enable) return no('execTraceConfig needs simulate')
     if (options.allowMoreLogging && limits.maxCallLogBytes < SIMULATE_MORE_LOGGING_BYTES) {
       return no(`allowMoreLogging allows more log bytes than the node's queries (maxCallLogBytes ${limits.maxCallLogBytes})`)

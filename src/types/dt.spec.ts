@@ -16,27 +16,27 @@ type Call = { method: 'get' | 'post'; path: string; query: Record<string, string
 type Answer = { status: number; json?: unknown; body?: Uint8Array; headers?: Record<string, string> }
 type Route = { method: 'get' | 'post'; path: string | RegExp; answer: (call: Call) => Answer | Promise<Answer> }
 
-const LIMITS_PATH = '/v2/transactions/simulate/limits'
+const CAPABILITIES_PATH = '/v2/capabilities'
 
 /**
  * A BaseHTTPClient that answers from routes, in the order they were added; a route answers once unless `repeat`. The
- * node's simulate limits, which are cached per client, have one route at a time (the last one set), and their requests
- * are kept apart from the others in `limitsCalls`.
+ * node's capabilities, which are cached per client, have one lasting route at a time (the last one set), and their
+ * requests are kept apart from the others in `capabilitiesCalls`.
  */
 class StubClient implements algosdk.BaseHTTPClient {
   calls: Call[] = []
-  limitsCalls: Call[] = []
+  capabilitiesCalls: Call[] = []
   private routes: (Route & { repeat: boolean })[] = []
 
   on(method: 'get' | 'post', path: string | RegExp, answer: (call: Call) => Answer | Promise<Answer>, repeat = false) {
-    // A lasting answer of the limits replaces the earlier lasting one, such as the default
-    if (path === LIMITS_PATH) this.routes = this.routes.filter((r) => r.path !== LIMITS_PATH || !r.repeat)
+    // A lasting answer of the capabilities replaces the earlier lasting one, such as the default
+    if (path === CAPABILITIES_PATH) this.routes = this.routes.filter((r) => r.path !== CAPABILITIES_PATH || !r.repeat)
     this.routes.push({ method, path, answer, repeat })
     return this
   }
 
   private async answer(call: Call): Promise<algosdk.BaseHTTPClientResponse> {
-    ;(call.path === LIMITS_PATH ? this.limitsCalls : this.calls).push(call)
+    ;(call.path === CAPABILITIES_PATH ? this.capabilitiesCalls : this.calls).push(call)
     const i = this.routes.findIndex(
       (r) => r.method === call.method && (typeof r.path === 'string' ? r.path === call.path : r.path.test(call.path)),
     )
@@ -131,25 +131,45 @@ const nodeStatus = json({
   'time-since-last-round': 0,
 })
 
-/** dtalgod's default simulate limits with time travel on and queries off, as its limits endpoint answers them. */
+/**
+ * dtalgod's default capabilities with time travel on and queries off, flat for overrides: the top-level fields, and
+ * `simulate`'s under their own names.
+ */
 const LIMITS = {
+  'time-travel': true,
+  'developer-api': false,
+  'time-limit-seconds': 0,
   'max-txn-groups': 16,
   'max-rounds': 16,
   'max-extra-opcode-budget': 320_000,
   'resource-limit-multiplier': 1,
-  'time-limit-seconds': 0,
-  'time-travel': true,
-  'developer-api': false,
 }
 
-/** Answers the simulate limits endpoint as dtalgod with these limits, replacing any earlier answer. */
+/** The capabilities endpoint's answer for these flat values (see `LIMITS`) and query limits, if any. */
+const capabilitiesJson = (limits: Partial<typeof LIMITS>, query?: Record<string, number>) => {
+  const all = { ...LIMITS, ...limits }
+  return {
+    'time-travel': all['time-travel'],
+    'developer-api': all['developer-api'],
+    'time-limit-seconds': all['time-limit-seconds'],
+    simulate: {
+      'max-txn-groups': all['max-txn-groups'],
+      'max-rounds': all['max-rounds'],
+      'max-extra-opcode-budget': all['max-extra-opcode-budget'],
+      'resource-limit-multiplier': all['resource-limit-multiplier'],
+    },
+    ...(query ? { query } : {}),
+  }
+}
+
+/** Answers the capabilities endpoint as dtalgod with these values, replacing any earlier answer. */
 const limitsOk = (stub: StubClient, limits: Partial<typeof LIMITS> = {}) =>
-  stub.on('get', LIMITS_PATH, json({ ...LIMITS, ...limits }), true)
+  stub.on('get', CAPABILITIES_PATH, json(capabilitiesJson(limits)), true)
 
-/** Answers the simulate limits endpoint with a 404, as stock algod, replacing any earlier answer. */
-const stockAlgod = (stub: StubClient) => stub.on('get', LIMITS_PATH, () => ({ status: 404, json: { message: 'Not Found' } }), true)
+/** Answers the capabilities endpoint with a 404, as stock algod, replacing any earlier answer. */
+const stockAlgod = (stub: StubClient) => stub.on('get', CAPABILITIES_PATH, () => ({ status: 404, json: { message: 'Not Found' } }), true)
 
-const limitsCalls = (stub: StubClient) => stub.limitsCalls
+const limitsCalls = (stub: StubClient) => stub.capabilitiesCalls
 
 /** Runs `run` with dtalgosdk's `DTAlgodClient.features` lacking `without`, which makes it count as stock algosdk. */
 const withoutFeatures = async (without: string[], run: () => Promise<void>) => {
@@ -1038,7 +1058,7 @@ describe('time travel', () => {
       expect(limitsCalls(stub)).toHaveLength(1)
     })
 
-    test('readonly calls use the stock budget without a limits endpoint, or when it fails', async () => {
+    test('readonly calls use the stock budget without a capabilities endpoint, or when it fails', async () => {
       stockAlgod(stub)
         .on('get', '/v2/transactions/params', suggestedParams, true)
         .on(
@@ -1052,7 +1072,7 @@ describe('time travel', () => {
 
       // A node that fails the limits request is not asked again
       const failing = new StubClient()
-        .on('get', '/v2/transactions/simulate/limits', () => ({ status: 503, json: {} }), true)
+        .on('get', CAPABILITIES_PATH, () => ({ status: 503, json: {} }), true)
         .on('get', '/v2/transactions/params', suggestedParams, true)
         .on(
           'post',
@@ -1409,38 +1429,44 @@ describe('time travel', () => {
     const payment = (amount: number) => algorand.newGroup().addPayment({ sender, receiver: sender, amount: microAlgo(amount) })
     const posts = () => stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
 
-    test('limits: the node limits, asked for once per algod client', async () => {
-      limitsOk(stub, { 'max-txn-groups': 8, 'max-rounds': 4, 'developer-api': true })
-      const limits = await algorand.simulate.limits()
-      expect(limits).toEqual({
+    test('capabilities and limits: the node capabilities, asked for once per algod client', async () => {
+      limitsOk(stub, { 'max-txn-groups': 8, 'max-rounds': 4, 'developer-api': true, 'time-limit-seconds': 108 })
+      expect(await algorand.client.capabilities()).toEqual({
+        reported: true,
+        timeTravel: true,
+        developerApi: true,
+        timeLimitSeconds: 108,
+        simulate: { maxTxnGroups: 8, maxRounds: 4, maxExtraOpcodeBudget: 320_000, resourceLimitMultiplier: 1 },
+      })
+      expect(await algorand.simulate.limits()).toEqual({
         maxTxnGroups: 8,
         maxRounds: 4,
         maxExtraOpcodeBudget: 320_000,
         resourceLimitMultiplier: 1,
-        timeTravel: true,
-        developerApi: true,
-        reported: true,
       })
-      await algorand.simulate.limits()
       expect(limitsCalls(stub)).toHaveLength(1)
       expect(stub.calls).toHaveLength(0)
     })
 
-    test('limits: stock algod limits after a 404', async () => {
+    test('capabilities and limits: stock algod values after a 404', async () => {
       stockAlgod(stub)
+      expect(await algorand.client.capabilities()).toEqual({
+        reported: false,
+        timeTravel: false,
+        developerApi: false,
+        timeLimitSeconds: 0,
+        simulate: { maxTxnGroups: 1, maxRounds: 0, maxExtraOpcodeBudget: 320_000, resourceLimitMultiplier: 1 },
+      })
       expect(await algorand.simulate.limits()).toEqual({
         maxTxnGroups: 1,
         maxRounds: 0,
         maxExtraOpcodeBudget: 320_000,
         resourceLimitMultiplier: 1,
-        timeTravel: false,
-        developerApi: false,
-        reported: false,
       })
     })
 
     test('limits: other errors are thrown and asked again next time', async () => {
-      stub.on('get', '/v2/transactions/simulate/limits', () => ({ status: 503, json: {} }))
+      stub.on('get', CAPABILITIES_PATH, () => ({ status: 503, json: {} }))
       limitsOk(stub)
       await expect(algorand.simulate.limits()).rejects.toMatchObject({ status: 503 })
       expect((await algorand.simulate.limits()).maxTxnGroups).toBe(16)
@@ -1572,7 +1598,7 @@ describe('time travel', () => {
   })
 })
 
-/** dtalgod's query limits, as its simulate limits endpoint answers them. */
+/** dtalgod's query limits, as its capabilities endpoint answers them. */
 const QUERY_LIMITS = {
   'max-calls': 1024,
   'max-call-budget': 320_000,
@@ -1582,9 +1608,9 @@ const QUERY_LIMITS = {
   'max-rounds': 16,
 }
 
-/** Answers the simulate limits endpoint as dtalgod with queries, with these query limits. */
+/** Answers the capabilities endpoint as dtalgod with queries, with these query limits. */
 const queryLimitsOk = (stub: StubClient, query: Partial<typeof QUERY_LIMITS> = {}, limits: Partial<typeof LIMITS> = {}) =>
-  stub.on('get', LIMITS_PATH, json({ ...LIMITS, ...limits, query: { ...QUERY_LIMITS, ...query } }), true)
+  stub.on('get', CAPABILITIES_PATH, json(capabilitiesJson(limits, { ...QUERY_LIMITS, ...query })), true)
 
 type SentQueryCall = {
   args?: Uint8Array[]
@@ -2001,13 +2027,13 @@ describe('query', () => {
       expect(queries(stub)).toHaveLength(0)
     })
 
-    test('simulate limits include the query limits only when the node has queries', async () => {
+    test('capabilities include the query limits only when the node has queries', async () => {
       queryLimitsOk(stub, { 'max-calls': 7 })
-      expect((await algorand.simulate.limits()).query).toMatchObject({ maxCalls: 7, maxRounds: 16 })
+      expect((await algorand.client.capabilities()).query).toMatchObject({ maxCalls: 7, maxRounds: 16 })
       stub = new StubClient()
       algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
       limitsOk(stub)
-      expect('query' in (await algorand.simulate.limits())).toBe(false)
+      expect('query' in (await algorand.client.capabilities())).toBe(false)
     })
   })
 

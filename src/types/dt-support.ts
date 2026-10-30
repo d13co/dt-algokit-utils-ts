@@ -28,7 +28,7 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'pack-rounds',
   'validity-window',
   'simulate-protocol',
-  'simulate-limits',
+  'capabilities',
   'query',
   'versions-rounds',
   'versions-keys',
@@ -58,10 +58,10 @@ export interface AtRoundOptions {
    * Read the state as of the end of this round instead of the latest round.
    *
    * Needs dtalgod with time travel (`EnableTimeTravel`) and dtalgosdk. Any other node throws instead of returning the
-   * latest state: whether the node has time travel is read once per algod client, from its simulate limits.
+   * latest state: whether the node has time travel is read once per algod client, from its capabilities.
    */
   round?: Round
-  /** Aborts the read: passed to fetch, never to the shared, cached read of the node's simulate limits. */
+  /** Aborts the read: passed to fetch, never to the shared, cached read of the node's capabilities. */
   signal?: AbortSignal
 }
 
@@ -431,10 +431,26 @@ export const chunk = <T>(items: T[], size: number): T[][] => {
 }
 
 /**
- * The limits a node places on simulate requests, and the optional features it has, as dtalgod reports them
- * (`GET /v2/transactions/simulate/limits`). Every dtalgod node has that endpoint; stock algod, which doesn't, gets stock
- * algod's limits, with `reported` false.
+ * What a node can do, as dtalgod reports it (`GET /v2/capabilities`): the fork's optional features it has on, and what
+ * its simulate and query requests accept. Every dtalgod node has that endpoint; stock algod, which doesn't, gets stock
+ * algod's values, with `reported` false.
  */
+export interface Capabilities {
+  /** Whether the node reported these: true on dtalgod, false on stock algod, which gets stock algod's values. */
+  reported: boolean
+  /** Whether the node has time travel (`EnableTimeTravel`): reads at past rounds, versions, holders, and `round` and `rounds` back to genesis. False on stock algod. */
+  timeTravel: boolean
+  /** Whether requests may set `execTraceConfig` and the protocol `future` (`EnableDeveloperAPI`). False on stock algod. */
+  developerApi: boolean
+  /** The longest an expensive request (simulate, query, deltas, versions) may run, in seconds (from `RestWriteTimeoutSeconds`). 0: no limit. */
+  timeLimitSeconds: number
+  /** The limits of simulate requests. */
+  simulate: SimulateLimits
+  /** The limits of read-only queries (`POST /v2/query`): present only when the node has queries on (`MaxAPIQueryCalls` above 0). */
+  query?: QueryLimits
+}
+
+/** The limits a node places on simulate requests, as dtalgod reports them in its capabilities. */
 export interface SimulateLimits {
   /** The most transaction groups a request may hold (`MaxAPISimulateGroups`). 1 on stock algod. */
   maxTxnGroups: number
@@ -444,17 +460,9 @@ export interface SimulateLimits {
   maxExtraOpcodeBudget: number
   /** The factor on the consensus limits on unnamed resources with `allowUnnamedResources` (`SimulateResourceLimitMultiplier`). 1: the consensus limits. */
   resourceLimitMultiplier: number
-  /** Whether the node has time travel (`EnableTimeTravel`): reads at past rounds, versions, holders, and `round` and `rounds` back to genesis. False on stock algod. */
-  timeTravel: boolean
-  /** Whether requests may set `execTraceConfig` and the protocol `future` (`EnableDeveloperAPI`). False on stock algod. */
-  developerApi: boolean
-  /** Whether the node reported these limits: true on dtalgod, false on stock algod, which gets stock algod's limits. */
-  reported: boolean
-  /** The limits of read-only queries (`POST /v2/query`): present only when the node has queries on (`MaxAPIQueryCalls` above 0). */
-  query?: QueryLimits
 }
 
-/** The limits a node places on read-only queries (`POST /v2/query`), as dtalgod reports them in its simulate limits. */
+/** The limits a node places on read-only queries (`POST /v2/query`), as dtalgod reports them in its capabilities. */
 export interface QueryLimits {
   /** The most calls a request may hold (`MaxAPIQueryCalls`). */
   maxCalls: number
@@ -565,8 +573,8 @@ export interface DTAlgodLike {
   /** The holders of an asset at a round. */
   getAssetHolders(assetId: Round): AssetHoldersRequestLike
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
-  /** The node's simulate limits, cached per client; stock algod's after a 404. */
-  simulateLimits(): Promise<SimulateLimits>
+  /** The node's capabilities, cached per client; stock algod's after a 404. */
+  capabilities(): Promise<Capabilities>
   /** A read-only query (`POST /v2/query`). */
   query(request: QueryRequestParamsLike): RunQueryLike
 }
@@ -626,7 +634,7 @@ export function requireDTSdk(feature: string): DTSdk {
 
 /**
  * Returns a time-travel algod client that shares the connection (server, token, headers and HTTP client) of the given
- * algod client. The same client is returned for the same `algod`, so what it caches (the node's simulate limits) is kept.
+ * algod client. The same client is returned for the same `algod`, so what it caches (the node's capabilities) is kept.
  *
  * @param algod The algod client to share the connection of
  * @param feature The feature that needs the client, for the error message
@@ -637,26 +645,28 @@ export function toDTAlgod(algod: algosdk.Algodv2, feature = 'This feature'): DTA
 }
 
 /**
- * Returns the node's simulate limits, through dtalgosdk's cached `DTAlgodClient.simulateLimits()`: stock algod's limits
- * (`reported` false) on stock algod. Returns `undefined` when the loaded algosdk is not dtalgosdk, so the limits are unknown.
+ * Returns the node's capabilities, through dtalgosdk's cached `DTAlgodClient.capabilities()`: stock algod's values
+ * (`reported` false) on stock algod. Returns `undefined` when the loaded algosdk is not dtalgosdk, so they are unknown.
  * @param algod The algod client to ask
  * @throws The request's error, other than a 404
  */
-export async function getSimulateLimits(algod: algosdk.Algodv2): Promise<SimulateLimits | undefined> {
+export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilities | undefined> {
   const tt = getDTSdk()
   if (!tt) return undefined
   // A copy: the fork's object is shared by every caller of the client
-  const { maxTxnGroups, maxRounds, maxExtraOpcodeBudget, resourceLimitMultiplier, timeTravel, developerApi, reported, query } =
-    await tt.DTAlgodClient.from(algod).simulateLimits()
+  const { reported, timeTravel, developerApi, timeLimitSeconds, simulate, query } = await tt.DTAlgodClient.from(algod).capabilities()
   return {
-    maxTxnGroups,
-    maxRounds,
-    maxExtraOpcodeBudget,
-    resourceLimitMultiplier,
+    reported,
     timeTravel,
     developerApi,
-    reported,
-    // Only when present, so the limits of a node without queries have no `query` key
+    timeLimitSeconds,
+    simulate: {
+      maxTxnGroups: simulate.maxTxnGroups,
+      maxRounds: simulate.maxRounds,
+      maxExtraOpcodeBudget: simulate.maxExtraOpcodeBudget,
+      resourceLimitMultiplier: simulate.resourceLimitMultiplier,
+    },
+    // Only when present, so the capabilities of a node without queries have no `query` key
     ...(query
       ? {
           query: {
@@ -672,18 +682,18 @@ export async function getSimulateLimits(algod: algosdk.Algodv2): Promise<Simulat
 }
 
 /**
- * Returns the node's query limits (`query` of its simulate limits), or `undefined` when the node has no queries (stock
+ * Returns the node's query limits (`query` of its capabilities), or `undefined` when the node has no queries (stock
  * algod, or dtalgod with queries disabled) or the loaded algosdk is not dtalgosdk.
  * @param algod The algod client to ask
- * @throws The limits request's error, other than a 404
+ * @throws The capabilities request's error, other than a 404
  */
 export async function getQueryLimits(algod: algosdk.Algodv2): Promise<QueryLimits | undefined> {
-  return (await getSimulateLimits(algod))?.query
+  return (await getCapabilities(algod))?.query
 }
 
-/** The message of the error for a node without queries, from its simulate limits. */
-export const noQueryMessage = (limits: SimulateLimits | undefined): string =>
-  limits?.reported
+/** The message of the error for a node without queries, from its capabilities. */
+export const noQueryMessage = (capabilities: Capabilities | undefined): string =>
+  capabilities?.reported
     ? 'The node has queries disabled (MaxAPIQueryCalls is 0)'
     : 'Querying needs dtalgod, but the node is stock algod (it has no POST /v2/query)'
 
@@ -697,24 +707,24 @@ export function isDTUnsupportedError(error: unknown): boolean {
 }
 
 /**
- * Returns the node's simulate limits after checking that the node is dtalgod: the one check that tells dtalgod from
- * stock algod, read once per algod client.
+ * Returns the node's capabilities after checking that the node is dtalgod: the one check that tells dtalgod from stock
+ * algod, read once per algod client.
  *
  * @param algod The algod client to ask
  * @param feature The feature that needs dtalgod, for the error message
  * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
  * @throws DTUnsupportedError if the node is stock algod
  */
-export async function requireDTNode(algod: algosdk.Algodv2, feature: string): Promise<SimulateLimits> {
+export async function requireDTNode(algod: algosdk.Algodv2, feature: string): Promise<Capabilities> {
   const tt = requireDTSdk(feature)
-  const limits = (await getSimulateLimits(algod))!
-  if (!limits.reported) throw new tt.DTUnsupportedError(`${feature} needs dtalgod, but the node is stock algod`)
-  return limits
+  const capabilities = (await getCapabilities(algod))!
+  if (!capabilities.reported) throw new tt.DTUnsupportedError(`${feature} needs dtalgod, but the node is stock algod`)
+  return capabilities
 }
 
 /**
  * Returns a time-travel algod client after checking that the node has time travel (`supportsDT()`, read once per algod
- * client from its simulate limits). Every read at a round, `/versions` listing and holders listing goes through this
+ * client from its capabilities). Every read at a round, `/versions` listing and holders listing goes through this
  * check, since stock algod ignores `round` and answers with the latest state.
  *
  * @param algod The algod client to share the connection of
@@ -727,7 +737,7 @@ export async function requireTimeTravel(algod: algosdk.Algodv2, feature: string,
   const tt = requireDTSdk(feature)
   const client = tt.DTAlgodClient.from(algod)
   if (!(await client.supportsDT())) {
-    const { reported } = await client.simulateLimits()
+    const { reported } = await client.capabilities()
     const at = round === undefined ? '' : ` at round ${round}`
     throw new tt.DTUnsupportedError(
       `${feature}${at} needs dtalgod with time travel, but ${reported ? 'the node has time travel off (EnableTimeTravel)' : 'the node is stock algod'}`,

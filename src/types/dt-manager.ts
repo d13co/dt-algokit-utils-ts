@@ -417,7 +417,7 @@ const sortedRounds = (rounds: readonly Round[], order: VersionsOrder | undefined
  *
  * Needs dtalgosdk (the time-travel fork of algosdk); without it every method throws a `DTNotAvailableError`. A node
  * without time travel (stock algod, or dtalgod with `EnableTimeTravel` off) throws dtalgosdk's `DTUnsupportedError`
- * before any request is sent; whether the node has time travel is read once per algod client, from its simulate limits.
+ * before any request is sent; whether the node has time travel is read once per algod client, from its capabilities.
  *
  * To read state at a past round, pass `{ round }` to the usual reads (`algorand.app.getGlobalState(appId, { round })`,
  * `algorand.account.getInformation(address, { round })`, ...) or use `appClient.atRound(round)`.
@@ -439,7 +439,7 @@ export class DTManager {
 
   /**
    * Returns whether time travel can be used: the loaded algosdk is dtalgosdk and the node is dtalgod with time travel
-   * on (`EnableTimeTravel`). It is read from the node's simulate limits, asked for once per algod client.
+   * on (`EnableTimeTravel`). It is read from the node's capabilities, asked for once per algod client.
    * @returns Whether time travel is supported
    * @example
    * ```typescript

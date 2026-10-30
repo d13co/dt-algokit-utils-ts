@@ -45,12 +45,13 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     latest = (await algorand.client.algod.status().do()).lastRound
   })
 
-  test('reports its simulate limits', async () => {
-    const limits = await algorand.simulate.limits()
-    expect(limits.reported).toBe(true)
-    expect(limits.timeTravel).toBe(true)
-    expect(limits.maxTxnGroups).toBeGreaterThanOrEqual(1)
-    expect(limits.maxExtraOpcodeBudget).toBeGreaterThan(0)
+  test('reports its capabilities', async () => {
+    const capabilities = await algorand.client.capabilities()
+    expect(capabilities.reported).toBe(true)
+    expect(capabilities.timeTravel).toBe(true)
+    expect(capabilities.simulate.maxTxnGroups).toBeGreaterThanOrEqual(1)
+    expect(capabilities.simulate.maxExtraOpcodeBudget).toBeGreaterThan(0)
+    expect(await algorand.simulate.limits()).toEqual(capabilities.simulate)
   })
 
   test('supports time travel', async () => {
