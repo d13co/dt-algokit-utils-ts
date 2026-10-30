@@ -21,7 +21,7 @@
 
 The fork is additive: every new parameter is optional and every new feature lives in a new method or module, so existing code, types and generated typed clients work unchanged.
 
-- It runs on stock `algosdk` (`^3.5.2`). dtalgosdk (`3.9.0-dt.4.0.0.1` or later) is detected at runtime by its `DTAlgodClient.features`; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
+- It runs on stock `algosdk` (`^3.5.2`). dtalgosdk (`3.9.0-dt.4.1.0.0` or later) is detected at runtime by its `DTAlgodClient.features`; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
 - The node side targets the current dt-algorand release, dt4 (`v5.0.5-dt4`). Older dtalgod releases are not supported.
 - dtalgod is told from stock algod by one check: its capabilities (`GET /v2/capabilities`, `algorand.client.capabilities()`), which every dtalgod node serves and stock algod doesn't (it answers 404). They are read once per algod client and also say which optional features the node has on (time travel, queries, simulate `rounds`, the developer API) and the limits of its simulate and query requests.
@@ -369,7 +369,7 @@ DT_ALGOD_SERVER=https://mainnet-api-dt.d13.co npx vitest run --dir src src/types
 
 The node must run the current dt-algorand release (dt4) with time travel on. The query tests branch on whether the node has queries, and the holders test is skipped on a node without the holders index, since both are optional: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
 
-The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.4.0.0.1.tgz` (a dev dependency), so the repo's own build and tests use it.
+The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.4.1.0.0.tgz` (a dev dependency), so the repo's own build and tests use it.
 
 ## Building and publishing
 
@@ -394,7 +394,7 @@ One-time setup:
 3. Publish `dtalgosdk` at that version first, since the snippets point at it.
 4. Commit, then tag and push: `git tag v<version> && git push origin main v<version>`. The CD workflow publishes it.
 
-Versions follow the same scheme as `dtalgosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.0.0.1`.
+Versions follow the same scheme as `dtalgosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`.
 
 - `9.2.3`: the upstream algokit-utils version the code is built on (`v9.2.3-beta.2`). Bump it when merging a new upstream release.
 - `dt.4`: the dt-algorand release whose API this covers (tag `v5.0.5-dt4`). Older dt-algorand releases are not supported; only the features that are optional on that release are detected at runtime (see [Compatibility](#compatibility)). Keep it a separate identifier (`dt.4`, not `dt4`) so npm compares the number numerically.
