@@ -21,10 +21,22 @@
 
 The fork is additive: every new parameter is optional and every new feature lives in a new method or module, so existing code, types and generated typed clients work unchanged.
 
-- It runs on stock `algosdk` (`^3.5.2`). The fork of algosdk is detected at runtime; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
+- It runs on stock `algosdk` (`^3.5.2`). dtalgosdk (`3.9.0-dt.4.0.0.1` or later) is detected at runtime by its `DTAlgodClient.features`; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
-- Queries (`algorand.query`) need a `dtalgosdk` with the `query` feature (3.9.0-dt.2.0.1.0 or later); versions `rounds`, `includeKeys`, `key` / `prefix` and asset holders need 3.9.0-dt.3.0.0.1 or later (its `versions-rounds`, `versions-keys`, `versions-pages` and `holders` features). With an older one, `algorand.query.groups`/`rounds` use simulate and `run()` throws a `DTNotAvailableError`.
-- Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round` throw rather than return the latest state.
+- The node side targets the current dt-algorand release, dt4 (`v5.0.5-dt4`). Older dtalgod releases are not supported.
+- dtalgod is told from stock algod by one check: its simulate limits (`GET /v2/transactions/simulate/limits`), which every dtalgod node serves and stock algod doesn't. They are read once per algod client and also say which optional features the node has on (time travel, queries, simulate `rounds`, the developer API). Nothing else is guessed per request.
+- Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round`, `algorand.dt`, `algorand.simulate.groups` / `rounds` and `algorand.query` throw a `DTUnsupportedError` before sending anything, rather than return the latest state or a stock error.
+
+The node features that are optional on a current dtalgod, and how each shows up:
+
+| Feature                                                                | Node config                                | Without it                                                                                                     |
+| ---------------------------------------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Time travel: reads at a round, `algorand.dt`, simulate back to genesis | `EnableTimeTravel`                         | `DTUnsupportedError` before sending (`timeTravel` of the limits)                                               |
+| Asset holders                                                          | `TimeTravelHoldersIndex` (and time travel) | `DTUnsupportedError` from the node's answer; an index still being built is a 503 thrown at once                |
+| Queries                                                                | `MaxAPIQueryCalls` above 0                 | `algorand.query.run` throws `DTUnsupportedError`; `groups` / `rounds` simulate instead (`query` of the limits) |
+| Simulate `rounds` and the validity window modes                        | `MaxAPISimulateRounds` above 0             | `simulate.rounds` sends one request per round (`maxRounds` 0 in the limits)                                    |
+| Several groups per simulate request                                    | `MaxAPISimulateGroups` above 1             | parallel groups go one per request; sequential groups beyond `maxTxnGroups` throw                              |
+| Execution traces, protocol `future`                                    | `EnableDeveloperAPI`                       | throws before sending (`developerApi` of the limits)                                                           |
 
 ## Installing
 
@@ -44,7 +56,7 @@ npm ls algosdk @algorandfoundation/algokit-utils   # every entry should be the d
 pnpm why algosdk                                    # should list only dtalgosdk
 ```
 
-At runtime, `await algorand.client.supportsDT()` (or `algorand.dt.supported()`) is `true` only when the algosdk fork is loaded and the node has time travel.
+At runtime, `await algorand.client.supportsDT()` (or `algorand.dt.supported()`) is `true` only when dtalgosdk is loaded and the node is dtalgod with time travel on.
 
 ## API changes at a glance
 
@@ -158,8 +170,6 @@ const { versions } = await algorand.dt.getAppVersions(appId, { order: 'desc', li
 versions.map((v) => v.changedKeys?.map((k) => Buffer.from(k).toString()))
 ```
 
-`rounds` and `includeKeys` need a dtalgod newer than `v5.0.4-dt3` and dtalgosdk 3.9.0-dt.3.0.0.1 or later (its `versions-rounds` / `versions-keys` features; an older one throws `DTNotAvailableError`). On a dt3 node, `rounds` is detected as ignored and `includeKeys` rejected, both thrown as `DTUnsupportedError`.
-
 ### Key and prefix filters
 
 `key` on `get/iterateAppVersions` (a global state key) and `get/iterateAccountAppVersions` (a local state key) lists only the versions at which that key changed, each with `keyValue`, the key's decoded value after it (as in `AppState`; undefined when it was removed). `prefix` on `get/iterateBoxesVersions` lists only the changes of the boxes whose names start with it, such as one ARC-56 box map. Strings are UTF-8; both are at most 64 bytes.
@@ -178,7 +188,7 @@ for await (const { round, boxes } of algorand.dt.iterateBoxesVersions(registryAp
 - With `key` on the account endpoint, entries hold only the local state, never the created app's params.
 - Pages can be short or empty and still have a `nextToken`: the node examines a bounded number of versions (key) or box index entries (prefix) per page. Keep paging until `nextToken` is absent; the iterators do.
 
-`key` and `prefix` go to the node as its `key` / `prefix` parameters, like any other versions parameter: there is no probe and no client-side emulation. They need dtalgosdk 3.9.0-dt.3.0.0.1 or later, checked by its `versions-pages` feature (an older fork throws `DTNotAvailableError` before sending).
+`key` and `prefix` go to the node as its `key` / `prefix` parameters, like any other versions parameter: there is no probe and no client-side emulation.
 
 Recommended follow-up: ARC-56 state history helpers on `AppClient.state.*` (a global or local key's versions, a box map's changes, decoded with the app spec), built on these `key` / `prefix` listings.
 
@@ -208,7 +218,7 @@ const next = await algorand.dt.getAssetHolders(assetId, { round: first.round, ne
 - `limit`: default 1,000, at most 10,000. Pages can be short or empty and still have a `nextToken`.
 - A page with `next` must pass the first page's `round` too (an `Error` otherwise), so every page lists the same round.
 - `signal` aborts, as for the versions iterators.
-- Needs a dtalgod (`v5.0.4-dt3` or later) with the holders index (`TimeTravelHoldersIndex`), and dtalgosdk's `holders` feature (an older fork throws `DTNotAvailableError`). A node without the endpoint or the index throws `DTUnsupportedError`; an asset that doesn't exist at the round is the node's 404; an index still being built is a 503 thrown at once.
+- Needs dtalgod with time travel and the holders index (`TimeTravelHoldersIndex`). Stock algod and a dtalgod with time travel off throw `DTUnsupportedError` before sending; a dtalgod without the index rejects the request, also thrown as `DTUnsupportedError`. An asset that doesn't exist at the round is the node's 404; an index still being built is a 503 thrown at once.
 - There is no indexer fallback: an indexer can't list balances at a past round.
 
 ## Extended simulate
@@ -234,9 +244,9 @@ Each outcome is `{ ok: true, result }`, with the same result shape as `composer.
 
 ### Node limits
 
-`simulate.groups` and `simulate.rounds` keep to the node's simulate limits, which dtalgod reports (`GET /v2/transactions/simulate/limits`) and `algorand.simulate.limits()` returns. They are asked for once per algod client. Requests hold at most `maxTxnGroups` groups and `maxRounds` rounds, and an `extraOpcodeBudget` above `maxExtraOpcodeBudget` throws, as do `protocol: 'future'` and `execTraceConfig` when the node reports the developer API off (a node that doesn't report its limits checks these itself). Readonly `AppClient` calls use the node's full `maxExtraOpcodeBudget` (320,000 on a node that doesn't report it).
+`simulate.groups` and `simulate.rounds` keep to the node's simulate limits, which dtalgod reports (`GET /v2/transactions/simulate/limits`) and `algorand.simulate.limits()` returns. They are asked for once per algod client. Requests hold at most `maxTxnGroups` groups and `maxRounds` rounds, and an `extraOpcodeBudget` above `maxExtraOpcodeBudget` throws, as do `protocol: 'future'` and `execTraceConfig` when the node reports the developer API off. Readonly `AppClient` calls use the node's full `maxExtraOpcodeBudget` (stock algod's 320,000 on stock algod).
 
-A node without the limits endpoint (stock algod, or a dtalgod built before it) gets stock algod's limits, with `reported: false`. Each request then holds one group (sequential groups beyond one throw; `parallel` groups get one request each), and `simulate.rounds` sends one request per round with `round` set instead of `rounds`. On an older dtalgod, pass `maxGroups` and `maxRounds` (its defaults are 16) to use its extended simulate.
+Stock algod has no limits endpoint: `algorand.simulate.limits()` then returns stock algod's limits with `reported: false`, and `simulate.groups` and `simulate.rounds` throw a `DTUnsupportedError` before sending anything. On a dtalgod with `rounds` disabled (`maxRounds` 0), `simulate.rounds` sends one request per round with `round` set instead of `rounds`. `maxGroups` and `maxRounds` can lower the node's limits for smaller requests; above them, the node rejects the request.
 
 `simulate.groups` and `simulate.rounds` send at most `concurrency` requests at once (default 4), across the windows of `rounds` and the requests parallel groups are split into; after a request fails, the ones not yet sent aren't. `algorand.query.groups` / `rounds` pass their `concurrency` to the simulate fallback too.
 
@@ -244,7 +254,7 @@ Recommended, not done: a simulate request that runs over the node's time limit (
 
 ### Rounds far apart, under a later protocol
 
-A transaction is valid for at most 1,000 rounds, so `simulate.rounds` normally puts rounds more than 1,000 apart in separate requests. With `validityWindow: 'rewrite'`, the node moves each transaction's validity window to every simulated round (dropping its signature), and with `'skip'` it evaluates the transactions as built outside their window; either way rounds of any span share a request. `protocol` (on `groups` and `rounds`) simulates under a later consensus protocol (`v24` to `v42`, `latest`, `future` on a node with the developer API, or a version string), as if an upgrade took effect right after the round, and each outcome's `protocolOverride` says how it applied:
+A transaction is valid for at most 1,000 rounds, so `simulate.rounds` normally puts rounds more than 1,000 apart in separate requests. With `validityWindow: 'rewrite'`, the node moves each transaction's validity window to every simulated round (dropping its signature), and with `'skip'` it evaluates the transactions as built outside their window; either way rounds of any span share a request. `protocol` (on `groups` and `rounds`) simulates under a later consensus protocol (`v24` to `v43`, `latest`, `future` on a node with the developer API, or a version string), as if an upgrade took effect right after the round, and each outcome's `protocolOverride` says how it applied:
 
 ```typescript
 for (const { round, protocolOverride, groups } of await algorand.simulate.rounds(composer, [20_000_000n, 45_000_000n], {
@@ -256,7 +266,7 @@ for (const { round, protocolOverride, groups } of await algorand.simulate.rounds
 }
 ```
 
-With `'rewrite'` the transaction IDs change, so the results' `txIds` are those as built; transactions that differ only by their validity window need distinct notes, or the later one fails as a duplicate. These options need a dtalgod with these features and an algosdk fork that has them (every `dtalgosdk` release does; on an older build of the fork without the `simulate-limits` feature, the defaults of 16 groups and 16 rounds apply); an older fork throws a `DTNotAvailableError`, an older node a `DTUnsupportedError`.
+With `'rewrite'` the transaction IDs change, so the results' `txIds` are those as built; transactions that differ only by their validity window need distinct notes, or the later one fails as a duplicate. The validity window modes need `rounds`: on a node with `rounds` disabled, `simulate.rounds` builds the transactions valid at each round instead and sends no mode.
 
 ## Queries
 
@@ -306,7 +316,7 @@ Each outcome is `{ ok: true, txns, returns }` (each transaction's `logs` and `co
 
 **The contract**: with query, every app call runs alone, against the round's state: the calls of one group don't see each other (no shared budget pool, `global GroupSize` 1, no `gtxn`), and the composers' fees, validity, notes and leases are ignored. With the simulate fallback, the groups run as composed, each on its own (`parallel: true`). So use these for independent read-only calls, such as ghost calls.
 
-`via` picks the path: `auto` (the default) queries when it can and simulates otherwise; `query` throws when it can't (a `DTNotAvailableError` for an older fork, a `DTUnsupportedError` for a node without queries, an `Error` naming the reason otherwise); `simulate` always simulates. Query is used when the fork has the `query` feature and the node reports query limits, `execTraceConfig` is off, `allowMoreLogging` is off or the node's `maxCallLogBytes` is at least simulate's 65,536, an `extraOpcodeBudget` plus 700 per transaction fits the node's `maxCallBudget` for every group, and every transaction is a NoOp app call that creates an app (with an approval program) or calls one (without programs), without an access list or `rejectVersion`, and no method call has transaction arguments. The options are checked the same way on both paths. A node without queries met mid-way (a load balancer mixing nodes) falls back to simulate with `auto`.
+`via` picks the path: `auto` (the default) queries when it can and simulates otherwise; `query` throws when it can't (a `DTUnsupportedError` for a node with queries disabled, an `Error` naming the reason otherwise); `simulate` always simulates. Both paths need dtalgosdk and dtalgod: without them they throw a `DTNotAvailableError` or a `DTUnsupportedError` before sending anything. Query is used when the node reports query limits, `execTraceConfig` is off, `allowMoreLogging` is off or the node's `maxCallLogBytes` is at least simulate's 65,536, an `extraOpcodeBudget` plus 700 per transaction fits the node's `maxCallBudget` for every group, and every transaction is a NoOp app call that creates an app (with an approval program) or calls one (without programs), without an access list or `rejectVersion`, and no method call has transaction arguments. The options are checked the same way on both paths. A node with queries disabled met mid-way (a load balancer mixing nodes with different settings) falls back to simulate with `auto`.
 
 |                                              | Query path                                                                                                     | Simulate path                                                |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
@@ -322,15 +332,15 @@ Each outcome is `{ ok: true, txns, returns }` (each transaction's `logs` and `co
 
 ### Limits, splitting and retries
 
-`algorand.query.limits()` returns the node's query limits (`maxCalls`, `maxRounds`, `maxCallBudget`, `maxCallLogBytes`, `maxResponseBytes`), or `undefined` on a node without queries; `algorand.query.supported()` says whether queries can be used. They come with the simulate limits, asked for once per algod client (`algorand.simulate.limits().query`).
+`algorand.query.limits()` returns the node's query limits (`maxCalls`, `maxRounds`, `maxCallBudget`, `maxCallLogBytes`, `maxResponseBytes`), or `undefined` on a node without queries (stock algod, or dtalgod with queries disabled); `algorand.query.supported()` says whether queries can be used. They come with the simulate limits, asked for once per algod client (`algorand.simulate.limits().query`).
 
 Requests hold at most `maxCalls` calls and `maxRounds` rounds (lower them with the `maxCalls` / `maxRounds` options of `run`, or `maxRounds` of `rounds`), and are split so their body stays under the node's 1,000,000 bytes. They are sent `concurrency` at a time (default 4). Duplicate rounds are queried once. When the latest round (0) is queried in more than one request, it is looked up first so every call sees the same block. A request whose results are over `maxResponseBytes`, or that runs over the node's time limit (504), is split in halves (rounds first, then calls) and sent again; a call that is still too large or too slow alone fails on its own (`kind: 'call'` with `run`, `kind: 'group'` with `groups`/`rounds`). Any other error cancels the requests in flight (and the node's work on them) and is thrown; a round after the latest one fails the whole request.
 
-A busy node answers 503 ("the node is busy") with `Retry-After`: the clients that `AlgorandClient.fromConfig` / `fromEnvironment` / `mainNet()` etc. make (`AlgoHttpClientWithRetry`) retry it, waiting at least as long as the header says (up to 10 s). Browsers can't read the header cross-origin (algod's CORS exposes no headers), so a busy 503 without a readable one waits at least 1 s before the first retry instead of retrying at once. A 503 for history the node can't serve (an incomplete box or holders index, or a time-travel history that isn't served) is thrown at once: it lasts until the node is fixed. They don't retry a 504 (the node's time limit) from `POST /v2/query`, which `QueryManager` splits instead, or from a `GET` of a `/versions` or `/holders` listing, where a retry would repeat the whole work: narrow the range instead. Simulate still retries a 504, as upstream does; a caller that splits simulate requests on a 504 may prefer a client without retries. An `Algodv2` passed to `fromClients` has no retries.
+A busy node answers 503 ("the node is busy", or "every slot for re-evaluating old rounds is in use" for old deltas) with `Retry-After`: the clients that `AlgorandClient.fromConfig` / `fromEnvironment` / `mainNet()` etc. make (`AlgoHttpClientWithRetry`) retry it, waiting at least as long as the header says (up to 10 s). dtalgod exposes the header to cross-origin scripts, but a proxy may drop it, so a busy 503 without a readable one waits at least 1 s before the first retry instead of retrying at once. A 503 for history the node can't serve (an incomplete box or holders index, or a time-travel history that isn't served) is thrown at once: it lasts until the node is fixed. They don't retry a 504 (the node's time limit) from `POST /v2/query`, which `QueryManager` splits instead, or from a `GET` of a `/versions` or `/holders` listing, where a retry would repeat the whole work: narrow the range instead. Simulate still retries a 504, as upstream does; a caller that splits simulate requests on a 504 may prefer a client without retries. An `Algodv2` passed to `fromClients` has no retries.
 
 ## Aborting requests
 
-`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages and iterators, `algorand.simulate.groups`/`rounds` and `algorand.query.run`/`groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). Aborting a query cancels all its requests in flight, and the node stops working on them. The node's support probe and simulate limits are cached per client and shared, so they are read without the signal.
+`algorand.app` reads (except `getBoxValue(s)FromABIType`), `algorand.dt` version pages and iterators, `algorand.simulate.groups`/`rounds` and `algorand.query.run`/`groups`/`rounds` take an optional `signal` (an `AbortSignal`), passed to fetch. An aborted request is never retried, and a retry backoff in progress ends as soon as the signal aborts. `composer.simulate({ signal })` checks the signal before and after the request (algosdk's composer can't pass it to fetch). Aborting a query cancels all its requests in flight, and the node stops working on them. The node's simulate limits, which also say whether it has time travel and queries, are cached per client and shared, so they are read without the signal.
 
 ```typescript
 const controller = new AbortController()
@@ -342,11 +352,11 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 
 | Error                                          | Meaning                                                                                                                          |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `DTNotAvailableError`                          | The loaded algosdk isn't the fork, or is an older fork without a feature an option needs (the message lists them)                |
-| `isDTUnsupportedError(e)`                      | The node doesn't support the request: a stock algod, an older dtalgod, or a round it can't serve                                 |
+| `DTNotAvailableError`                          | The loaded algosdk isn't dtalgosdk (it lacks a `DTAlgodClient.features` entry algokit-utils uses)                                |
+| `isDTUnsupportedError(e)`                      | The node doesn't support the request: stock algod, a dtalgod with the feature off, or a round it can't serve                     |
 | `QueryCallError`                               | A call of `algorand.query.run` at a round failed (`kind: 'call'`) or its round did (`kind: 'round'`); in the outcome, not thrown |
 | `QueryGroupError`                              | A group of `algorand.query.groups`/`rounds` failed, on either path (`kind` as simulate's); in the outcome, not thrown            |
-| `DTUnsupportedError` from `algorand.query.run` | The node has no queries (stock algod, an older dtalgod, or queries disabled)                                                     |
+| `DTUnsupportedError` from `algorand.query.run` | The node has no queries (stock algod, or dtalgod with queries disabled)                                                          |
 
 ## Tests
 
@@ -356,9 +366,9 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts
 ```
 
-The query tests branch on whether the node has queries: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
+The node must run the current dt-algorand release (dt4) with time travel on. The query tests branch on whether the node has queries, and the holders test is skipped on a node without the holders index, since both are optional: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
 
-The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.3.0.0.1.tgz` (a dev dependency), so the repo's own build and tests use it.
+The algosdk fork is vendored as `vendor/dtalgosdk-3.9.0-dt.4.0.0.1.tgz` (a dev dependency), so the repo's own build and tests use it.
 
 ## Building and publishing
 
@@ -379,14 +389,14 @@ One-time setup:
 ### Releasing
 
 1. Choose the version (see below) and set it with `npm version <version> --no-git-tag-version`, which updates `package.json` and `package-lock.json`.
-2. Update the version in the README's install snippets. If `dtalgosdk` moved to a new base version (say `3.9.1-dt.…`), update its snippets too and add `|| ^<base>-dt.0` to the `algosdk` peer range in `package.json`: a prerelease only matches a range naming the same `x.y.z`.
+2. Update the version in the README's install snippets, and `dtalgosdk`'s too. Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dtalgosdk version>` with the oldest dtalgosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
 3. Publish `dtalgosdk` at that version first, since the snippets point at it.
 4. Commit, then tag and push: `git tag v<version> && git push origin main v<version>`. The CD workflow publishes it.
 
-Versions follow the same scheme as `dtalgosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.2.0.0.1`.
+Versions follow the same scheme as `dtalgosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.0.0.1`.
 
 - `9.2.3`: the upstream algokit-utils version the code is built on (`v9.2.3-beta.2`). Bump it when merging a new upstream release.
-- `dt.2`: the dt-algorand release whose API this covers (tag `v5.0.4-dt2`). It means "covers up to", not "requires": missing node features are detected at runtime. Keep it a separate identifier (`dt.2`, not `dt2`) so npm compares the number numerically.
+- `dt.4`: the dt-algorand release whose API this covers (tag `v5.0.5-dt4`). Older dt-algorand releases are not supported; only the features that are optional on that release are detected at runtime (see [Compatibility](#compatibility)). Keep it a separate identifier (`dt.4`, not `dt4`) so npm compares the number numerically.
 - `0.0.1`: this package's own release, semver-style (a major bump for breaking changes). Reset to `0.0.1` whenever the base or the dt number changes.
 
 These are prereleases, so `^` ranges don't match them; consumers pin exact versions in their overrides. `publishConfig.tag` is `latest`, so each publish becomes the default install.

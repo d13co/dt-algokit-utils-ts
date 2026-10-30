@@ -20,19 +20,19 @@ See **[the full list of differences](./docs/dt-fork.md)** for every changed meth
 
 ## Installing the fork
 
-The new features also need `dtalgosdk`, the matching fork of algosdk. Install both under their upstream names and override them across your whole dependency tree, so your code, generated typed clients and other libraries (e.g. algokit-subscriber) all load the same copy. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`.
+The new features also need `dtalgosdk`, the matching fork of algosdk, and a node on the current dt-algorand release (dt4, `v5.0.5-dt4`); older dtalgod releases are not supported. Install both under their upstream names and override them across your whole dependency tree, so your code, generated typed clients and other libraries (e.g. algokit-subscriber) all load the same copy. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`.
 
 npm (`package.json`; each override must equal the dependency spec):
 
 ```json
 {
   "dependencies": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.3.0.0.1",
-    "algosdk": "npm:dtalgosdk@3.9.0-dt.3.0.0.1"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.4.0.0.1",
+    "algosdk": "npm:dtalgosdk@3.9.0-dt.4.0.0.1"
   },
   "overrides": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.3.0.0.1",
-    "algosdk": "npm:dtalgosdk@3.9.0-dt.3.0.0.1"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.4.0.0.1",
+    "algosdk": "npm:dtalgosdk@3.9.0-dt.4.0.0.1"
   }
 }
 ```
@@ -41,8 +41,8 @@ pnpm (`pnpm-workspace.yaml`, or `pnpm.overrides` in `package.json`), with the sa
 
 ```yaml
 overrides:
-  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.3.0.0.1
-  algosdk: npm:dtalgosdk@3.9.0-dt.3.0.0.1
+  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.4.0.0.1
+  algosdk: npm:dtalgosdk@3.9.0-dt.4.0.0.1
 ```
 
 yarn: the same entries under `resolutions` in `package.json` (yarn ignores `overrides`). Yarn 4 refuses versions published less than a day ago (`npmMinimalAgeGate`); to install a new release right away, add `npmPreapprovedPackages: ["@d13co/dt-algokit-utils", "dtalgosdk"]` to `.yarnrc.yml`. bun: the same entries under `overrides`.

@@ -16,18 +16,27 @@ type Call = { method: 'get' | 'post'; path: string; query: Record<string, string
 type Answer = { status: number; json?: unknown; body?: Uint8Array }
 type Route = { method: 'get' | 'post'; path: string | RegExp; answer: (call: Call) => Answer | Promise<Answer> }
 
-/** A BaseHTTPClient that answers from routes, in the order they were added; a route answers once unless `repeat`. */
+const LIMITS_PATH = '/v2/transactions/simulate/limits'
+
+/**
+ * A BaseHTTPClient that answers from routes, in the order they were added; a route answers once unless `repeat`. The
+ * node's simulate limits, which are cached per client, have one route at a time (the last one set), and their requests
+ * are kept apart from the others in `limitsCalls`.
+ */
 class StubClient implements algosdk.BaseHTTPClient {
   calls: Call[] = []
+  limitsCalls: Call[] = []
   private routes: (Route & { repeat: boolean })[] = []
 
   on(method: 'get' | 'post', path: string | RegExp, answer: (call: Call) => Answer | Promise<Answer>, repeat = false) {
+    // A lasting answer of the limits replaces the earlier lasting one, such as the default
+    if (path === LIMITS_PATH) this.routes = this.routes.filter((r) => r.path !== LIMITS_PATH || !r.repeat)
     this.routes.push({ method, path, answer, repeat })
     return this
   }
 
   private async answer(call: Call): Promise<algosdk.BaseHTTPClientResponse> {
-    this.calls.push(call)
+    ;(call.path === LIMITS_PATH ? this.limitsCalls : this.calls).push(call)
     const i = this.routes.findIndex(
       (r) => r.method === call.method && (typeof r.path === 'string' ? r.path === call.path : r.path.test(call.path)),
     )
@@ -116,30 +125,27 @@ const nodeStatus = json({
   'time-since-last-round': 0,
 })
 
-/** Answers the time travel probe (`supportsDT`) as a time-travel node. */
-const probeOk = (stub: StubClient) => stub.on('get', '/v2/applications/0/box/versions', json({ round: LAST_ROUND, versions: [] }), true)
-
-/** dtalgod's default simulate limits, as its limits endpoint answers them. */
+/** dtalgod's default simulate limits with time travel on and queries off, as its limits endpoint answers them. */
 const LIMITS = {
   'max-txn-groups': 16,
   'max-rounds': 16,
   'max-extra-opcode-budget': 320_000,
   'resource-limit-multiplier': 1,
+  'time-limit-seconds': 0,
   'time-travel': true,
   'developer-api': false,
 }
 
-/** Answers the simulate limits endpoint as dtalgod with these limits. */
+/** Answers the simulate limits endpoint as dtalgod with these limits, replacing any earlier answer. */
 const limitsOk = (stub: StubClient, limits: Partial<typeof LIMITS> = {}) =>
-  stub.on('get', '/v2/transactions/simulate/limits', json({ ...LIMITS, ...limits }), true)
+  stub.on('get', LIMITS_PATH, json({ ...LIMITS, ...limits }), true)
 
-/** Answers the simulate limits endpoint with a 404, as stock algod or an older dtalgod. */
-const limits404 = (stub: StubClient) =>
-  stub.on('get', '/v2/transactions/simulate/limits', () => ({ status: 404, json: { message: 'Not Found' } }), true)
+/** Answers the simulate limits endpoint with a 404, as stock algod, replacing any earlier answer. */
+const stockAlgod = (stub: StubClient) => stub.on('get', LIMITS_PATH, () => ({ status: 404, json: { message: 'Not Found' } }), true)
 
-const limitsCalls = (stub: StubClient) => stub.calls.filter((c) => c.path === '/v2/transactions/simulate/limits')
+const limitsCalls = (stub: StubClient) => stub.limitsCalls
 
-/** Runs `run` with the fork's `DTAlgodClient.features` lacking `without`, as an older version of the fork. */
+/** Runs `run` with dtalgosdk's `DTAlgodClient.features` lacking `without`, which makes it count as stock algosdk. */
 const withoutFeatures = async (without: string[], run: () => Promise<void>) => {
   const DT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
   const features = DT.features
@@ -254,6 +260,8 @@ describe('time travel', () => {
 
   beforeEach(() => {
     stub = new StubClient()
+    // dtalgod with time travel, unless a test answers the limits otherwise
+    limitsOk(stub)
     algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
   })
 
@@ -279,12 +287,6 @@ describe('time travel', () => {
       expect(info.balance.microAlgo).toBe(5n)
     })
 
-    test('a node that answers for another round throws instead of returning the latest state', async () => {
-      stub.on('get', `/v2/accounts/${address}`, json(accountJson(address, LAST_ROUND)))
-      const error = await algorand.account.getInformation(address, { round: 1234 }).catch((e) => e)
-      expect(isDTUnsupportedError(error)).toBe(true)
-    })
-
     test('asset holding at a round', async () => {
       stub.on(
         'get',
@@ -296,19 +298,16 @@ describe('time travel', () => {
       expect(holding).toMatchObject({ balance: 42n, round: 99n })
     })
 
-    test('global state at a round checks the node supports time travel first', async () => {
-      probeOk(stub).on('get', '/v2/applications/123', json(appJson(123, address, 5)))
+    test('global state at a round, after reading once per client whether the node has time travel', async () => {
+      stub.on('get', '/v2/applications/123', json(appJson(123, address, 5)), true)
       const state = await algorand.app.getGlobalState(123n, { round: 1000n })
       expect(state.int1.value).toBe(5n)
-      expect(stub.calls.map((c) => c.path)).toEqual(['/v2/applications/0/box/versions', '/v2/applications/123'])
-      expect(stub.calls[1].query.round).toBe('1000')
-    })
-
-    test('global state at a round on a node without time travel throws', async () => {
-      stub.on('get', '/v2/applications/0/box/versions', () => ({ status: 404, json: { message: 'Not Found' } }))
-      const error = await algorand.app.getGlobalState(123n, { round: 1000n }).catch((e) => e)
-      expect(isDTUnsupportedError(error)).toBe(true)
-      expect(stub.calls).toHaveLength(1)
+      await algorand.app.getGlobalState(123n, { round: 1001n })
+      expect(stub.calls.map((c) => [c.path, c.query.round])).toEqual([
+        ['/v2/applications/123', '1000'],
+        ['/v2/applications/123', '1001'],
+      ])
+      expect(limitsCalls(stub)).toHaveLength(1)
     })
 
     test('box names at a round follow the pages', async () => {
@@ -354,6 +353,59 @@ describe('time travel', () => {
       } finally {
         Object.defineProperty(TT, 'features', { value: features, configurable: true, writable: true })
       }
+    })
+  })
+
+  describe('nodes without time travel', () => {
+    const readsAtRound = () => [
+      () => algorand.account.getInformation(address, { round: 1000 }),
+      () => algorand.asset.getById(77n, { round: 1000 }),
+      () => algorand.asset.getAccountInformation(address, 77n, { round: 1000 }),
+      () => algorand.app.getById(123n, { round: 1000 }),
+      () => algorand.app.getGlobalState(123n, { round: 1000 }),
+      () => algorand.app.getLocalState(123n, address, { round: 1000 }),
+      () => algorand.app.getBoxNames(123n, { round: 1000 }),
+      () => algorand.app.getBoxValue(123n, 'a', { round: 1000 }),
+      () => algorand.app.getBoxes(123n, { round: 1000 }),
+      () => algorand.dt.getAppVersions(123n),
+      async () => {
+        for await (const v of algorand.dt.iterateAssetVersions(77n)) return v
+      },
+      () => algorand.dt.getAssetHolders(77n),
+      async () => {
+        for await (const h of algorand.dt.iterateAssetHolders(77n)) return h
+      },
+    ]
+
+    test('on stock algod, reads at a round, versions and holders throw before sending anything', async () => {
+      stockAlgod(stub)
+      for (const read of readsAtRound()) {
+        const error = await read().catch((e) => e)
+        expect(isDTUnsupportedError(error)).toBe(true)
+        expect(error.message).toMatch(/needs dtalgod with time travel, but the node is stock algod/)
+      }
+      expect(stub.calls).toHaveLength(0)
+      expect(limitsCalls(stub)).toHaveLength(1)
+      expect(await algorand.dt.supported()).toBe(false)
+    })
+
+    test('on dtalgod with time travel off, reads at a round, versions and holders throw before sending anything', async () => {
+      limitsOk(stub, { 'time-travel': false })
+      for (const read of readsAtRound()) {
+        const error = await read().catch((e) => e)
+        expect(isDTUnsupportedError(error)).toBe(true)
+        expect(error.message).toMatch(/the node has time travel off \(EnableTimeTravel\)/)
+      }
+      const error = await algorand.app.getGlobalState(123n, { round: 1000n }).catch((e) => e)
+      expect(error.requestedRound).toBe(1000n)
+      expect(stub.calls).toHaveLength(0)
+      expect(await algorand.dt.supported()).toBe(false)
+    })
+
+    test('reads without a round still work on stock algod, without asking for the limits', async () => {
+      stockAlgod(stub).on('get', `/v2/accounts/${address}`, json(accountJson(address, LAST_ROUND)))
+      expect((await algorand.account.getInformation(address)).validAsOfRound).toBe(BigInt(LAST_ROUND))
+      expect(limitsCalls(stub)).toHaveLength(0)
     })
   })
 
@@ -576,14 +628,6 @@ describe('time travel', () => {
         expect(stub.calls).toHaveLength(0)
       })
 
-      test('an older fork without versions-rounds or versions-keys throws DTNotAvailableError', async () => {
-        await withoutFeatures(['versions-rounds', 'versions-keys'], async () => {
-          await expect(algorand.dt.getAssetVersions(9n, { rounds: [5] })).rejects.toThrow(DTNotAvailableError)
-          await expect(algorand.dt.getAppVersions(9n, { includeKeys: true })).rejects.toThrow(/versions-keys/)
-        })
-        expect(stub.calls).toHaveLength(0)
-      })
-
       test('changedRound on every type, account sub-objects included', async () => {
         stub
           .on(
@@ -741,27 +785,11 @@ describe('time travel', () => {
         expect(stub.calls[2].query.prefix).toBeUndefined()
       })
 
-      test('checks before sending: 64 bytes at most, no key with rounds, a fork with versions-pages', async () => {
+      test('checks before sending: 64 bytes at most, no key with rounds', async () => {
         await expect(algorand.dt.getAppVersions(5n, { key: new Uint8Array(65) })).rejects.toThrow(/65 bytes/)
         await expect(algorand.dt.iterateBoxesVersions(5n, { prefix: 'x'.repeat(65) }).next()).rejects.toThrow(/65 bytes/)
         await expect(algorand.dt.getAppVersions(5n, { key: 'k', rounds: [5] })).rejects.toThrow(/key cannot be combined with rounds/)
-        await withoutFeatures(['versions-pages'], async () => {
-          await expect(algorand.dt.getAppVersions(5n, { key: 'k' })).rejects.toThrow(DTNotAvailableError)
-          await expect(algorand.dt.getBoxesVersions(5n, { prefix: 'p' })).rejects.toThrow(/versions-pages/)
-        })
         expect(stub.calls).toHaveLength(0)
-        // dtalgosdk 3.9.0-dt.3.0.0.1 as released lists no versions-filters feature: key and prefix don't need one
-        stub
-          .on('get', '/v2/applications/5/versions', json({ round: 9, versions: [] }))
-          .on('get', '/v2/applications/5/boxes/versions', json({ round: 9, versions: [] }))
-        await withoutFeatures(['versions-filters'], async () => {
-          await algorand.dt.getAppVersions(5n, { key: 'k' })
-          await algorand.dt.getBoxesVersions(5n, { prefix: 'p' })
-        })
-        expect(stub.calls.map((c) => [c.query.key, c.query.prefix])).toEqual([
-          ['b64:aw==', undefined],
-          [undefined, 'b64:cA=='],
-        ])
       })
     })
   })
@@ -852,7 +880,6 @@ describe('time travel', () => {
       stub.calls = []
       stub.on('get', '/v2/applications/123/boxes', listing([[new Uint8Array([1, 2, 3, 4]), abiString('x')]], 1000))
       const state = new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand, defaultSender: address }).atRound(1000)
-      probeOk(stub)
       expect([...(await state.state.box.getMap('box')).entries()]).toEqual([[new Uint8Array([1, 2, 3, 4]), 'x']])
       const listed = stub.calls.find((c) => c.path === '/v2/applications/123/boxes')!
       expect(listed.query.prefix).toBeUndefined()
@@ -900,11 +927,12 @@ describe('time travel', () => {
       expect(stub.calls.every((c) => c.options?.signal === controller.signal)).toBe(true)
     })
 
-    test('an older fork without holders throws DTNotAvailableError', async () => {
-      await withoutFeatures(['holders'], async () => {
-        await expect(algorand.dt.getAssetHolders(9n)).rejects.toThrow(DTNotAvailableError)
-        await expect(algorand.dt.iterateAssetHolders(9n).next()).rejects.toThrow(/holders/)
-      })
+    test('a dtalgod without the holders index rejects the request with a DTUnsupportedError', async () => {
+      stub.on('get', '/v2/assets/9/holders', () => ({
+        status: 400,
+        json: { message: 'asset holders require EnableTimeTravel and TimeTravelHoldersIndex' },
+      }))
+      expect(isDTUnsupportedError(await algorand.dt.getAssetHolders(9n).catch((e) => e))).toBe(true)
     })
   })
 
@@ -912,7 +940,7 @@ describe('time travel', () => {
     const appClient = () => new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand, defaultSender: address })
 
     test('state reads use the pinned round', async () => {
-      probeOk(stub).on('get', '/v2/applications/123', json(appJson(123, address, 8)))
+      stub.on('get', '/v2/applications/123', json(appJson(123, address, 8)))
       const past = appClient().atRound(1000)
       expect(past.round).toBe(1000n)
       expect(await past.state.global.getValue('int1')).toBe(8n)
@@ -976,7 +1004,7 @@ describe('time travel', () => {
     })
 
     test('readonly calls use the stock budget without a limits endpoint, or when it fails', async () => {
-      limits404(stub)
+      stockAlgod(stub)
         .on('get', '/v2/transactions/params', suggestedParams, true)
         .on(
           'post',
@@ -1293,24 +1321,6 @@ describe('time travel', () => {
       expect(outcomes[1].groups[0]).toMatchObject({ ok: false, error: { kind: 'round' } })
     })
 
-    test('protocol and validity window modes need a fork version with those features', async () => {
-      const DT = algosdk.DTAlgodClient as unknown as { features: readonly string[] }
-      const features = DT.features
-      Object.defineProperty(DT, 'features', {
-        value: features.filter((f) => f !== 'validity-window' && f !== 'simulate-protocol'),
-        configurable: true,
-        writable: true,
-      })
-      try {
-        stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
-        await expect(algorand.simulate.groups([payment(1)], { protocol: 'v42' })).rejects.toThrow(/simulate-protocol/)
-        await expect(algorand.simulate.rounds(payment(1), [1000n], { validityWindow: 'skip' })).rejects.toThrow(DTNotAvailableError)
-        expect(await algorand.simulate.groups([payment(1)])).toHaveLength(1)
-      } finally {
-        Object.defineProperty(DT, 'features', { value: features, configurable: true, writable: true })
-      }
-    })
-
     test('protocol: rounds in several windows with parallel groups split across requests', async () => {
       // Group 2 is alone in the second request, which fails at round 1500
       stub.on('get', '/v2/transactions/params', suggestedParams, true).on(
@@ -1378,11 +1388,11 @@ describe('time travel', () => {
       })
       await algorand.simulate.limits()
       expect(limitsCalls(stub)).toHaveLength(1)
-      expect(stub.calls[0].path).toBe('/v2/transactions/simulate/limits')
+      expect(stub.calls).toHaveLength(0)
     })
 
     test('limits: stock algod limits after a 404', async () => {
-      limits404(stub)
+      stockAlgod(stub)
       expect(await algorand.simulate.limits()).toEqual({
         maxTxnGroups: 1,
         maxRounds: 0,
@@ -1409,7 +1419,7 @@ describe('time travel', () => {
       const outcomes = await algorand.simulate.groups([payment(1), payment(2), payment(3)], { parallel: true })
       expect(posts().map((r) => r.txnGroups.length)).toEqual([2, 1])
       expect(outcomes.map((o) => o.ok)).toEqual([true, true, true])
-      await expect(algorand.simulate.groups([payment(1), payment(2), payment(3)])).rejects.toThrow(/at most 2 per request \(set/)
+      await expect(algorand.simulate.groups([payment(1), payment(2), payment(3)])).rejects.toThrow(/the node takes at most 2 per request/)
       // maxGroups overrides the node limit
       await algorand.simulate.groups([payment(1), payment(2), payment(3)], { maxGroups: 3 })
       expect(posts().at(-1)!.txnGroups).toHaveLength(3)
@@ -1439,14 +1449,6 @@ describe('time travel', () => {
       expect(posts().map((r) => r.extraOpcodeBudget)).toEqual([100_000])
     })
 
-    test('without a limits endpoint, the node checks extraOpcodeBudget itself', async () => {
-      limits404(stub)
-        .on('get', '/v2/transactions/params', suggestedParams, true)
-        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
-      await algorand.simulate.groups([payment(1)], { extraOpcodeBudget: 1_000_000 })
-      expect(posts().map((r) => r.extraOpcodeBudget)).toEqual([1_000_000])
-    })
-
     test('protocol future and execTraceConfig are refused when the node reports the developer API off', async () => {
       limitsOk(stub).on('get', '/v2/transactions/params', suggestedParams, true)
       await expect(algorand.simulate.groups([payment(1)], { protocol: 'future' })).rejects.toThrow(
@@ -1458,50 +1460,32 @@ describe('time travel', () => {
       expect(posts()).toHaveLength(0)
     })
 
-    test('protocol future and execTraceConfig are sent when the developer API is on, or unknown', async () => {
+    test('protocol future and execTraceConfig are sent when the developer API is on', async () => {
       const trace = { execTraceConfig: new modelsv2.SimulateTraceConfig({ enable: true }) }
       limitsOk(stub, { 'developer-api': true })
         .on('get', '/v2/transactions/params', suggestedParams, true)
         .on('post', '/v2/transactions/simulate', echoSimulate(), true)
       await algorand.simulate.groups([payment(1)], { protocol: 'future', ...trace })
       expect(posts().at(-1)).toMatchObject({ protocol: 'future', execTraceConfig: { enable: true } })
-
-      // Without the limits endpoint the node checks it
-      const stock = new StubClient()
-      limits404(stock)
-        .on('get', '/v2/transactions/params', suggestedParams, true)
-        .on('post', '/v2/transactions/simulate', echoSimulate(), true)
-      const other = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stock, '') })
-      await other.simulate.groups([other.newGroup().addPayment({ sender, receiver: sender, amount: microAlgo(1) })], trace)
-      expect(sentSimulate(stock.calls.at(-1)!).execTraceConfig?.enable).toBe(true)
     })
 
-    test('without a limits endpoint: one group per request, as plain upstream requests', async () => {
-      limits404(stub)
-        .on('get', '/v2/transactions/params', suggestedParams, true)
-        .on('get', '/v2/status', nodeStatus)
-        .on(
-          'post',
-          '/v2/transactions/simulate',
-          echoSimulate(undefined, (g) => (g === 0 ? undefined : 'never')),
-          true,
-        )
-      await expect(algorand.simulate.groups([payment(1), payment(2)])).rejects.toThrow(
-        /at most 1 per request \(it has no simulate limits endpoint/,
-      )
-      const outcomes = await algorand.simulate.groups([payment(1), payment(2)], { parallel: true })
-      expect(posts().map((r) => [r.txnGroups.length, r.parallelGroups, r.rounds, r.round])).toEqual([
-        [1, undefined, undefined, BigInt(LAST_ROUND)],
-        [1, undefined, undefined, BigInt(LAST_ROUND)],
-      ])
-      expect(outcomes.map((o) => [o.groupIndex, o.ok])).toEqual([
-        [0, true],
-        [1, true],
-      ])
+    test('on stock algod, groups and rounds throw before sending anything', async () => {
+      stockAlgod(stub).on('get', '/v2/transactions/params', suggestedParams, true)
+      for (const simulate of [
+        () => algorand.simulate.groups([payment(1)]),
+        () => algorand.simulate.groups([payment(1), payment(2)], { parallel: true }),
+        () => algorand.simulate.rounds(payment(1), [1000n, 1001n]),
+      ]) {
+        const error = await simulate().catch((e) => e)
+        expect(isDTUnsupportedError(error)).toBe(true)
+        expect(error.message).toMatch(/needs dtalgod, but the node is stock algod/)
+      }
+      expect(posts()).toHaveLength(0)
+      expect(limitsCalls(stub)).toHaveLength(1)
     })
 
-    test('without a limits endpoint: rounds are simulated one request per round, with round set', async () => {
-      limits404(stub)
+    test('on dtalgod with rounds disabled, rounds are simulated one request per round, with round set', async () => {
+      limitsOk(stub, { 'max-rounds': 0 })
         .on('get', '/v2/transactions/params', suggestedParams, true)
         .on(
           'post',
@@ -1515,7 +1499,7 @@ describe('time travel', () => {
       const rounds = [5000n, 1000n, 5000n]
       const outcomes = await algorand.simulate.rounds(composer, rounds, { validityWindow: 'rewrite' })
       const requests = posts()
-      // One request per distinct round, with transactions valid at it, and no fork fields
+      // One request per distinct round, with transactions valid at it, and no rounds or validity window mode
       expect(requests.map((r) => [r.round, r.rounds, r.rewriteValidityWindow, r.txnGroups[0].txns[0].txn.firstValid])).toEqual([
         [5000n, undefined, undefined, 5001n],
         [1000n, undefined, undefined, 1001n],
@@ -1539,18 +1523,16 @@ describe('time travel', () => {
       ])
     })
 
-    test('a fork without the simulate-limits feature keeps the default limits and asks nothing', async () => {
-      await withoutFeatures(['simulate-limits'], async () => {
-        stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
-        await algorand.simulate.groups([payment(1), payment(2)], { extraOpcodeBudget: 1_000_000 })
-        await algorand.simulate.rounds(payment(1), [1000n, 1001n])
-        expect(posts().map((r) => [r.txnGroups.length, r.rounds, r.extraOpcodeBudget])).toEqual([
-          [2, undefined, 1_000_000],
-          [1, [1000n, 1001n], undefined],
-        ])
-        expect(limitsCalls(stub)).toHaveLength(0)
+    test('an algosdk without every feature algokit-utils uses counts as stock algosdk', async () => {
+      await withoutFeatures(['holders'], async () => {
+        await expect(algorand.simulate.groups([payment(1)])).rejects.toThrow(DTNotAvailableError)
         await expect(algorand.simulate.limits()).rejects.toThrow(DTNotAvailableError)
+        await expect(algorand.account.getInformation(address, { round: 1 })).rejects.toThrow(DTNotAvailableError)
+        await expect(algorand.dt.getAssetHolders(9n)).rejects.toThrow(DTNotAvailableError)
+        expect(await algorand.dt.supported()).toBe(false)
       })
+      expect(limitsCalls(stub)).toHaveLength(0)
+      expect(stub.calls).toHaveLength(0)
     })
   })
 })
@@ -1561,12 +1543,13 @@ const QUERY_LIMITS = {
   'max-call-budget': 320_000,
   'max-call-log-bytes': 65_536,
   'max-response-bytes': 67_108_864,
+  'max-call-state-bytes': 67_108_864,
   'max-rounds': 16,
 }
 
 /** Answers the simulate limits endpoint as dtalgod with queries, with these query limits. */
 const queryLimitsOk = (stub: StubClient, query: Partial<typeof QUERY_LIMITS> = {}, limits: Partial<typeof LIMITS> = {}) =>
-  stub.on('get', '/v2/transactions/simulate/limits', json({ ...LIMITS, ...limits, query: { ...QUERY_LIMITS, ...query } }), true)
+  stub.on('get', LIMITS_PATH, json({ ...LIMITS, ...limits, query: { ...QUERY_LIMITS, ...query } }), true)
 
 type SentQueryCall = {
   args?: Uint8Array[]
@@ -1946,12 +1929,22 @@ describe('query', () => {
       limitsOk(stub)
       expect(await algorand.query.supported()).toBe(false)
       expect(await algorand.query.limits()).toBeUndefined()
-      expect(isDTUnsupportedError(await algorand.query.run({ program, calls: [{}] }).catch((e) => e))).toBe(true)
+      const disabled = await algorand.query.run({ program, calls: [{}] }).catch((e) => e)
+      expect(isDTUnsupportedError(disabled)).toBe(true)
+      expect(disabled.message).toMatch(/queries disabled \(MaxAPIQueryCalls is 0\)/)
+      stockAlgod(stub)
+      const fresh = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+      expect(await fresh.query.supported()).toBe(false)
+      expect((await fresh.query.run({ program, calls: [{}] }).catch((e) => e)).message).toMatch(/the node is stock algod/)
       expect(queries(stub)).toHaveLength(0)
 
+      // A node behind the same address with queries disabled, after one that reported them
       stub = new StubClient()
       algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
-      queryLimitsOk(stub).on('post', '/v2/query', () => ({ status: 404, json: { message: 'Not Found' } }))
+      queryLimitsOk(stub).on('post', '/v2/query', () => ({
+        status: 400,
+        json: { message: 'query is disabled on this node (MaxAPIQueryCalls is 0)' },
+      }))
       expect(await algorand.query.supported()).toBe(true)
       expect(await algorand.query.limits()).toEqual({
         maxCalls: 1024,
@@ -1963,7 +1956,7 @@ describe('query', () => {
       expect(isDTUnsupportedError(await algorand.query.run({ program, calls: [{}] }).catch((e) => e))).toBe(true)
     })
 
-    test('a fork without the query feature', async () => {
+    test('without dtalgosdk', async () => {
       queryLimitsOk(stub)
       await withoutFeatures(['query'], async () => {
         expect(await algorand.query.supported()).toBe(false)
@@ -2218,24 +2211,38 @@ describe('query', () => {
         expect(queries(stub)).toHaveLength(0)
       })
 
-      test('a fork without the query feature', async () => {
-        queryLimitsOk(stub).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      test('without dtalgosdk, both paths throw DTNotAvailableError', async () => {
+        queryLimitsOk(stub)
         await withoutFeatures(['query'], async () => {
-          const [outcome] = await algorand.query.groups([ghost()])
-          expect(outcome.via).toBe('simulate')
-          await expect(algorand.query.groups([ghost()], { via: 'query' })).rejects.toThrow(DTNotAvailableError)
+          await expect(algorand.query.groups([ghost()])).rejects.toThrow(DTNotAvailableError)
+          await expect(algorand.query.groups([ghost()], { via: 'simulate' })).rejects.toThrow(DTNotAvailableError)
         })
-        expect(queries(stub)).toHaveLength(0)
+        expect(stub.calls).toHaveLength(0)
       })
 
-      test('via query on a node without queries throws DTUnsupportedError; a 404 mid-way falls back with auto', async () => {
+      test('on stock algod, both paths throw DTUnsupportedError before sending anything', async () => {
+        stockAlgod(stub)
+        for (const via of ['auto', 'query', 'simulate'] as const) {
+          const error = await algorand.query.groups([ghost()], { via }).catch((e) => e)
+          expect(isDTUnsupportedError(error)).toBe(true)
+          expect(error.message).toMatch(/needs dtalgod, but the node is stock algod/)
+        }
+        expect(stub.calls.filter((c) => c.method === 'post')).toHaveLength(0)
+      })
+
+      test('via query on a node without queries throws DTUnsupportedError; queries disabled mid-way fall back with auto', async () => {
         limitsOk(stub)
         expect(isDTUnsupportedError(await algorand.query.groups([ghost()], { via: 'query' }).catch((e) => e))).toBe(true)
         stub = new StubClient()
         algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
         stub
           .on('get', '/v2/transactions/params', suggestedParams, true)
-          .on('post', '/v2/query', () => ({ status: 404, json: { message: 'Not Found' } }), true)
+          .on(
+            'post',
+            '/v2/query',
+            () => ({ status: 400, json: { message: 'query is disabled on this node (MaxAPIQueryCalls is 0)' } }),
+            true,
+          )
           .on('post', '/v2/transactions/simulate', echoSimulate(), true)
         queryLimitsOk(stub)
         const [outcome] = await algorand.query.groups([ghost()])

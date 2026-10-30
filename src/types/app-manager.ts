@@ -10,7 +10,7 @@ import {
   type CompiledTeal,
   type TealTemplateParams,
 } from './app'
-import { AtRoundOptions, dtAlgodForRead, fetchOptions, mapConcurrently } from './dt-support'
+import { AtRoundOptions, requireTimeTravel, fetchOptions, mapConcurrently } from './dt-support'
 import modelsv2 = algosdk.modelsv2
 
 /** Options for {@link AppManager.getBoxes}. */
@@ -285,7 +285,7 @@ export class AppManager {
       round === undefined
         ? await this._algod.getApplicationByID(Number(appId)).do(undefined, fetchOptions(options))
         : await (
-            await dtAlgodForRead(this._algod, 'Reading an app', round, true)
+            await requireTimeTravel(this._algod, 'Reading an app', round)
           )
             .getApplicationByID(appId)
             .round(round)
@@ -349,7 +349,7 @@ export class AppManager {
       round === undefined
         ? await this._algod.accountApplicationInformation(address, appId).do(undefined, fetchOptions(options))
         : await (
-            await dtAlgodForRead(this._algod, 'Reading local state', round, false)
+            await requireTimeTravel(this._algod, 'Reading local state', round)
           )
             .accountApplicationInformation(address, appId)
             .round(round)
@@ -379,7 +379,7 @@ export class AppManager {
       boxes = (await this._algod.getApplicationBoxes(appId).do(undefined, fetchOptions(options))).boxes
     } else {
       // Listing a past round can come in pages; the pages of one round fit together because past rounds never change
-      const tt = await dtAlgodForRead(this._algod, 'Listing boxes', round, false)
+      const tt = await requireTimeTravel(this._algod, 'Listing boxes', round)
       boxes = []
       let next: string | undefined = undefined
       do {
@@ -426,7 +426,7 @@ export class AppManager {
     const { prefix: prefixOption, includeValues = false, limit, round } = options ?? {}
     const prefix =
       typeof prefixOption === 'string' ? new Uint8Array(Buffer.from(prefixOption, 'utf-8')) : (prefixOption ?? new Uint8Array())
-    const tt = round === undefined ? undefined : await dtAlgodForRead(this._algod, 'Listing boxes', round, false)
+    const tt = round === undefined ? undefined : await requireTimeTravel(this._algod, 'Listing boxes', round)
     const listing = (): PagedBoxesRequest =>
       (tt ? tt.getApplicationBoxes(appId).round(round!) : this._algod.getApplicationBoxes(appId)) as unknown as PagedBoxesRequest
     const toBoxName = (name: Uint8Array): BoxName => ({
@@ -498,7 +498,7 @@ export class AppManager {
       round === undefined
         ? await this._algod.getApplicationBoxByName(Number(appId), name).do(undefined, fetchOptions(options))
         : await (
-            await dtAlgodForRead(this._algod, 'Reading a box', round, false)
+            await requireTimeTravel(this._algod, 'Reading a box', round)
           )
             .getApplicationBoxByName(appId, name)
             .round(round)

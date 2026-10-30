@@ -21,8 +21,9 @@ import {
   mapProtocolOverrideHits,
   mergeProtocolOverrides,
   offsetProtocolOverride,
+  noQueryMessage,
+  requireDTNode,
   requireDTSdk,
-  requireDTSdkFeatures,
   txIdsOf,
 } from './dt-support'
 import {
@@ -31,15 +32,12 @@ import {
   SimulateManager,
   SimulateRoundsOptions,
   checkSimulateLimits,
-  simulateOptionFeatures,
+  checkValidityWindow,
 } from './simulate-manager'
 import modelsv2 = algosdk.modelsv2
 
 /** The most requests of a query in flight at once, by default. */
 export const DEFAULT_QUERY_CONCURRENCY = 4
-
-/** The most bytes of a query request body when the loaded fork doesn't say: dtalgod's fixed limit. */
-const DEFAULT_MAX_QUERY_REQUEST_BYTES = 1_000_000
 
 /** Room left in a request body for everything but the calls and the programs (keys, sender, schemas, budget, protocol). */
 const QUERY_REQUEST_OVERHEAD_BYTES = 512
@@ -486,7 +484,7 @@ class QueryRun {
   private plan(job: QueryJob, j: number): Piece[] {
     const roundsPerRequest = Math.max(1, Math.min(this.config.maxRounds, this.limits.maxRounds))
     const callsPerRequest = Math.max(1, Math.min(this.config.maxCalls, this.limits.maxCalls))
-    const maxBody = this.tt.MAX_QUERY_REQUEST_BYTES ?? DEFAULT_MAX_QUERY_REQUEST_BYTES
+    const maxBody = this.tt.MAX_QUERY_REQUEST_BYTES
     const { program, clearProgram } = job.target
     const room =
       maxBody -
@@ -601,9 +599,7 @@ class QueryRun {
    */
   private split(piece: Piece, error: unknown): Piece[] | 'alone' | undefined {
     const status = errorStatus(error)
-    const tooLarge = this.tt.isQueryResponseTooLarge
-      ? this.tt.isQueryResponseTooLarge(error)
-      : status === 400 && /query response too large/.test(errorText(error))
+    const tooLarge = this.tt.isQueryResponseTooLarge(error)
     const bodyTooLarge = status === 400 && /request body too large/.test(errorText(error))
     if (!tooLarge && !bodyTooLarge && status !== 504) return undefined
     if (piece.rounds.length > 1 && !bodyTooLarge) {
@@ -665,7 +661,7 @@ class QueryRun {
  * their logs and cost. No signatures, fees or minimum balances; every resource is available without references; nothing
  * is written.
  *
- * Needs a version of the time-travel fork of algosdk with the `query` feature and a dtalgod with queries on.
+ * Needs dtalgosdk and a dtalgod with queries on (`MaxAPIQueryCalls` above 0), which its simulate limits report.
  */
 export class QueryManager {
   private _clientManager: ClientManager
@@ -683,11 +679,11 @@ export class QueryManager {
 
   /**
    * Returns the node's query limits: how many calls and rounds a request may hold, the most budget and log bytes of a
-   * call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries (stock algod, an
-   * older dtalgod, or queries disabled). The limits are asked for once per algod client, with the simulate limits.
+   * call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries (stock algod, or
+   * dtalgod with queries disabled). The limits are asked for once per algod client, with the simulate limits.
    *
    * @returns The node's query limits, if it has queries
-   * @throws DTNotAvailableError if the loaded algosdk is not a version of the time-travel fork with the `query` feature
+   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
    * @example
    * ```typescript
    * const limits = await algorand.query.limits()
@@ -695,13 +691,13 @@ export class QueryManager {
    * ```
    */
   public async limits(): Promise<QueryLimits | undefined> {
-    requireDTSdkFeatures('Reading the query limits', ['query'])
+    requireDTSdk('Reading the query limits')
     return await getQueryLimits(this._clientManager.algod)
   }
 
   /**
-   * Returns whether queries can be used: the loaded algosdk is a version of the time-travel fork with the `query` feature,
-   * and the node reports query limits. Never throws `DTNotAvailableError`.
+   * Returns whether queries can be used: the loaded algosdk is dtalgosdk, and the node reports query limits. Never throws
+   * `DTNotAvailableError`.
    *
    * @returns Whether `run` can be used
    * @example
@@ -710,8 +706,7 @@ export class QueryManager {
    * ```
    */
   public async supported(): Promise<boolean> {
-    const tt = getDTSdk()
-    if (!tt || !(tt.DTAlgodClient.features ?? []).includes('query')) return false
+    if (!getDTSdk()) return false
     return (await getQueryLimits(this._clientManager.algod)) !== undefined
   }
 
@@ -736,8 +731,8 @@ export class QueryManager {
    * @param params The program or app, the calls, the rounds and the request options
    * @param options How to send the requests
    * @returns The results at each round, in the order of `rounds` (one, at the latest round, without `rounds`)
-   * @throws DTNotAvailableError if the loaded algosdk is not a version of the time-travel fork with the `query` feature
-   * @throws The fork's `DTUnsupportedError` if the node has no queries
+   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
+   * @throws dtalgosdk's `DTUnsupportedError` if the node has no queries (stock algod, or dtalgod with queries disabled)
    * @example
    * ```typescript
    * const program = (await algorand.app.compileTeal('#pragma version 10\nglobal Round\nitob\nlog\nint 1')).compiledBase64ToBytes
@@ -749,7 +744,7 @@ export class QueryManager {
    * ```
    */
   public async run(params: QueryParams, options?: QueryRunOptions): Promise<QueryRunResult[]> {
-    const tt = requireDTSdkFeatures('Querying', ['query'])
+    const tt = requireDTSdk('Querying')
     const { signal, concurrency = DEFAULT_QUERY_CONCURRENCY, maxCalls, maxRounds } = options ?? {}
     signal?.throwIfAborted()
     checkPositiveInteger('concurrency', concurrency)
@@ -768,12 +763,9 @@ export class QueryManager {
     const negative = rounds.find((r) => r < 0n)
     if (negative !== undefined) throw new RangeError(`Can't query at round ${negative}`)
     // The limits are cached per client and shared, so they are read without the signal
-    const limits = await getQueryLimits(this._clientManager.algod)
-    if (!limits) {
-      throw new tt.DTUnsupportedError(
-        'The node has no query endpoint (POST /v2/query): it is stock algod, an older dtalgod, or has queries disabled',
-      )
-    }
+    const nodeLimits = await getSimulateLimits(this._clientManager.algod)
+    const limits = nodeLimits?.query
+    if (!limits) throw new tt.DTUnsupportedError(noQueryMessage(nodeLimits))
     if (budget !== undefined && (!Number.isInteger(budget) || budget < 1 || budget > limits.maxCallBudget)) {
       throw new RangeError(`budget must be a positive integer of at most the node's maxCallBudget ${limits.maxCallBudget}, not ${budget}`)
     }
@@ -802,7 +794,7 @@ export class QueryManager {
    * as simulate does).
    *
    * `via: 'auto'` (the default) queries when all of these hold, and simulates otherwise:
-   * - the fork has the `query` feature and the node reports query limits;
+   * - the node reports query limits (it has queries on);
    * - `execTraceConfig` is off;
    * - without `allowMoreLogging`, or with the node's `maxCallLogBytes` at least simulate's 65,536;
    * - with `extraOpcodeBudget`, it plus 700 per transaction is at most `maxCallBudget` for every group;
@@ -874,10 +866,15 @@ export class QueryManager {
     }
     checkPositiveInteger('concurrency', concurrency)
     if (composers.length === 0) throw new Error('No transaction groups to query')
-    requireDTSdkFeatures('Querying composed app calls', simulateOptionFeatures(simulateOptions))
+    requireDTSdk('Querying composed app calls')
+    checkValidityWindow(simulateOptions)
     simulateOptions.signal?.throwIfAborted()
-    // The limits are cached per client and shared, so they are read without the signal
-    checkSimulateLimits(await getSimulateLimits(this._clientManager.algod), simulateOptions.protocol, simulateOptions)
+    // Both paths need dtalgod. The limits are cached per client and shared, so they are read without the signal
+    checkSimulateLimits(
+      await requireDTNode(this._clientManager.algod, 'Querying composed app calls'),
+      simulateOptions.protocol,
+      simulateOptions,
+    )
     if (via !== 'simulate') {
       const plan = await this.queryPlan(composers, simulateOptions, 'round' in at ? at.round : undefined)
       if (plan.ok) {
@@ -907,20 +904,10 @@ export class QueryManager {
       error,
     })
     const tt = getDTSdk()
-    if (!tt) return no('the loaded algosdk is not the time-travel fork', () => new DTNotAvailableError('Querying'))
-    if (!(tt.DTAlgodClient.features ?? []).includes('query')) {
-      return no('the loaded time-travel fork of algosdk has no query feature', () => new DTNotAvailableError('Querying', ['query']))
-    }
-    const limits = await getQueryLimits(this._clientManager.algod)
-    if (!limits) {
-      return no(
-        'the node has no query endpoint',
-        () =>
-          new tt.DTUnsupportedError(
-            'The node has no query endpoint (POST /v2/query): it is stock algod, an older dtalgod, or has queries disabled',
-          ),
-      )
-    }
+    if (!tt) return no('the loaded algosdk is not dtalgosdk', () => new DTNotAvailableError('Querying'))
+    const nodeLimits = await getSimulateLimits(this._clientManager.algod)
+    const limits = nodeLimits?.query
+    if (!limits) return no('the node has queries disabled', () => new tt.DTUnsupportedError(noQueryMessage(nodeLimits)))
     if (options.execTraceConfig?.enable) return no('execTraceConfig needs simulate')
     if (options.allowMoreLogging && limits.maxCallLogBytes < SIMULATE_MORE_LOGGING_BYTES) {
       return no(`allowMoreLogging allows more log bytes than the node's queries (maxCallLogBytes ${limits.maxCallLogBytes})`)

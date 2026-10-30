@@ -20,7 +20,7 @@ import {
   BoxesVersionsRequestLike,
   KeyedVersionsRequestLike,
   RawVersionsPage,
-  requireDTSdkFeatures,
+  requireTimeTravel,
   VersionsOrder,
   VersionsRequestLike,
 } from './dt-support'
@@ -47,8 +47,6 @@ export interface VersionsOptions {
    * - Not with `minRound` / `maxRound`; `limit` counts rounds.
    * - A page sends the rounds as given, in one request (at most 10,000). The iterators split them into requests of
    *   `min(limit, maxRoundsPerRequest)` rounds, so long lists stay under URL length limits: prefer them for long lists.
-   *
-   * Needs a dtalgod newer than `v5.0.4-dt3`, and the fork's `versions-rounds` feature.
    */
   rounds?: readonly Round[]
   /**
@@ -83,8 +81,7 @@ export interface VersionsPageOptions extends VersionsOptions {
 export interface AppStateVersionsOptions {
   /**
    * Include `changedKeys`, the state keys each version of global or local state changed (added, removed or given a new
-   * value, net over the round), sorted, as bytes. Needs a dtalgod newer than `v5.0.4-dt3`, and the fork's
-   * `versions-keys` feature.
+   * value, net over the round), sorted, as bytes.
    */
   includeKeys?: boolean
 }
@@ -418,8 +415,9 @@ const sortedRounds = (rounds: readonly Round[], order: VersionsOrder | undefined
  * Time travel on a time-travel algod (dtalgod with `EnableTimeTravel`): the rounds at which boxes, apps, assets and
  * accounts changed, with their values.
  *
- * Needs the time-travel fork of algosdk; without it every method throws a `DTNotAvailableError`. A node without
- * time travel throws the fork's `DTUnsupportedError`.
+ * Needs dtalgosdk (the time-travel fork of algosdk); without it every method throws a `DTNotAvailableError`. A node
+ * without time travel (stock algod, or dtalgod with `EnableTimeTravel` off) throws dtalgosdk's `DTUnsupportedError`
+ * before any request is sent; whether the node has time travel is read once per algod client, from its simulate limits.
  *
  * To read state at a past round, pass `{ round }` to the usual reads (`algorand.app.getGlobalState(appId, { round })`,
  * `algorand.account.getInformation(address, { round })`, ...) or use `appClient.atRound(round)`.
@@ -440,8 +438,8 @@ export class DTManager {
   }
 
   /**
-   * Returns whether time travel can be used: the loaded algosdk is the time-travel fork and the node has time travel
-   * enabled. The node is probed once per algod client.
+   * Returns whether time travel can be used: the loaded algosdk is dtalgosdk and the node is dtalgod with time travel
+   * on (`EnableTimeTravel`). It is read from the node's simulate limits, asked for once per algod client.
    * @returns Whether time travel is supported
    * @example
    * ```typescript
@@ -714,15 +712,11 @@ export class DTManager {
     return request as AnyVersionsRequest<RawAccountVersion>
   }
 
-  /** Checks the options before anything is sent, and that the loaded fork has what they need. */
+  /** Checks the options before anything is sent. */
   private check(options: (VersionsOptions & AppStateVersionsOptions) | undefined) {
-    if (options?.rounds) {
-      if (options.minRound !== undefined || options.maxRound !== undefined) {
-        throw new Error('rounds cannot be combined with minRound or maxRound')
-      }
-      requireDTSdkFeatures('Versions with rounds', ['versions-rounds'])
+    if (options?.rounds && (options.minRound !== undefined || options.maxRound !== undefined)) {
+      throw new Error('rounds cannot be combined with minRound or maxRound')
     }
-    if (options?.includeKeys) requireDTSdkFeatures('Versions with includeKeys', ['versions-keys'])
     const max = options?.maxRoundsPerRequest
     if (max !== undefined && !(Number.isInteger(max) && max > 0)) {
       throw new Error(`maxRoundsPerRequest must be a positive integer, not ${max}`)
@@ -752,6 +746,7 @@ export class DTManager {
   ) {
     this.check(options)
     const apply = filter?.()
+    await this.requireTimeTravel('Listing versions')
     const configured = this.configure(request as AnyVersionsRequest<E>, options, options?.rounds)
     apply?.(configured)
     if (options?.next) configured.next(options.next)
@@ -769,6 +764,7 @@ export class DTManager {
     signal?.throwIfAborted()
     this.check(options)
     const apply = filter?.()
+    await this.requireTimeTravel('Listing versions')
     for (const rounds of this.roundsChunks(options)) {
       const configured = this.configure(request() as AnyVersionsRequest<E>, options, rounds)
       apply?.(configured)
@@ -781,9 +777,9 @@ export class DTManager {
   }
 
   /**
-   * Returns a page of the accounts that hold an asset at a round, in address order. Needs a dtalgod with the asset
-   * holders index (`TimeTravelHoldersIndex`); otherwise the fork's `DTUnsupportedError`. An index still being built is
-   * a 503 that is thrown at once (not retried). For every holder, prefer {@link iterateAssetHolders}.
+   * Returns a page of the accounts that hold an asset at a round, in address order. Needs dtalgod with time travel and
+   * the asset holders index (`TimeTravelHoldersIndex`); otherwise dtalgosdk's `DTUnsupportedError`. An index still being
+   * built is a 503 that is thrown at once (not retried). For every holder, prefer {@link iterateAssetHolders}.
    * @param assetId The ID of the asset
    * @param options The round, the page size, the `next` token (with the first page's `round`) and an abort signal
    * @returns The page of holders
@@ -799,6 +795,7 @@ export class DTManager {
     if (options?.next !== undefined && options.round === undefined) {
       throw new Error("Pass the first page's round with next, so every page of the holders lists the same round")
     }
+    await this.requireTimeTravel('Listing asset holders')
     const page = await this.holdersRequest(assetId, options).next(options?.next).do(undefined, fetchOptions(options))
     return { round: page.round, holders: page.holders.map(mapAssetHolder), nextToken: page.nextToken || undefined }
   }
@@ -818,15 +815,23 @@ export class DTManager {
   public async *iterateAssetHolders(assetId: bigint, options?: AssetHoldersOptions): AsyncGenerator<AssetHolder> {
     const signal = options?.signal
     signal?.throwIfAborted()
+    await this.requireTimeTravel('Listing asset holders')
     for await (const holder of this.holdersRequest(assetId, options).iterate(undefined, fetchOptions(options))) {
       yield mapAssetHolder(holder)
       signal?.throwIfAborted()
     }
   }
 
+  /**
+   * Checks that the node has time travel. Stock algod would answer some of these routes with errors of its own; a
+   * dtalgod without the holders index rejects the holders request itself with a `DTUnsupportedError`.
+   */
+  private async requireTimeTravel(feature: string) {
+    await requireTimeTravel(this._clientManager.algod, feature)
+  }
+
   private holdersRequest(assetId: bigint, options: AssetHoldersOptions | undefined) {
-    requireDTSdkFeatures('Asset holders', ['holders'])
-    const request = this.algod.getAssetHolders!(assetId)
+    const request = this.algod.getAssetHolders(assetId)
     if (options?.round !== undefined) request.round(options.round)
     if (options?.limit !== undefined) request.limit(options.limit)
     return request
@@ -837,9 +842,6 @@ export class DTManager {
     if (options?.key === undefined) return undefined
     const key = filterBytes('key', options.key)
     if (options.rounds) throw new Error('key cannot be combined with rounds')
-    // dtalgosdk lists no feature of its own for key() and prefix(): they shipped in the release that added
-    // versions-pages (3.9.0-dt.3.0.0.1), whose iterators page through the short and empty pages the filters give
-    requireDTSdkFeatures('Versions with key', ['versions-pages'])
     return (request) => (request as unknown as KeyedVersionsRequestLike<E, RawVersionsPage<E>>).key(key)
   }
 
@@ -849,7 +851,6 @@ export class DTManager {
     const prefix = filterBytes('prefix', options.prefix)
     // An empty prefix (an ARC-56 map with prefix "") is no filter; the node rejects it
     if (prefix.length === 0) return undefined
-    requireDTSdkFeatures('Versions with prefix', ['versions-pages'])
     return (request) => (request as unknown as BoxesVersionsRequestLike).prefix(prefix)
   }
 

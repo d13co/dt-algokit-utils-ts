@@ -3,7 +3,7 @@ import { Config } from '../config'
 import { chunkArray } from '../util'
 import { AccountAssetInformation } from './account'
 import { CommonTransactionParams, MAX_TRANSACTION_GROUP_SIZE, TransactionComposer } from './composer'
-import { AtRoundOptions, dtAlgodForRead } from './dt-support'
+import { AtRoundOptions, requireTimeTravel } from './dt-support'
 import { SendParams } from './transaction'
 
 /** Individual result from performing a bulk opt-in or bulk opt-out for an account against a series of assets. */
@@ -171,7 +171,7 @@ export class AssetManager {
     const asset =
       round === undefined
         ? await this._algod.getAssetByID(Number(assetId)).do()
-        : await (await dtAlgodForRead(this._algod, 'Reading an asset', round, true)).getAssetByID(assetId).round(round).do()
+        : await (await requireTimeTravel(this._algod, 'Reading an asset', round)).getAssetByID(assetId).round(round).do()
     return AssetManager.assetInformationFromAlgod(asset)
   }
 
@@ -229,7 +229,7 @@ export class AssetManager {
       round === undefined
         ? await this._algod.accountAssetInformation(sender, Number(assetId)).do()
         : await (
-            await dtAlgodForRead(this._algod, 'Reading an account asset holding', round, false)
+            await requireTimeTravel(this._algod, 'Reading an account asset holding', round)
           )
             .accountAssetInformation(sender, assetId)
             .round(round)

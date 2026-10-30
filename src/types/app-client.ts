@@ -95,15 +95,15 @@ const MAX_SIMULATE_OPCODE_BUDGET = 20_000 * 16
 const simulateLimitsFailed = new WeakSet<algosdk.Algodv2>()
 
 /**
- * The extra opcode budget for a readonly call: the most the node allows, as a dtalgod reports it (more or less than
- * stock), or the most stock algod allows. The limits are only asked for with the time-travel fork of algosdk; if that
- * fails, the stock limit is used.
+ * The extra opcode budget for a readonly call: the most the node allows (on dtalgod, more or less than stock algod).
+ * The limits are only asked for with dtalgosdk; without it, or if asking fails, stock algod's limit is used.
  */
 async function readonlyOpcodeBudget(algod: algosdk.Algodv2): Promise<number> {
   if (simulateLimitsFailed.has(algod)) return MAX_SIMULATE_OPCODE_BUDGET
   try {
     const limits = await getSimulateLimits(algod)
-    return limits?.reported ? limits.maxExtraOpcodeBudget : MAX_SIMULATE_OPCODE_BUDGET
+    // Stock algod gets stock algod's limits, so this is its limit there too
+    return limits?.maxExtraOpcodeBudget ?? MAX_SIMULATE_OPCODE_BUDGET
   } catch {
     simulateLimitsFailed.add(algod)
     return MAX_SIMULATE_OPCODE_BUDGET

@@ -6,7 +6,8 @@ import { Config } from '../config'
  * A HTTP Client that wraps the Algorand SDK HTTP Client with retries.
  *
  * A 429 or 503 with a `Retry-After` header waits at least that long before the next try (capped at 10 s). A dtalgod 503
- * "node is busy" without a readable header (browsers can't read it cross-origin) waits at least 1 s. A 503 for history
+ * for a busy node ("node is busy", or no slot free to re-evaluate an old round's deltas) without a readable header (a
+ * proxy may drop it) waits at least 1 s. A 503 for history
  * the node can't serve (an incomplete box or holders index, an untrusted history) is not retried: it lasts until the node
  * is fixed. A 504 (the node's time limit) is not retried from `POST /v2/query` or from `GET` of `/versions` and `/holders`
  * listings: a retry repeats the whole work, and the caller narrows the request instead.
@@ -24,8 +25,11 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
    * caller splits or narrows the request instead.
    */
   private static readonly TIME_LIMITED_RETRY_STATUS_CODES = AlgoHttpClientWithRetry.RETRY_STATUS_CODES.filter((s) => s !== 504)
-  /** dtalgod's 503 when it has no capacity left for a request: worth a retry, but not at once. */
-  private static readonly BUSY = /node is busy/
+  /**
+   * dtalgod's 503s when it has no capacity left for a request (simulate, query, versions), or no slot to re-evaluate an
+   * old round's deltas: worth a retry, but not at once.
+   */
+  private static readonly BUSY = /node is busy|every slot for re-evaluating old rounds is in use/
   /** The least wait before retrying a busy node that gave no readable `Retry-After`. */
   private static readonly BUSY_MIN_BACKOFF_MS = 1000
   /**

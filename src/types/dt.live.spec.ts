@@ -21,8 +21,8 @@ const XGOV_CREATOR = 'I7OP7WFSK57IFDHJA6DM5TJC2IFY4M3XSBV4R4PVOV4YWF7K57BZFUVQ5E
 /** A round before the xGov app existed, after USDC was created */
 const PAST = 50_000_000n
 
-/** Runs a test of a newer dtalgod feature, skipping it on a node that doesn't support it yet. */
-const onNewerNode = (run: () => Promise<void>) => async (ctx: { skip: (note?: string) => void }) => {
+/** Runs a test of the asset holders index, which is optional on dtalgod (`TimeTravelHoldersIndex`), skipping it on a node without it. */
+const withHoldersIndex = (run: () => Promise<void>) => async (ctx: { skip: (note?: string) => void }) => {
   try {
     await run()
   } catch (error) {
@@ -34,8 +34,6 @@ const onNewerNode = (run: () => Promise<void>) => async (ctx: { skip: (note?: st
 describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000 }, () => {
   let algorand: AlgorandClient
   let latest: bigint
-  /** On a dtalgod older than the simulate limits endpoint, its default limits, which utils can't know */
-  let olderNode: { maxGroups?: number; maxRounds?: number }
 
   beforeAll(async () => {
     const url = new URL(server!)
@@ -45,12 +43,11 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     const { genesisId } = await algorand.client.network()
     if (genesisId !== 'mainnet-v1.0') throw new Error(`Expected a MainNet node, got ${genesisId}`)
     latest = (await algorand.client.algod.status().do()).lastRound
-    olderNode = (await algorand.simulate.limits()).reported ? {} : { maxGroups: 16, maxRounds: 16 }
   })
 
-  test('reports its simulate limits', async (ctx) => {
+  test('reports its simulate limits', async () => {
     const limits = await algorand.simulate.limits()
-    if (!limits.reported) return ctx.skip('the node has no simulate limits endpoint')
+    expect(limits.reported).toBe(true)
     expect(limits.timeTravel).toBe(true)
     expect(limits.maxTxnGroups).toBeGreaterThanOrEqual(1)
     expect(limits.maxExtraOpcodeBudget).toBeGreaterThan(0)
@@ -116,10 +113,10 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     const fund = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: fresh, amount: algo(1) })
     const spend = algorand.newGroup().addPayment({ sender: fresh, receiver: XGOV_CREATOR, amount: algo(0.1) })
 
-    const sequential = await algorand.simulate.groups([fund, spend], olderNode)
+    const sequential = await algorand.simulate.groups([fund, spend])
     expect(sequential.map((o) => o.ok)).toEqual([true, true])
 
-    const parallel = await algorand.simulate.groups([fund, spend], { ...olderNode, parallel: true })
+    const parallel = await algorand.simulate.groups([fund, spend], { parallel: true })
     expect(parallel[0].ok).toBe(true)
     expect(parallel[1].ok).toBe(false)
     if (!parallel[1].ok) expect(parallel[1].error.failureMessage).toMatch(/overspend/)
@@ -128,7 +125,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
   test('simulate at several rounds, packed into windows', async () => {
     const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
     const rounds = [latest - 2_000n, latest - 10n, latest - 1_500n, latest - 5n]
-    const outcomes = await algorand.simulate.rounds(pay, rounds, olderNode)
+    const outcomes = await algorand.simulate.rounds(pay, rounds)
     expect(outcomes.map((o) => o.round)).toEqual(rounds)
     for (const o of outcomes) {
       expect(o.groups).toHaveLength(1)
@@ -137,31 +134,25 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     }
   })
 
-  test(
-    'simulate at rounds far apart with the validity window rewritten',
-    onNewerNode(async () => {
-      const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
-      const rounds = [latest - 200_000n, latest - 5n]
-      const outcomes = await algorand.simulate.rounds(pay, rounds, { ...olderNode, validityWindow: 'rewrite' })
-      expect(outcomes.map((o) => [o.round, o.groups[0].ok])).toEqual(rounds.map((r) => [r, true]))
-    }),
-  )
+  test('simulate at rounds far apart with the validity window rewritten', async () => {
+    const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
+    const rounds = [latest - 200_000n, latest - 5n]
+    const outcomes = await algorand.simulate.rounds(pay, rounds, { validityWindow: 'rewrite' })
+    expect(outcomes.map((o) => [o.round, o.groups[0].ok])).toEqual(rounds.map((r) => [r, true]))
+  })
 
-  test(
-    'simulate under a later protocol',
-    onNewerNode(async () => {
-      const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
-      const [now] = await algorand.simulate.groups([pay], { round: latest - 5n, protocol: 'latest' })
-      expect(now.protocolOverride).toMatchObject({ applied: false })
-      expect(now.protocolOverride!.from).toBe(now.protocolOverride!.to)
+  test('simulate under a later protocol', async () => {
+    const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
+    const [now] = await algorand.simulate.groups([pay], { round: latest - 5n, protocol: 'latest' })
+    expect(now.protocolOverride).toMatchObject({ applied: false })
+    expect(now.protocolOverride!.from).toBe(now.protocolOverride!.to)
 
-      // Long before the latest protocol upgrade. The group may fail (the sender may not exist yet); the override is still there
-      const [old] = await algorand.simulate.groups([pay], { round: 20_000_000n, protocol: 'latest' })
-      expect(old.protocolOverride?.applied).toBe(true)
-      expect(old.protocolOverride?.from).not.toBe(old.protocolOverride?.to)
-      expect(old.protocolOverride?.to).toBe(now.protocolOverride!.to)
-    }),
-  )
+    // Long before the latest protocol upgrade. The group may fail (the sender may not exist yet); the override is still there
+    const [old] = await algorand.simulate.groups([pay], { round: 20_000_000n, protocol: 'latest' })
+    expect(old.protocolOverride?.applied).toBe(true)
+    expect(old.protocolOverride?.from).not.toBe(old.protocolOverride?.to)
+    expect(old.protocolOverride?.to).toBe(now.protocolOverride!.to)
+  })
 
   describe('query', () => {
     /** `#pragma version 10; global Round; itob; log; txn ApplicationArgs 0; log; int 1`, compiled by dtalgod's /v2/teal/compile */
@@ -279,30 +270,24 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     /** An app whose global state changes every round (`total_effort`) */
     const BUSY_APP = 1284326447n
 
-    test(
-      'rounds: an asset as of rounds before and after its creation',
-      onNewerNode(async () => {
-        const versions = []
-        for await (const v of algorand.dt.iterateAssetVersions(USDC, { rounds: [60_000_000n, 1000n] })) versions.push(v)
-        expect(versions.map((v) => [v.round, v.deleted, v.changedRound])).toEqual([
-          [1000n, true, undefined],
-          [60_000_000n, false, 8_874_561n],
-        ])
-      }),
-    )
+    test('rounds: an asset as of rounds before and after its creation', async () => {
+      const versions = []
+      for await (const v of algorand.dt.iterateAssetVersions(USDC, { rounds: [60_000_000n, 1000n] })) versions.push(v)
+      expect(versions.map((v) => [v.round, v.deleted, v.changedRound])).toEqual([
+        [1000n, true, undefined],
+        [60_000_000n, false, 8_874_561n],
+      ])
+    })
 
-    test(
-      'includeKeys: the global state keys of the last changes',
-      onNewerNode(async () => {
-        const page = await algorand.dt.getAppVersions(BUSY_APP, { order: 'desc', limit: 2, includeKeys: true })
-        expect(page.versions).toHaveLength(2)
-        for (const v of page.versions) {
-          expect(Array.isArray(v.changedKeys)).toBe(true)
-          expect(v.app).toBeUndefined()
-        }
-        expect(page.versions[0].changedKeys!.map((k) => Buffer.from(k).toString())).toContain('total_effort')
-      }),
-    )
+    test('includeKeys: the global state keys of the last changes', async () => {
+      const page = await algorand.dt.getAppVersions(BUSY_APP, { order: 'desc', limit: 2, includeKeys: true })
+      expect(page.versions).toHaveLength(2)
+      for (const v of page.versions) {
+        expect(Array.isArray(v.changedKeys)).toBe(true)
+        expect(v.app).toBeUndefined()
+      }
+      expect(page.versions[0].changedKeys!.map((k) => Buffer.from(k).toString())).toContain('total_effort')
+    })
   })
 
   describe('versions filters', () => {
@@ -364,7 +349,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
 
   test(
     'asset holders: two pages at the same round',
-    onNewerNode(async () => {
+    withHoldersIndex(async () => {
       const first = await algorand.dt.getAssetHolders(USDC, { limit: 2 })
       expect(first.holders).toHaveLength(2)
       expect(first.nextToken).toBeDefined()

@@ -96,18 +96,18 @@ export class ClientManager {
   }
 
   /**
-   * Returns a time-travel algod client (the time-travel fork of algosdk's `DTAlgodClient`) that shares the
-   * connection of `algod`, for reads at past rounds, `/versions` listings and extended simulate on dtalgod.
+   * Returns a time-travel algod client (dtalgosdk's `DTAlgodClient`) that shares the connection of `algod`, for reads
+   * at past rounds, `/versions` listings, extended simulate and queries on dtalgod.
    * @returns The time-travel algod client
-   * @throws DTNotAvailableError if the loaded algosdk is not the time-travel fork
+   * @throws DTNotAvailableError if the loaded algosdk is not dtalgosdk
    */
   public get dtAlgod(): DTAlgodLike {
     return toDTAlgod(this._algod, 'The time-travel algod client')
   }
 
   /**
-   * Returns whether time travel can be used: the loaded algosdk is the time-travel fork and the algod node has time
-   * travel enabled (`EnableTimeTravel`). The node is probed once per algod client.
+   * Returns whether time travel can be used: the loaded algosdk is dtalgosdk and the algod node is dtalgod with time
+   * travel on (`EnableTimeTravel`). It is read from the node's simulate limits, asked for once per algod client.
    * @returns Whether time travel is supported
    */
   public async supportsDT(): Promise<boolean> {

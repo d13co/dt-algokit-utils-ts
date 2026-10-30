@@ -260,6 +260,17 @@ describe('AlgoHttpClientWithRetry dtalgod 503s and listing time-outs', () => {
     expect(fetchMock).toHaveBeenCalledTimes(5)
   })
 
+  test('a node with no slot to re-evaluate an old round counts as busy', async () => {
+    fetchMock
+      .mockImplementationOnce(failing(503, 'every slot for re-evaluating old rounds is in use'))
+      .mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/deltas/1000')
+    await vi.advanceTimersByTimeAsync(999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect((await request).status).toBe(200)
+  })
+
   test('a busy node with Retry-After waits as the header says', async () => {
     fetchMock.mockImplementationOnce(failing(503, busy, { 'Retry-After': '2' })).mockImplementationOnce(async () => ok())
     const request = client().get('/v2/accounts/A')
