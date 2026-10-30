@@ -1,0 +1,190 @@
+name: dt-algokit-utils
+
+# CI for the dtalgorand branch, and the npm release of @d13co/dt-algokit-utils: pushing a
+# v<version> tag (v9.2.3-dt.4.1.0.0) on dtalgorand tests, packs and publishes it.
+# See "Releasing" in docs/dt-fork.md.
+on:
+  push:
+    branches: [dtalgorand]
+    tags: ['v*-dt.*']
+  pull_request:
+    branches: [dtalgorand]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dt-algokit-utils-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the oldest in `engines`; the 24 run packs the release
+        node: [22.x, 24.x]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag is on dtalgorand
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch --quiet origin dtalgorand
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD || {
+            echo "::error::$GITHUB_REF_NAME is not on dtalgorand"
+            exit 1
+          }
+
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # Needs no install, so a mistagged release fails before the tests
+      - name: Check the version in package-lock.json, the docs, dt-algosdk and the tag
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: node scripts/ci/dt-release.mjs check "$TAG"
+
+      - name: Install algokit
+        run: pipx install algokit
+
+      # Most tests run against LocalNet; the dtalgod live tests skip without DT_ALGOD_SERVER
+      - name: Start LocalNet
+        run: algokit localnet start
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check types
+        run: npm run check-types
+
+      - name: Lint
+        run: npm run lint
+
+      # Blocking: the dependencies the published package installs
+      - name: Audit production dependencies
+        run: npm run audit -- -p
+
+      # Advisory: dev tooling (vitest's vite, ...) often has advisories that don't reach the package
+      - name: Audit all dependencies
+        continue-on-error: true
+        run: npm run audit
+
+      # Builds dist/ (its own package.json and README) and type-checks it
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm run test -- --silent
+
+      # Packs the tested dist/, so the publish job publishes exactly this tarball
+      - name: Pack
+        if: github.ref_type == 'tag' && matrix.node == '24.x'
+        run: npm pack ./dist
+
+      - name: Upload package
+        if: github.ref_type == 'tag' && matrix.node == '24.x'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package
+          path: d13co-dt-algokit-utils-*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: test
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # One publish at a time across tags, so the last tag pushed is the one `latest` ends on
+    concurrency:
+      group: npm-publish
+      cancel-in-progress: false
+    # The trusted publisher on npmjs.com names this environment. Its required reviewers
+    # approve each release, and its deployment policy admits only v*-dt.* tags.
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@d13co/dt-algokit-utils/v/${{ steps.version.outputs.version }}
+    permissions:
+      contents: write # GitHub release
+      id-token: write # npm trusted publishing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing (OIDC) needs npm 11.5.1 or later
+      - name: Check npm version
+        run: |
+          node -e '
+            const [a, b, c] = process.argv[1].split(".").map(Number);
+            if (a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)))) process.exit(0);
+            console.error("::error::npm " + process.argv[1] + " is older than 11.5.1, which trusted publishing needs");
+            process.exit(1);
+          ' "$(npm -v)"
+
+      - name: Read version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: package
+          path: package
+
+      # Authenticates with npm trusted publishing (OIDC), which also adds provenance;
+      # there is no token. The versions are prereleases, and npm 11 publishes a
+      # prerelease only with an explicit --tag. The ./ matters: npm reads
+      # package/<file>.tgz as the GitHub repository package/<file>.tgz.
+      # A version already on npm (the first one, published by hand) is not published
+      # again, and the GitHub release gets npm's tarball in place of the rebuilt one;
+      # --min-release-age=0 overrides the .npmrc delay for a version just published.
+      - name: Publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if npm view "@d13co/dt-algokit-utils@$VERSION" version >/dev/null 2>&1; then
+            echo "::notice::@d13co/dt-algokit-utils@$VERSION is already on npm, not publishing it again"
+            npm pack "@d13co/dt-algokit-utils@$VERSION" --min-release-age=0 --pack-destination package
+          else
+            npm publish "./package/d13co-dt-algokit-utils-$VERSION.tgz" --tag latest --access public
+          fi
+
+      - name: Create GitHub release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::notice::The $GITHUB_REF_NAME release already exists"
+            exit 0
+          fi
+          {
+            echo "npm: [@d13co/dt-algokit-utils@$VERSION](https://www.npmjs.com/package/@d13co/dt-algokit-utils/v/$VERSION). Install it as described in the [README](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/README.md#installing-the-fork); the changes from algokit-utils are in [docs/dt-fork.md](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/docs/dt-fork.md)."
+            prev=$(git describe --tags --abbrev=0 --match 'v*-dt.*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+            if [ -n "$prev" ]; then
+              echo
+              echo "## Changes since $prev"
+              echo
+              git log --first-parent --format='- %s (%h)' "$prev..$GITHUB_REF_NAME"
+            fi
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            "package/d13co-dt-algokit-utils-$VERSION.tgz" \
+            --verify-tag --latest --title "@d13co/dt-algokit-utils $VERSION" --notes-file notes.md

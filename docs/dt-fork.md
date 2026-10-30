@@ -380,22 +380,23 @@ The repo's own build and tests use the algosdk fork as a dev dependency, `"algos
 
 ### CI and CD
 
-- `.github/workflows/ci.yml` validates every push to `main` or `dtalgorand` and every pull request with `dt-ci.yml`: type check, lint, an audit of the production dependencies (the full audit only warns), build and the tests against LocalNet.
-- `.github/workflows/cd.yml` publishes on a pushed tag `v<version>` (only tags with `-dt.` in them). It runs the same validation on the tagged commit, checks the tag matches `package.json`'s version, skips a version already on npm, then builds and runs `npm publish ./dist --tag latest --provenance`.
-- The upstream workflows (semantic-release, docs publishing) are removed: they need the Algorand Foundation's bot and secrets.
-
-One-time setup:
-
-1. Create `github.com/d13co/dt-algokit-utils-ts` and push this branch as `main`.
-2. For the first publish, add an npm granular access token with read and write access (allowed to bypass 2FA) as the `NPM_TOKEN` secret (npm can only set up trusted publishing for a package that already exists). The `npm` environment is created on the first run; add protection rules to it if you want to approve each publish.
-3. After the first publish, on npmjs.com under the package's Settings, add a trusted publisher: GitHub Actions, organization `d13co`, repository `dt-algokit-utils-ts`, workflow `cd.yml`, environment `npm`. Then delete the `NPM_TOKEN` secret and the token.
+GitHub Actions tests and publishes the package with one workflow, [`.github/workflows/dt-algokit-utils.yml`](../.github/workflows/dt-algokit-utils.yml), modelled on dt-algosdk's. On every push and pull request to `dtalgorand` it runs the type check, lint, an audit of the production dependencies (the full audit only warns), the build and the tests against LocalNet, on Node 22 (the oldest in `engines`) and 24, and `node scripts/ci/dt-release.mjs check`. On a `v<version>` tag it also checks the release, packs the tested `dist/`, publishes that tarball to npm with provenance, and creates a GitHub release with the tarball. The upstream workflows (semantic-release, docs publishing) are removed: they need the Algorand Foundation's bot and secrets.
 
 ### Releasing
 
 1. Choose the version (see below) and set it with `npm version <version> --no-git-tag-version`, which updates `package.json` and `package-lock.json`.
-2. Update the version in the README's install snippets, and `dt-algosdk`'s too. Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dt-algosdk version>` with the oldest dt-algosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
-3. Publish `dt-algosdk` at that version first, since the snippets point at it.
-4. Commit, then tag and push to the fork, `github.com/d13co/dt-algokit-utils-ts` (not upstream): `git tag v<version> && git push <fork remote> dtalgorand v<version>`. The CD workflow publishes it.
+2. Set the dt-algosdk the repo builds and tests against, pinned exactly: `npm install -D -E --min-release-age=0 algosdk@npm:dt-algosdk@<version>` (publish that `dt-algosdk` first if it's new; `--min-release-age=0` overrides the repo's `.npmrc`, which makes npm 11 refuse versions less than 7 days old). Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dt-algosdk version>` with the oldest dt-algosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
+3. `node scripts/ci/dt-release.mjs update` sets both versions in the install snippets of `README.md`: `@d13co/dt-algokit-utils@<version>` and `dt-algosdk@<the devDependency's version>`.
+4. `npm run build`, `npm test`, then `npm pack ./dist --dry-run` to check the contents.
+5. Commit and push `dtalgorand`, then tag the commit and push the tag to the fork, `github.com/d13co/dt-algokit-utils-ts` (not upstream): `git tag v<version> && git push <fork remote> v<version>`.
+6. The workflow checks that the tag is on `dtalgorand` and matches the version in `package.json` and `package-lock.json`, that the docs name that version and the dt-algosdk devDependency, and that the peer range accepts that dt-algosdk (`node scripts/ci/dt-release.mjs check v<version>` runs the same check locally). It then runs the tests and, once the `npm` environment's reviewer approves, publishes with `npm publish --tag latest`: npm 11 publishes a prerelease only with an explicit tag, and `latest` makes it the version `npm install @d13co/dt-algokit-utils` gets. If the version is already on npm, the workflow does not publish it again and only creates the GitHub release, with npm's tarball.
+
+#### One-time setup
+
+- **Default branch.** `dtalgorand` (Settings → General), so the repository page shows this branch's README. The fork's `main` tracks upstream.
+- **GitHub environment.** The publish job runs in the environment `npm`, which requires a reviewer (`d13co`) to approve each release and lets only `v*-dt.*` tags deploy to it (Settings → Environments). The trusted publisher names it.
+- **First version, by hand.** The workflow publishes only through npm trusted publishing, which is set up on a package that already exists. Publish the first version from a checkout: steps 1 to 4, then `npm publish ./dist --tag latest`, then push the tag (step 5). The workflow sees that the version is on npm, skips publishing, and creates the GitHub release.
+- **Trusted publisher.** Right after the first publish, add one for the workflow, either in the package's settings on npmjs.com (Trusted publishing → GitHub Actions: owner `d13co`, repository `dt-algokit-utils-ts`, workflow `dt-algokit-utils.yml`, environment `npm`, publishing allowed) or with npm 11.5.1 or later: `npm trust github @d13co/dt-algokit-utils --file dt-algokit-utils.yml --repo d13co/dt-algokit-utils-ts --env npm --allow-publish`. Publishing is not allowed unless it is turned on. Trusted publishing adds provenance to each version and needs no token: the repository has no `NPM_TOKEN` secret.
 
 Versions follow the same scheme as `dt-algosdk`: `<upstream base>-dt.<dt-algorand N>.<x>.<y>.<z>`, e.g. `9.2.3-dt.4.1.0.0`, built on algokit-utils 9.2.3, covering dt-algorand dt4, and this package's release 1.0.0.
 
