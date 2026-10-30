@@ -8,7 +8,7 @@ import { QueryRoundOutcome } from './query-manager'
 
 // Live checks against a MainNet time-travel algod (dtalgod with EnableTimeTravel). Skipped unless DT_ALGOD_SERVER is set:
 //
-//   DT_ALGOD_SERVER=http://10.114.0.27:4000 npx vitest run src/types/dt.live.spec.ts
+//   DT_ALGOD_SERVER=https://mainnet-api-dt.d13.co npx vitest run --dir src src/types/dt.live.spec.ts
 //
 // DT_ALGOD_TOKEN sets the API token, if the node needs one.
 

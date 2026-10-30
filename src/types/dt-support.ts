@@ -34,6 +34,7 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'versions-keys',
   'versions-pages',
   'holders',
+  'round-header',
 ] as const)
 
 /** Thrown when a time travel, extended simulate or query feature is used but the loaded algosdk is not dtalgosdk (the time-travel fork). */

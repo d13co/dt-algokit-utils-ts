@@ -24,7 +24,8 @@ The fork is additive: every new parameter is optional and every new feature live
 - It runs on stock `algosdk` (`^3.5.2`). dtalgosdk (`3.9.0-dt.4.0.0.1` or later) is detected at runtime by its `DTAlgodClient.features`; without it, the new features throw a `DTNotAvailableError` and everything else behaves as upstream.
 - The public types never reference the algosdk fork's types, so it type-checks against stock algosdk too.
 - The node side targets the current dt-algorand release, dt4 (`v5.0.5-dt4`). Older dtalgod releases are not supported.
-- dtalgod is told from stock algod by one check: its simulate limits (`GET /v2/transactions/simulate/limits`), which every dtalgod node serves and stock algod doesn't. They are read once per algod client and also say which optional features the node has on (time travel, queries, simulate `rounds`, the developer API). Nothing else is guessed per request.
+- dtalgod is told from stock algod by one check: its simulate limits (`GET /v2/transactions/simulate/limits`), which every dtalgod node serves and stock algod doesn't. They are read once per algod client and also say which optional features the node has on (time travel, queries, simulate `rounds`, the developer API).
+- Each answer to a read at a round is also checked, by dtalgosdk: dtalgod marks it with an `X-Algod-TT-Round` header carrying the round (a 404 too), and an answer without it, or for another round, throws a `DTUnsupportedError`. This catches a load balancer that mixes nodes, where a read lands on a stock algod that ignores `round` and answers with the latest state. Box listings check the round in the body instead, since stock algod serves its last few rounds there. A proxy in front of the node must pass the header through: one that strips it makes every read at a round throw.
 - Against a stock algod, reads without `round` and `composer.simulate()` behave as upstream (except that `composer.simulate({ round })` builds transactions valid at that round). Reads with `round`, `algorand.dt`, `algorand.simulate.groups` / `rounds` and `algorand.query` throw a `DTUnsupportedError` before sending anything, rather than return the latest state or a stock error.
 
 The node features that are optional on a current dtalgod, and how each shows up:
@@ -363,7 +364,7 @@ await algorand.app.getGlobalState(appId, { round: 45_000_000n, signal: controlle
 `src/types/dt.spec.ts` runs offline against a stub algod. `src/types/dt.live.spec.ts` runs against a MainNet dtalgod:
 
 ```sh
-DT_ALGOD_SERVER=http://host:port npx vitest run src/types/dt.live.spec.ts
+DT_ALGOD_SERVER=https://mainnet-api-dt.d13.co npx vitest run --dir src src/types/dt.live.spec.ts
 ```
 
 The node must run the current dt-algorand release (dt4) with time travel on. The query tests branch on whether the node has queries, and the holders test is skipped on a node without the holders index, since both are optional: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.

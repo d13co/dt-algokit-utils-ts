@@ -13,7 +13,7 @@ import modelsv2 = algosdk.modelsv2
 // Offline tests of the time travel and extended simulate features, against a stub algod.
 
 type Call = { method: 'get' | 'post'; path: string; query: Record<string, string>; body?: Uint8Array; options?: Record<string, unknown> }
-type Answer = { status: number; json?: unknown; body?: Uint8Array }
+type Answer = { status: number; json?: unknown; body?: Uint8Array; headers?: Record<string, string> }
 type Route = { method: 'get' | 'post'; path: string | RegExp; answer: (call: Call) => Answer | Promise<Answer> }
 
 const LIMITS_PATH = '/v2/transactions/simulate/limits'
@@ -43,8 +43,14 @@ class StubClient implements algosdk.BaseHTTPClient {
     if (i < 0) throw new Error(`unexpected request ${call.method} ${call.path}`)
     const route = this.routes[i]
     if (!route.repeat) this.routes.splice(i, 1)
-    const { status, json, body } = await route.answer(call)
-    const response = { body: body ?? new TextEncoder().encode(JSON.stringify(json)), status, headers: {} }
+    const { status, json, body, headers } = await route.answer(call)
+    // dtalgod marks an answer given as of `?round=R` with X-Algod-TT-Round, a 404 included; a route can answer otherwise
+    const marked = call.method === 'get' && call.query.round !== undefined && (status < 300 || status === 404)
+    const response = {
+      body: body ?? new TextEncoder().encode(JSON.stringify(json)),
+      status,
+      headers: headers ?? (marked ? { 'x-algod-tt-round': call.query.round } : {}),
+    }
     if (status >= 300) {
       const { message } = (json ?? {}) as { message?: string }
       throw Object.assign(new Error(`Network request error. Received status ${status} (Bad Request)${message ? `: ${message}` : ''}`), {
@@ -323,6 +329,35 @@ describe('time travel', () => {
       const names = await algorand.app.getBoxNames(5n, { round: 70 })
       expect(names.map((n) => n.name)).toEqual(['a', 'b'])
       expect(stub.calls.every((c) => c.query.round === '70')).toBe(true)
+    })
+
+    test('an answer at a round without X-Algod-TT-Round throws, as from a stock node behind a load balancer', async () => {
+      // The limits said time travel, but this answer comes from a node that ignored round
+      stub
+        .on('get', '/v2/applications/123', () => ({ status: 200, json: appJson(123, address, 5), headers: {} }))
+        .on('get', `/v2/accounts/${address}`, () => ({
+          status: 200,
+          json: accountJson(address, 1000),
+          headers: { 'x-algod-tt-round': '999' },
+        }))
+      const missing = await algorand.app.getGlobalState(123n, { round: 1000n }).catch((e) => e)
+      expect(isDTUnsupportedError(missing)).toBe(true)
+      expect(missing.requestedRound).toBe(1000n)
+      const other = await algorand.account.getInformation(address, { round: 1000 }).catch((e) => e)
+      expect(isDTUnsupportedError(other)).toBe(true)
+    })
+
+    test("a 404 at a round passes through as the node's not found at that round", async () => {
+      stub.on('get', '/v2/applications/5/box', () => ({ status: 404, json: { message: 'box not found' } }))
+      const error = await algorand.app.getBoxValue(5n, 'a', { round: 70 }).catch((e) => e)
+      expect(isDTUnsupportedError(error)).toBe(false)
+      expect(error).toMatchObject({ status: 404 })
+    })
+
+    test('a box page for another round throws: box listings check the round in the body', async () => {
+      stub.on('get', '/v2/applications/5/boxes', json({ round: 69, boxes: [{ name: b64('a') }] }))
+      const error = await algorand.app.getBoxNames(5n, { round: 70 }).catch((e) => e)
+      expect(isDTUnsupportedError(error)).toBe(true)
     })
 
     test('box value at a round', async () => {
