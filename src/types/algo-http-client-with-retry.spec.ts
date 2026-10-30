@@ -155,9 +155,15 @@ describe('AlgoHttpClientWithRetry Retry-After and query time-outs', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  test('a 504 from /v2/transactions/simulate is still retried', async () => {
+  test("a 504 from /v2/transactions/simulate (the node's time limit too) is not retried", async () => {
+    fetchMock.mockImplementation(async () => failing(504)())
+    await expect(client().post('/v2/transactions/simulate', new Uint8Array([1]))).rejects.toMatchObject({ response: { status: 504 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('a 504 from another POST is still retried', async () => {
     fetchMock.mockImplementationOnce(async () => failing(504)()).mockImplementationOnce(async () => ok())
-    const request = client().post('/v2/transactions/simulate', new Uint8Array([1]))
+    const request = client().post('/v2/teal/dryrun', new Uint8Array([1]))
     await vi.advanceTimersByTimeAsync(0)
     expect((await request).status).toBe(200)
     expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -288,14 +294,17 @@ describe('AlgoHttpClientWithRetry dtalgod 503s and listing time-outs', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  test.each(['/v2/assets/1/versions', '/v2/applications/5/box/versions', '/v2/accounts/A/apps/5/versions/', '/v2/assets/1/holders'])(
-    'a 504 from GET %s is not retried',
-    async (path) => {
-      fetchMock.mockImplementation(failing(504, 'time limit exceeded'))
-      await expect(client().get(path)).rejects.toMatchObject({ response: { status: 504 } })
-      expect(fetchMock).toHaveBeenCalledTimes(1)
-    },
-  )
+  test.each([
+    '/v2/assets/1/versions',
+    '/v2/applications/5/box/versions',
+    '/v2/accounts/A/apps/5/versions/',
+    '/v2/assets/1/holders',
+    '/v2/deltas/123',
+  ])('a 504 from GET %s is not retried', async (path) => {
+    fetchMock.mockImplementation(failing(504, 'time limit exceeded'))
+    await expect(client().get(path)).rejects.toMatchObject({ response: { status: 504 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
 
   test('a 504 from GET /v2/status is still retried', async () => {
     fetchMock.mockImplementationOnce(failing(504, 'gateway')).mockImplementationOnce(async () => ok())

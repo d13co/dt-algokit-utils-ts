@@ -511,6 +511,9 @@ export class AppClient {
   private _defaultSigner?: TransactionSigner
   private _round?: bigint
 
+  /** Whether new clients register their error transformer; off while `atRound` makes a clone. */
+  private static registerErrorTransformers = true
+
   private _approvalSourceMap: SourceMap | undefined
   private _clearSourceMap: SourceMap | undefined
 
@@ -547,7 +550,7 @@ export class AppClient {
     this._appSpec = AppClient.normaliseAppSpec(params.appSpec)
     this._appName = params.appName ?? this._appSpec.name
     this._algorand = params.algorand
-    this._algorand.registerErrorTransformer!(this.handleCallErrors)
+    if (AppClient.registerErrorTransformers) this._algorand.registerErrorTransformer!(this.handleCallErrors)
     this._defaultSender = typeof params.defaultSender === 'string' ? Address.fromString(params.defaultSender) : params.defaultSender
     this._defaultSigner = params.defaultSigner
     this._round = params.round === undefined ? undefined : BigInt(params.round)
@@ -608,10 +611,12 @@ export class AppClient {
     }
   }
 
-  /** The round reads use: the one in `options`, else the round this client is pinned to, if any. */
+  /** The options reads use: the round in `options`, else the round this client is pinned to, if any, and the abort signal. */
   private readOptions(options?: AtRoundOptions): AtRoundOptions | undefined {
     const round = options?.round ?? this._round
-    return round === undefined ? undefined : { round }
+    const signal = options?.signal
+    if (round === undefined && signal === undefined) return undefined
+    return { ...(round !== undefined ? { round } : {}), ...(signal ? { signal } : {}) }
   }
 
   /**
@@ -639,7 +644,14 @@ export class AppClient {
    * ```
    */
   public atRound(round: Round | undefined): AppClient {
-    return this.clone({ round })
+    // The clone has this client's app, app spec, source maps and AlgorandClient, so this client's error transformer
+    // already covers its calls. Registering another for each clone would keep every clone alive (e.g. one per round).
+    AppClient.registerErrorTransformers = false
+    try {
+      return this.clone({ round })
+    } finally {
+      AppClient.registerErrorTransformers = true
+    }
   }
 
   /**

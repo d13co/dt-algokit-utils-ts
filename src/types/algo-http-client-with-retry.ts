@@ -20,9 +20,10 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
   // which is the underlying library used by algosdk - but the CloudFlare specific 52X status codes have been removed
   private static readonly RETRY_STATUS_CODES = [408, 413, 429, 500, 502, 503, 504]
   /**
-   * The status codes retried for requests with a time limit on the node (`POST /v2/query`, `GET` of `/versions` and
-   * `/holders` listings): all but 504, which is that limit. A retry would repeat the whole (up to the limit) work; the
-   * caller splits or narrows the request instead.
+   * The status codes retried for requests with a time limit on the node (`POST /v2/query`,
+   * `POST /v2/transactions/simulate`, `GET /v2/deltas/{round}`, and `GET` of `/versions` and `/holders` listings): all
+   * but 504, which is that limit. A retry would repeat the whole (up to the limit) work; the caller splits or narrows the
+   * request instead.
    */
   private static readonly TIME_LIMITED_RETRY_STATUS_CODES = AlgoHttpClientWithRetry.RETRY_STATUS_CODES.filter((s) => s !== 504)
   /**
@@ -115,7 +116,10 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
   /** The status codes to retry for a `method` request to `relativePath`. */
   private static retryStatusCodes(method: 'get' | 'post', relativePath: string): number[] {
     const path = relativePath.replace(/\/+$/, '')
-    const timeLimited = method === 'post' ? path === '/v2/query' : /\/(versions|holders)$/.test(path)
+    const timeLimited =
+      method === 'post'
+        ? path === '/v2/query' || path === '/v2/transactions/simulate'
+        : /\/(versions|holders)$|^\/v2\/deltas\/\d+$/.test(path)
     return timeLimited ? AlgoHttpClientWithRetry.TIME_LIMITED_RETRY_STATUS_CODES : AlgoHttpClientWithRetry.RETRY_STATUS_CODES
   }
 

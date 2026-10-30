@@ -3,6 +3,7 @@ import { getABIReturnValue } from '../transaction/transaction'
 import { ClientManager } from './client-manager'
 import { BuiltTransactions, RawSimulateOptions, TransactionComposer } from './composer'
 import {
+  asSentGroup,
   DTSimulateResponseLike,
   RawSimulateGroupOutcome,
   Capabilities,
@@ -339,19 +340,20 @@ export class SimulateManager {
   ): Promise<SimulateRoundOutcome[]> {
     const { maxRounds: maxRoundsOption, ...rest } = options ?? {}
     const groups = Array.isArray(composers) ? composers : [composers]
-    if (rounds.length === 0) return []
     const tt = requireDTSdk('Simulating at several rounds')
     checkValidityWindow(rest)
     const limit = concurrencyLimiter(checkConcurrency(rest.concurrency))
     rest.signal?.throwIfAborted()
     // The capabilities are cached per client and shared, so they are read without the signal
     const capabilities = await requireDTNode(this._clientManager.algod, 'Simulating at several rounds')
+    // Checked like any other call first, so an empty list doesn't hide a missing dt-algosdk or dtalgod
+    if (rounds.length === 0) return []
     const maxRounds = maxRoundsOption ?? capabilities.simulate.maxRounds
     if (maxRounds === 0) return await this.roundByRound(groups, rounds, rest, capabilities, limit)
     // With a validity window mode the rounds of a request needn't fit in one transaction's validity window
     const { windows, positions } = tt.packSimulateRounds(rounds, { maxRounds, ...(rest.validityWindow ? { maxSpan: null } : {}) })
 
-    // Build one after the other (a composer can only build one validity window at a time), then send `concurrency` at a time
+    // Build every window, then send `concurrency` at a time
     const builtWindows: BuiltTransactions[][] = []
     for (const w of windows) {
       builtWindows.push(await this.buildGroups(groups, { firstValidRound: w.firstValid, lastValidRound: w.lastValid }))
@@ -379,7 +381,7 @@ export class SimulateManager {
     if (zero !== undefined) {
       throw new RangeError(`Can't simulate at round ${zero} in rounds: give past rounds (look the latest round up with status())`)
     }
-    // Build one after the other (a composer can only build one validity window at a time), then send `concurrency` at a time
+    // Build every window, then send `concurrency` at a time
     const built: BuiltTransactions[][] = []
     for (const r of unique) built.push(await this.buildGroups(composers, validityAt(r)))
     const results = await Promise.all(unique.map((r, i) => this.send(built[i], rest, { round: r }, capabilities, limit)))
@@ -398,9 +400,7 @@ export class SimulateManager {
     for (const composer of composers) {
       const b = validity ? await composer.buildTransactionsWithValidity(validity) : await composer.buildTransactions()
       if (b.transactions.length === 0) throw new Error(`Transaction group ${built.length} is empty`)
-      // Clear any group ID so that the request assigns one for the group as simulated
-      if (b.transactions.length > 1) b.transactions.forEach((t) => (t.group = undefined))
-      built.push(b)
+      built.push(asSentGroup(b))
     }
     return built
   }

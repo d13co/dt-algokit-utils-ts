@@ -18,6 +18,16 @@ import isTransactionWithSigner = algosdk.isTransactionWithSigner
 import SimulateResponse = algosdk.modelsv2.SimulateResponse
 import modelsv2 = algosdk.modelsv2
 
+/** A validity window to build transactions with, for a simulate at past rounds. */
+type ValidityWindow = { firstValid: bigint; lastValid: bigint }
+
+/**
+ * The validity window of each build for a simulate at past rounds, keyed by the suggested params object of that build:
+ * transactions that don't set `firstValidRound` / `lastValidRound` get it instead of one based on the suggested params.
+ * Kept per build, not per composer, so builds of one composer at different rounds can run concurrently.
+ */
+const validityWindows = new WeakMap<algosdk.SuggestedParams, ValidityWindow>()
+
 const address = (address: string | Address): Address => {
   return typeof address === 'string' ? Address.fromString(address) : address
 }
@@ -587,12 +597,6 @@ export class TransactionComposer {
 
   /** Whether the validity window was explicitly set on construction */
   private defaultValidityWindowIsExplicit = false
-
-  /**
-   * The validity window to build with, while building for a simulate at past rounds: transactions that don't set
-   * `firstValidRound` / `lastValidRound` get it instead of one based on the suggested params.
-   */
-  private validityOverride?: { firstValid: bigint; lastValid: bigint }
 
   private appManager: AppManager
 
@@ -1482,6 +1486,7 @@ export class TransactionComposer {
     params: CommonTransactionParams,
     txnParams: TParams,
   ): TransactionWithContext {
+    const validityWindow = validityWindows.get(txnParams.suggestedParams)
     // We are going to mutate suggested params, let's create a clone first
     txnParams.suggestedParams = { ...txnParams.suggestedParams }
 
@@ -1491,10 +1496,10 @@ export class TransactionComposer {
     if (params.note)
       txnParams.note = (typeof params.note === 'string' ? encoder.encode(params.note) : params.note) satisfies algosdk.Transaction['note']
 
-    if (this.validityOverride && !params.firstValidRound && !params.lastValidRound) {
+    if (validityWindow && !params.firstValidRound && !params.lastValidRound) {
       // Building for a simulate at past rounds: the transactions must be valid at those rounds
-      txnParams.suggestedParams.firstValid = this.validityOverride.firstValid
-      txnParams.suggestedParams.lastValid = this.validityOverride.lastValid
+      txnParams.suggestedParams.firstValid = validityWindow.firstValid
+      txnParams.suggestedParams.lastValid = validityWindow.lastValid
     } else {
       if (params.firstValidRound) {
         txnParams.suggestedParams.firstValid = params.firstValidRound
@@ -1939,7 +1944,22 @@ export class TransactionComposer {
    * ```
    */
   async buildTransactions(): Promise<BuiltTransactions> {
+    return await this.buildTransactionsIn()
+  }
+
+  /** Returns the suggested params for one build, carrying `validity` (for a simulate at past rounds) when given. */
+  private async suggestedParamsFor(validity?: ValidityWindow): Promise<algosdk.SuggestedParams> {
     const suggestedParams = await this.getSuggestedParams()
+    if (!validity) return suggestedParams
+    // A new object for each build, so the window stays with this build
+    const own = { ...suggestedParams }
+    validityWindows.set(own, validity)
+    return own
+  }
+
+  /** `buildTransactions`, valid in `validity` when given. */
+  private async buildTransactionsIn(validity?: ValidityWindow): Promise<BuiltTransactions> {
+    const suggestedParams = await this.suggestedParamsFor(validity)
 
     const transactions: algosdk.Transaction[] = []
     const methodCalls = new Map<number, algosdk.ABIMethod>()
@@ -1994,26 +2014,14 @@ export class TransactionComposer {
     if (validity.lastValidRound < validity.firstValidRound) {
       throw new Error(`lastValidRound ${validity.lastValidRound} is before firstValidRound ${validity.firstValidRound}`)
     }
-    const previous = this.validityOverride
-    this.validityOverride = { firstValid: validity.firstValidRound, lastValid: validity.lastValidRound }
-    try {
-      return await this.buildTransactions()
-    } finally {
-      this.validityOverride = previous
-    }
+    return await this.buildTransactionsIn({ firstValid: validity.firstValidRound, lastValid: validity.lastValidRound })
   }
 
-  /** Runs `build` with transactions valid at the given simulate round, unless it's 0 / undefined (the latest round). */
-  private async withValidityForSimulateRound<T>(round: number | bigint | undefined, build: () => Promise<T>): Promise<T> {
-    if (!round) return await build()
+  /** The validity window for a simulate at `round`, or `undefined` for 0 / undefined (the latest round). */
+  private validityForSimulateRound(round: number | bigint | undefined): ValidityWindow | undefined {
+    if (!round) return undefined
     const firstValid = BigInt(round) + 1n
-    const previous = this.validityOverride
-    this.validityOverride = { firstValid, lastValid: firstValid + this.defaultValidityWindow }
-    try {
-      return await build()
-    } finally {
-      this.validityOverride = previous
-    }
+    return { firstValid, lastValid: firstValid + this.defaultValidityWindow }
   }
 
   /**
@@ -2176,21 +2184,34 @@ export class TransactionComposer {
   async simulate(options?: SimulateOptions): Promise<SendAtomicTransactionComposerResults & { simulateResponse: SimulateResponse }> {
     const { skipSignatures = false, signal, ...rawOptions } = options ?? {}
     signal?.throwIfAborted()
-    const atc = skipSignatures ? new AtomicTransactionComposer() : this.atc
+    const validity = this.validityForSimulateRound(rawOptions.round)
+    // At a past round, the group is built in a separate ATC, so its past validity never reaches this composer's group
+    const atc = skipSignatures || validity ? new AtomicTransactionComposer() : this.atc
 
     // Build the transactions
     if (skipSignatures) {
       rawOptions.allowEmptySignatures = true
       rawOptions.fixSigners = true
       // Build transactions uses empty signers
-      const transactions = await this.withValidityForSimulateRound(rawOptions.round, () => this.buildTransactions())
+      const transactions = await this.buildTransactionsIn(validity)
       for (const txn of transactions.transactions) {
         atc.addTransaction({ txn, signer: TransactionComposer.NULL_SIGNER })
       }
       atc['methodCalls'] = transactions.methodCalls
+    } else if (validity) {
+      // Real signatures, for transactions valid at the past round
+      const suggestedParams = await this.suggestedParamsFor(validity)
+      const methodCalls = new Map<number, algosdk.ABIMethod>()
+      for (const txn of this.txns) {
+        for (const { context, ...ts } of await this.buildTxnWithSigner(txn, suggestedParams)) {
+          atc.addTransaction(ts)
+          if (context.abiMethod) methodCalls.set(atc.count() - 1, context.abiMethod)
+        }
+      }
+      atc['methodCalls'] = methodCalls
     } else {
       // Build creates real signatures
-      await this.withValidityForSimulateRound(rawOptions.round, () => this.build())
+      await this.build()
     }
 
     signal?.throwIfAborted()

@@ -5,6 +5,7 @@ import { ABIReturn } from './app'
 import { ClientManager } from './client-manager'
 import { BuiltTransactions, TransactionComposer } from './composer'
 import {
+  asSentGroup,
   DTAlgodLike,
   DTNotAvailableError,
   QueryCallLike,
@@ -845,7 +846,6 @@ export class QueryManager {
     options?: QueryRoundsOptions,
   ): Promise<QueryRoundOutcome[]> {
     const groups = Array.isArray(composers) ? composers : [composers]
-    if (rounds.length === 0) return []
     const requested = rounds.map((r) => BigInt(r))
     const zero = requested.find((r) => r < 1n)
     if (zero !== undefined) {
@@ -875,6 +875,8 @@ export class QueryManager {
       simulateOptions.protocol,
       simulateOptions,
     )
+    // Checked like any other call first, so an empty list doesn't hide a missing dt-algosdk or dtalgod
+    if ('rounds' in at && at.rounds.length === 0) return []
     if (via !== 'simulate') {
       const plan = await this.queryPlan(composers, simulateOptions, 'round' in at ? at.round : undefined)
       if (plan.ok) {
@@ -914,12 +916,12 @@ export class QueryManager {
     }
     const built: BuiltTransactions[] = []
     for (const composer of composers) {
-      // Built as `simulate.groups` builds them at a past round, so the transaction IDs (in failure messages) match
+      // Built and grouped as `simulate.groups` builds them, so the transaction IDs (in failure messages) match
       const b = round
         ? await composer.buildTransactionsWithValidity({ firstValidRound: round + 1n, lastValidRound: round + 11n })
         : await composer.buildTransactions()
       if (b.transactions.length === 0) throw new Error(`Transaction group ${built.length} is empty`)
-      built.push(b)
+      built.push(asSentGroup(b))
     }
     const { extraOpcodeBudget } = options
     for (const [g, b] of built.entries()) {

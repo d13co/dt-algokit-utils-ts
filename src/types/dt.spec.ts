@@ -349,6 +349,8 @@ describe('time travel', () => {
       const names = await algorand.app.getBoxNames(5n, { round: 70 })
       expect(names.map((n) => n.name)).toEqual(['a', 'b'])
       expect(stub.calls.every((c) => c.query.round === '70')).toBe(true)
+      // Always with a limit: a node with MaxAPIBoxPerApplication 0 answers a paged listing without one with no boxes
+      expect(stub.calls.every((c) => Number(c.query.limit) === 100000)).toBe(true)
     })
 
     test('an answer at a round without X-Algod-TT-Round throws, as from a stock node behind a load balancer', async () => {
@@ -393,6 +395,41 @@ describe('time travel', () => {
       await algorand.app.getBoxValue(5n, 'a', { round: 70, signal })
       await algorand.app.getBoxValue(5n, 'a', { signal })
       expect(stub.calls.map((c) => c.options?.signal)).toEqual([signal, signal])
+    })
+
+    test('a signal goes to fetch for account, asset and app client reads too', async () => {
+      const { signal } = new AbortController()
+      stub
+        .on('get', `/v2/accounts/${address}`, json(accountJson(address, 70)), true)
+        .on(
+          'get',
+          `/v2/accounts/${address}/assets/77`,
+          json({ round: 70, 'asset-holding': { amount: 1, 'asset-id': 77, 'is-frozen': false } }),
+          true,
+        )
+        .on('get', '/v2/assets/77', json({ index: 77, params: { creator: address, decimals: 0, total: 1 } }), true)
+        .on('get', '/v2/applications/123', json(appJson(123, address, 5)), true)
+        .on('get', '/v2/applications/5/box', json({ round: 70, name: b64('a'), value: b64('hello') }), true)
+      for (const round of [undefined, 70]) {
+        stub.calls = []
+        await algorand.account.getInformation(address, { round, signal })
+        await algorand.asset.getAccountInformation(address, 77n, { round, signal })
+        await algorand.asset.getById(77n, { round, signal })
+        await algorand.app
+          .getBoxValueFromABIType({ appId: 5n, boxName: 'a', type: new algosdk.ABIStringType(), round, signal })
+          .catch(() => {})
+        const client = new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand, defaultSender: address })
+        await (round === undefined ? client : client.atRound(round)).getGlobalState({ signal })
+        expect(stub.calls.map((c) => [c.path, c.options?.signal === signal])).toEqual(
+          [
+            `/v2/accounts/${address}`,
+            `/v2/accounts/${address}/assets/77`,
+            '/v2/assets/77',
+            '/v2/applications/5/box',
+            '/v2/applications/123',
+          ].map((path) => [path, true]),
+        )
+      }
     })
 
     test('without the time-travel fork of algosdk, reads at a round throw and other reads still work', async () => {
@@ -680,6 +717,13 @@ describe('time travel', () => {
         await expect(algorand.dt.iterateAssetVersions(9n, { rounds: [5], maxRoundsPerRequest: 0 }).next()).rejects.toThrow(
           /maxRoundsPerRequest/,
         )
+        // A limit below 1 would split the rounds into empty chunks forever
+        for (const limit of [0, -1, 1.5]) {
+          await expect(algorand.dt.iterateAssetVersions(9n, { rounds: [5], limit }).next()).rejects.toThrow(
+            /limit must be a positive integer/,
+          )
+        }
+        await expect(algorand.dt.getAssetVersions(9n, { limit: 0 })).rejects.toThrow(/limit must be a positive integer/)
         expect(stub.calls).toHaveLength(0)
       })
 
@@ -929,7 +973,8 @@ describe('time travel', () => {
         [2n, 'two'],
       ])
       expect(stub.calls).toHaveLength(1)
-      expect(stub.calls[0].query).toMatchObject({ prefix: `b64:${b64('b')}`, include: 'values' })
+      // Always with a limit: a node with MaxAPIBoxPerApplication 0 answers a paged listing without one with no boxes
+      expect(stub.calls[0].query).toMatchObject({ prefix: `b64:${b64('b')}`, include: 'values', limit: 100000 })
 
       // A map with prefix "" lists every box, without a prefix
       stub.calls = []
@@ -1006,6 +1051,18 @@ describe('time travel', () => {
       const past = appClient().atRound(5n)
       expect(past.clone({}).round).toBe(5n)
       expect(past.atRound(undefined).round).toBeUndefined()
+    })
+
+    test('atRound clones share the error transformer of their client, so they are not kept alive', () => {
+      const transformers = () => (algorand as unknown as { _errorTransformers: Set<unknown> })._errorTransformers.size
+      const client = appClient()
+      const before = transformers()
+      for (let round = 1; round <= 20; round++) client.atRound(round).atRound(round + 1)
+      expect(transformers()).toBe(before)
+      // A client made otherwise still registers its own
+      client.clone({})
+      new AppClient({ appId: 5n, appSpec: JSON.stringify(stateArc56), algorand, round: 7 })
+      expect(transformers()).toBe(before + 2)
     })
 
     test('readonly calls simulate at the pinned round, with transactions valid at it', async () => {
@@ -1179,6 +1236,60 @@ describe('time travel', () => {
       expect(request.round).toBe(2000n)
       expect(request.txnGroups[0].txns[0].txn.firstValid).toBe(2001n)
       expect(outcome.round).toBe(2000n)
+    })
+
+    test("groups and rounds leave the composer's transactions as they were, so it can be reused", async () => {
+      const account = algosdk.generateAccount()
+      algorand.setSigner(account.addr, algosdk.makeBasicAccountTransactionSigner(account))
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      // A transaction added already built is reused by every build of the composer, as are method call arguments
+      const prebuilt = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+        sender: account.addr,
+        receiver: account.addr,
+        amount: 1,
+        suggestedParams: { fee: 0, minFee: 1000, firstValid: 1000, lastValid: 6000, genesisHash: new Uint8Array(32).fill(7) },
+      })
+      const composer = algorand
+        .newGroup()
+        .addTransaction(prebuilt)
+        .addPayment({ sender: account.addr, receiver: account.addr, amount: microAlgo(2) })
+      await algorand.simulate.groups([composer])
+      await algorand.simulate.groups([composer])
+      await algorand.simulate.rounds(composer, [1000n, 5000n], { maxRounds: 1 })
+      expect(prebuilt.group).toBeUndefined()
+      // Every request got a group ID for the whole group
+      for (const request of stub.calls.filter((c) => c.method === 'post').map(sentSimulate)) {
+        const [first, second] = request.txnGroups[0].txns.map((t) => t.txn.group)
+        expect(first).toBeDefined()
+        expect(first).toEqual(second)
+      }
+      // and the composer still builds
+      expect((await composer.build()).transactions).toHaveLength(2)
+    })
+
+    test('builds of one composer at different rounds can run at once', async () => {
+      const slowParams = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return suggestedParams()
+      }
+      stub.on('get', '/v2/transactions/params', slowParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const composer = payment(1)
+      await Promise.all([algorand.simulate.groups([composer], { round: 100 }), algorand.simulate.groups([composer], { round: 20000 })])
+      const requests = stub.calls.filter((c) => c.method === 'post').map(sentSimulate)
+      expect(requests.map((r) => r.txnGroups[0].txns[0].txn.firstValid - BigInt(r.round!))).toEqual([1n, 1n])
+      // The composer's own builds are as before
+      expect((await composer.buildTransactions()).transactions[0].firstValid).toBe(BigInt(LAST_ROUND))
+    })
+
+    test("a composer's simulate at a past round leaves its own group valid at the latest round", async () => {
+      const account = algosdk.generateAccount()
+      algorand.setSigner(account.addr, algosdk.makeBasicAccountTransactionSigner(account))
+      stub.on('get', '/v2/transactions/params', suggestedParams, true).on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      const composer = algorand.newGroup().addPayment({ sender: account.addr, receiver: account.addr, amount: microAlgo(1) })
+      await composer.simulate({ round: 2000 })
+      expect(sentSimulate(stub.calls.at(-1)!).txnGroups[0].txns[0].txn.firstValid).toBe(2001n)
+      const { transactions } = await composer.build()
+      expect(transactions[0].txn.firstValid).toBe(BigInt(LAST_ROUND))
     })
 
     test('rounds: packs rounds into windows and returns outcomes in input order', async () => {
@@ -2160,6 +2271,8 @@ describe('query', () => {
       )
       const composer = ghost(ghost())
       const { transactions } = await composer.buildTransactions()
+      // Grouped as simulate groups them, so the transaction IDs match simulate's
+      algosdk.assignGroupID(transactions)
       const results = await algorand.query.rounds(composer, [1000, 2000, 3000])
       expect(results.map((r) => [r.round, r.groups[0].ok])).toEqual([
         [1000n, true],
@@ -2202,6 +2315,22 @@ describe('query', () => {
       const [alone] = await algorand.query.groups([ghost()], { round: 2000, via: 'query' })
       if (!alone.ok) expect(alone.error.failureMessage).toBe('query response too large: over 1000 bytes')
       expect(queried.ok || alone.ok).toBe(false)
+    })
+
+    test('a group of several transactions names the same failing transaction as simulate', async () => {
+      queryLimitsOk(stub)
+        .on('post', '/v2/query', queryEcho({ callError: () => 'logic eval error: nope' }))
+        .on(
+          'post',
+          '/v2/transactions/simulate',
+          echoSimulate(undefined, () => 'logic eval error: nope'),
+        )
+      const [queried] = await algorand.query.groups([ghost(ghost())], { round: 2000, via: 'query' })
+      await algorand.query.groups([ghost(ghost())], { round: 2000, via: 'simulate' })
+      const simulatedTxn = sentSimulate(simulates()[0]).txnGroups[0].txns[0].txn
+      expect(simulatedTxn.group).toBeDefined()
+      expect(queried.ok).toBe(false)
+      if (!queried.ok) expect(queried.error.failureMessage).toBe(`transaction ${simulatedTxn.txID()}: logic eval error: nope`)
     })
 
     test("rounds: hashes each transaction once for every round's method returns", async () => {
@@ -2277,12 +2406,17 @@ describe('query', () => {
         await withoutFeatures(['query'], async () => {
           await expect(algorand.query.groups([ghost()])).rejects.toThrow(DTNotAvailableError)
           await expect(algorand.query.groups([ghost()], { via: 'simulate' })).rejects.toThrow(DTNotAvailableError)
+          // An empty list of rounds too, rather than an empty answer
+          await expect(algorand.query.rounds(ghost(), [])).rejects.toThrow(DTNotAvailableError)
+          await expect(algorand.simulate.rounds(ghost(), [])).rejects.toThrow(DTNotAvailableError)
         })
         expect(stub.calls).toHaveLength(0)
       })
 
       test('on stock algod, both paths throw DTUnsupportedError before sending anything', async () => {
         stockAlgod(stub)
+        await expect(algorand.query.rounds(ghost(), [])).rejects.toSatisfy(isDTUnsupportedError)
+        await expect(algorand.simulate.rounds(ghost(), [])).rejects.toSatisfy(isDTUnsupportedError)
         for (const via of ['auto', 'query', 'simulate'] as const) {
           const error = await algorand.query.groups([ghost()], { via }).catch((e) => e)
           expect(isDTUnsupportedError(error)).toBe(true)

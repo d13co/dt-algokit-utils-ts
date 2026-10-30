@@ -13,13 +13,20 @@ import {
 import { AtRoundOptions, requireTimeTravel, fetchOptions, mapConcurrently } from './dt-support'
 import modelsv2 = algosdk.modelsv2
 
+/**
+ * The page size of the paged box listings when none is given: stock algod's default `MaxAPIBoxPerApplication`, which
+ * caps it. It is always sent, because a node with `MaxAPIBoxPerApplication` 0 (no cap) answers a paged listing without
+ * a limit with no boxes. Pages also end at about 1 MB, so it never makes a page larger.
+ */
+const BOX_PAGE_LIMIT = 100_000
+
 /** Options for {@link AppManager.getBoxes}. */
 export interface GetBoxesOptions extends AtRoundOptions {
   /** Only the boxes whose names start with this prefix (a string is UTF-8). Empty or undefined: every box. */
   prefix?: string | Uint8Array
   /** Include each box's value. */
   includeValues?: boolean
-  /** The most boxes per page; the node caps it at its `MaxAPIBoxPerApplication`. Pages also end at about 1 MB of values. */
+  /** The most boxes per page (default 100000); the node caps it at its `MaxAPIBoxPerApplication`. Pages also end at about 1 MB of values. */
   limit?: number
 }
 
@@ -119,6 +126,8 @@ export interface BoxValueRequestParams {
   type: algosdk.ABIType
   /** Read the box as of the end of this past round instead of the latest round (needs dtalgod time travel) */
   round?: number | bigint
+  /** Aborts the read: passed to fetch. */
+  signal?: AbortSignal
 }
 
 /**
@@ -133,6 +142,8 @@ export interface BoxValuesRequestParams {
   type: algosdk.ABIType
   /** Read the boxes as of the end of this past round instead of the latest round (needs dtalgod time travel) */
   round?: number | bigint
+  /** Aborts the reads: passed to fetch. */
+  signal?: AbortSignal
 }
 
 /**
@@ -386,6 +397,7 @@ export class AppManager {
         const page: modelsv2.BoxesResponse = await tt
           .getApplicationBoxes(appId)
           .round(round)
+          .limit(BOX_PAGE_LIMIT)
           .next(next)
           .do(undefined, fetchOptions(options))
         boxes.push(...page.boxes)
@@ -442,7 +454,7 @@ export class AppManager {
       for (;;) {
         if (prefix.length > 0) request.prefix!(prefix)
         if (includeValues) request.include!('values')
-        if (limit !== undefined) request.limit(limit)
+        request.limit(limit ?? BOX_PAGE_LIMIT)
         if (next !== undefined) request.next(next)
         const page: PagedBoxesResponse = await request.do(undefined, fetchOptions(options))
         // A paged answer has its round; a node that ignored the paging parameters lists every name, without values
@@ -531,8 +543,8 @@ export class AppManager {
    * ```
    */
   public async getBoxValueFromABIType(request: BoxValueRequestParams): Promise<algosdk.ABIValue> {
-    const { appId, boxName, type, round } = request
-    const value = await this.getBoxValue(appId, boxName, round === undefined ? undefined : { round })
+    const { appId, boxName, type, round, signal } = request
+    const value = await this.getBoxValue(appId, boxName, round === undefined && !signal ? undefined : { round, signal })
     return type.decode(value)
   }
 
@@ -546,8 +558,8 @@ export class AppManager {
    * ```
    */
   public async getBoxValuesFromABIType(request: BoxValuesRequestParams): Promise<algosdk.ABIValue[]> {
-    const { appId, boxNames, type, round } = request
-    return await Promise.all(boxNames.map(async (boxName) => await this.getBoxValueFromABIType({ appId, boxName, type, round })))
+    const { appId, boxNames, type, round, signal } = request
+    return await Promise.all(boxNames.map(async (boxName) => await this.getBoxValueFromABIType({ appId, boxName, type, round, signal })))
   }
 
   /**

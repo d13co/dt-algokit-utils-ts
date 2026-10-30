@@ -80,6 +80,7 @@ export interface RoundRequestLike<T> {
 
 /** A box listing request that can be read at a past round. */
 export interface BoxesRoundRequestLike extends RoundRequestLike<modelsv2.BoxesResponse> {
+  limit(limit: number): this
   next(nextToken: string | undefined): this
 }
 
@@ -351,6 +352,22 @@ export function mergeProtocolOverrides(overrides: (SimulateProtocolOverride | un
   const rank = (code: string) => (PROTOCOL_NOTE_ORDER.includes(code) ? PROTOCOL_NOTE_ORDER.indexOf(code) : PROTOCOL_NOTE_ORDER.length)
   notes.sort((a, b) => rank(a.code) - rank(b.code)) // stable: unknown codes keep their order
   return { from: present[0].from, to: present[0].to, applied: present.some((o) => o.applied), ...(notes.length ? { notes } : {}) }
+}
+
+/**
+ * Returns a built group as simulate and queries send it: a group of several transactions as copies with a group ID for
+ * the whole group, replacing any they had. Copies, because the composer reuses the transactions passed to it already
+ * built (method call arguments, `addTransaction`) across its builds, and a group ID left on them breaks its later builds.
+ */
+export function asSentGroup(built: BuiltTransactions): BuiltTransactions {
+  if (built.transactions.length < 2) return built
+  const transactions = built.transactions.map((t) => {
+    const copy = algosdk.decodeUnsignedTransaction(algosdk.encodeUnsignedTransaction(t))
+    copy.group = undefined
+    return copy
+  })
+  algosdk.assignGroupID(transactions)
+  return { ...built, transactions }
 }
 
 /** The IDs of built groups' transactions, by the built group, with the group ID they were hashed under. */

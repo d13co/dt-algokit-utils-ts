@@ -43,7 +43,8 @@ export interface VersionsOptions {
    *
    * - Entries come in `order` (ascending by default), not in the order given: match them by `round`.
    * - An entry with `deleted: true` and no `changedRound` means the object did not exist then.
-   * - **Round 0 is the genesis round here**, unlike `algorand.simulate.rounds` and `algorand.query.*`, where 0 is the latest round.
+   * - **Round 0 is the genesis round here**, unlike the `round` option of `algorand.simulate.groups` / `algorand.query.groups`
+   *   and the `rounds` of `algorand.query.run`, where 0 is the latest round (`simulate.rounds` and `query.rounds` reject 0).
    * - Not with `minRound` / `maxRound`; `limit` counts rounds.
    * - A page sends the rounds as given, in one request (at most 10,000). The iterators split them into requests of
    *   `min(limit, maxRoundsPerRequest)` rounds, so long lists stay under URL length limits: prefer them for long lists.
@@ -720,6 +721,11 @@ export class DTManager {
     const max = options?.maxRoundsPerRequest
     if (max !== undefined && !(Number.isInteger(max) && max > 0)) {
       throw new Error(`maxRoundsPerRequest must be a positive integer, not ${max}`)
+    }
+    // Checked here too, not only by the node: with `rounds`, the iterators split the rounds into chunks of `limit`
+    const limit = options?.limit
+    if (limit !== undefined && !(Number.isInteger(limit) && limit > 0)) {
+      throw new Error(`limit must be a positive integer, not ${limit}`)
     }
   }
 
