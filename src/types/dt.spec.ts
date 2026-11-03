@@ -1717,6 +1717,7 @@ const QUERY_LIMITS = {
   'max-response-bytes': 67_108_864,
   'max-call-state-bytes': 67_108_864,
   'max-rounds': 16,
+  'max-total-calls': 1024,
 }
 
 /** Answers the capabilities endpoint as dtalgod with queries, with these query limits. */
@@ -1802,6 +1803,17 @@ const queryEcho =
     return { status: 200, body: algosdk.msgpackRawEncode(body) }
   }
 
+/** Answers like `queryEcho`, or with dtalgod's 400 for a request over these query limits. */
+const queryWithin =
+  (limits: typeof QUERY_LIMITS) =>
+  (call: Call): Answer => {
+    const { calls, rounds = [] } = sentQuery(call)
+    const total = calls.length * Math.max(1, rounds.length)
+    if (calls.length > limits['max-calls']) return { status: 400, json: { message: `too many calls: got ${calls.length}` } }
+    if (rounds.length > limits['max-rounds']) return { status: 400, json: { message: `too many rounds: got ${rounds.length}` } }
+    if (total > limits['max-total-calls']) return { status: 400, json: { message: `too many calls in total: ${total}` } }
+    return queryEcho()(call)
+  }
 const tooLarge = () => ({ status: 400, json: { message: 'query response too large: over 1000 bytes' } })
 const enc = (text: string) => new TextEncoder().encode(text)
 const dec = (bytes: Uint8Array) => new TextDecoder().decode(bytes)
@@ -1906,6 +1918,75 @@ describe('query', () => {
       stub.calls = []
       await algorand.query.run({ program, rounds: [1, 2], calls }, { maxCalls: 1, maxRounds: 1 })
       expect(queries(stub)).toHaveLength(10)
+    })
+
+    test('chunking by maxTotalCalls: the fewest requests, rounds spread evenly, calls filling the total', async () => {
+      const limited = (query: Partial<typeof QUERY_LIMITS>) => {
+        stub = new StubClient()
+        algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+        queryLimitsOk(stub, query).on('post', '/v2/query', queryWithin({ ...QUERY_LIMITS, ...query }), true)
+      }
+      const shape = () =>
+        queries(stub)
+          .map((c): [bigint[] | undefined, string] => [
+            sentQuery(c).rounds,
+            sentQuery(c)
+              .calls.map((k) => dec(k.args![0]))
+              .join(''),
+          ])
+          .sort(([a, x], [b, y]) => Number(a![0] - b![0]) || x.localeCompare(y))
+      const calls = ['a', 'b', 'c', 'd', 'e'].map((a) => ({ args: [enc(a)] }))
+
+      // 3 rounds in one request leave room for 2 calls each
+      limited({ 'max-calls': 4, 'max-rounds': 4, 'max-total-calls': 6 })
+      const results = await algorand.query.run({ program, rounds: [1, 2, 3], calls })
+      expect(shape()).toEqual([
+        [[1n, 2n, 3n], 'ab'],
+        [[1n, 2n, 3n], 'cd'],
+        [[1n, 2n, 3n], 'e'],
+      ])
+      for (const r of results) expect(r.calls.map((c) => (c.ok ? dec(c.logs[0]) : undefined))).toEqual(['a', 'b', 'c', 'd', 'e'])
+
+      // One round per request leaves room for maxCalls
+      stub.calls = []
+      await algorand.query.run({ program, rounds: [1, 2, 3], calls }, { maxRounds: 1 })
+      expect(shape()).toEqual([
+        [[1n], 'abcd'],
+        [[1n], 'e'],
+        [[2n], 'abcd'],
+        [[2n], 'e'],
+        [[3n], 'abcd'],
+        [[3n], 'e'],
+      ])
+
+      // A total below maxRounds: one round per request is fewer requests than 2 rounds with 1 call each
+      limited({ 'max-calls': 4, 'max-rounds': 4, 'max-total-calls': 2 })
+      await algorand.query.run({ program, rounds: [1, 2, 3], calls: calls.slice(0, 2) })
+      expect(shape()).toEqual([
+        [[1n], 'ab'],
+        [[2n], 'ab'],
+        [[3n], 'ab'],
+      ])
+
+      // The node's defaults. 17 rounds of 100 calls: two requests of 9 and 8 rounds, not 16 rounds of 64 calls and a short one
+      limited({})
+      const many = (n: number) => Array.from({ length: n }, (_, i) => ({ args: [enc(`${i}`)] }))
+      const seventeen = Array.from({ length: 17 }, (_, i) => i + 1)
+      await algorand.query.run({ program, rounds: seventeen, calls: many(100) })
+      expect(queries(stub).map((c) => [sentQuery(c).rounds!.length, sentQuery(c).calls.length])).toEqual([
+        [9, 100],
+        [8, 100],
+      ])
+      // 17 rounds of 1,000 calls: one round per request
+      stub.calls = []
+      const results1000 = await algorand.query.run({ program, rounds: seventeen, calls: many(1000) })
+      expect(queries(stub).map((c) => [sentQuery(c).rounds!.length, sentQuery(c).calls.length])).toEqual(Array(17).fill([1, 1000]))
+      expect(results1000.every((r) => r.calls.length === 1000 && r.calls.every((c) => c.ok))).toBe(true)
+    })
+
+    test("dt-algosdk sets maxTotalCalls to maxCalls times maxRounds for a node that doesn't report it", async () => {
+      queryLimitsOk(stub, { 'max-calls': 3, 'max-rounds': 5, 'max-total-calls': undefined })
+      expect(await algorand.query.limits()).toMatchObject({ maxCalls: 3, maxRounds: 5, maxTotalCalls: 15 })
     })
 
     test('calls are split by the request body limit; a call too large alone throws', async () => {
@@ -2124,6 +2205,7 @@ describe('query', () => {
         maxCallLogBytes: 65_536,
         maxResponseBytes: 67_108_864,
         maxRounds: 16,
+        maxTotalCalls: 1024,
       })
       expect(isDTUnsupportedError(await algorand.query.run({ program, calls: [{}] }).catch((e) => e))).toBe(true)
     })

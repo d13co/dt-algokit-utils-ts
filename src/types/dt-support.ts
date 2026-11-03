@@ -481,7 +481,7 @@ export interface SimulateLimits {
 
 /** The limits a node places on read-only queries (`POST /v2/query`), as dtalgod reports them in its capabilities. */
 export interface QueryLimits {
-  /** The most calls a request may hold (`MaxAPIQueryCalls`). */
+  /** The most calls a request may hold (`MaxAPIQueryCalls`), at most `maxTotalCalls`. */
   maxCalls: number
   /** The most opcode budget of a call, and its budget when the request sets none (`MaxAPIQueryCallBudget`). */
   maxCallBudget: number
@@ -494,6 +494,11 @@ export interface QueryLimits {
   maxResponseBytes: number
   /** The most entries a request may list in `rounds`, duplicates included (`MaxAPIQueryRounds`). */
   maxRounds: number
+  /**
+   * The most calls times listed rounds a request may ask for, duplicates included and no rounds counting as 1
+   * (`MaxAPIQueryTotalCalls`). At most `maxCalls` times `maxRounds`, which it is on nodes that don't report it.
+   */
+  maxTotalCalls: number
 }
 
 /** A call of a query request, as the fork's `QueryCallParams`. */
@@ -692,6 +697,7 @@ export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilit
             maxCallLogBytes: query.maxCallLogBytes,
             maxResponseBytes: query.maxResponseBytes,
             maxRounds: query.maxRounds,
+            maxTotalCalls: query.maxTotalCalls,
           },
         }
       : {}),

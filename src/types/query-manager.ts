@@ -106,9 +106,9 @@ export interface QueryRunOptions {
   signal?: AbortSignal
   /** The most requests in flight at once (default 4). */
   concurrency?: number
-  /** At most this many calls per request. The node's `maxCalls` caps it: set it lower to split more. */
+  /** At most this many calls per request. The node's `maxCalls` and `maxTotalCalls` cap it: set it lower to split more. */
   maxCalls?: number
-  /** At most this many rounds per request. The node's `maxRounds` caps it: set it lower to split more. */
+  /** At most this many rounds per request. The node's `maxRounds` and `maxTotalCalls` cap it: set it lower to split more. */
   maxRounds?: number
 }
 
@@ -481,18 +481,37 @@ class QueryRun {
     }
   }
 
-  /** Splits a job into requests: rounds by `maxRounds`, calls by `maxCalls` and by the request body limit. */
+  /**
+   * Splits a job into requests: rounds by `maxRounds`, calls by `maxCalls`, both by `maxTotalCalls` (calls times rounds),
+   * and calls by the request body limit. The rounds per request are the number that needs the fewest requests (the most
+   * rounds on a tie), spread evenly; each request then takes as many calls as fit in the total at its rounds.
+   */
   private plan(job: QueryJob, j: number): Piece[] {
-    const roundsPerRequest = Math.max(1, Math.min(this.config.maxRounds, this.limits.maxRounds))
-    const callsPerRequest = Math.max(1, Math.min(this.config.maxCalls, this.limits.maxCalls))
+    const { maxCalls, maxRounds, maxTotalCalls } = this.limits
+    const roundCount = job.rounds.length
+    const callCount = job.calls.length
+    const callsAt = (rounds: number) => Math.max(1, Math.min(this.config.maxCalls, maxCalls, Math.floor(maxTotalCalls / rounds)))
+    let best = Math.max(1, Math.min(this.config.maxRounds, maxRounds, maxTotalCalls, roundCount))
+    let fewest = Infinity
+    for (let r = best; r >= 1; r--) {
+      const requests = Math.ceil(roundCount / r) * Math.ceil(callCount / callsAt(r))
+      if (requests < fewest) [fewest, best] = [requests, r]
+    }
+    // As many requests as `best` rounds each need, with the rounds spread evenly between them
+    const roundsPerRequest = Math.ceil(roundCount / Math.ceil(roundCount / best))
+    const ranges = new Map<number, [number, number][]>()
+    return chunk(job.rounds, roundsPerRequest).flatMap((rounds) => {
+      if (!ranges.has(rounds.length)) ranges.set(rounds.length, this.callRanges(job, rounds.length, callsAt(rounds.length)))
+      return ranges.get(rounds.length)!.map(([start, end]) => ({ job: j, start, end, rounds }))
+    })
+  }
+
+  /** Splits a job's calls into requests at `roundCount` rounds: at most `callsPerRequest` each, within the body limit. */
+  private callRanges(job: QueryJob, roundCount: number, callsPerRequest: number): [number, number][] {
     const maxBody = this.tt.MAX_QUERY_REQUEST_BYTES
     const { program, clearProgram } = job.target
     const room =
-      maxBody -
-      (program?.length ?? 0) -
-      (clearProgram?.length ?? 0) -
-      QUERY_REQUEST_OVERHEAD_BYTES -
-      QUERY_ROUND_BYTES * Math.min(roundsPerRequest, job.rounds.length)
+      maxBody - (program?.length ?? 0) - (clearProgram?.length ?? 0) - QUERY_REQUEST_OVERHEAD_BYTES - QUERY_ROUND_BYTES * roundCount
     const callRanges: [number, number][] = []
     let start = 0
     let bytes = 0
@@ -511,7 +530,7 @@ class QueryRun {
       bytes += size
     })
     callRanges.push([start, job.calls.length])
-    return chunk(job.rounds, roundsPerRequest).flatMap((rounds) => callRanges.map(([start, end]) => ({ job: j, start, end, rounds })))
+    return callRanges
   }
 
   /** The encoded size of a call: exact with the fork's model, else an upper estimate. */
@@ -679,9 +698,9 @@ export class QueryManager {
   }
 
   /**
-   * Returns the node's query limits: how many calls and rounds a request may hold, the most budget and log bytes of a
-   * call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries (stock algod, or
-   * dtalgod with queries disabled). The limits are asked for once per algod client, with the node's capabilities.
+   * Returns the node's query limits: how many calls, rounds and calls times rounds a request may hold, the most budget and
+   * log bytes of a call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries
+   * (stock algod, or dtalgod with queries disabled). The limits are asked for once per algod client, with the node's capabilities.
    *
    * @returns The node's query limits, if it has queries
    * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk
@@ -719,8 +738,8 @@ export class QueryManager {
    * signatures, fees or minimum balances, every resource available without references, and its writes dropped. A failed
    * call doesn't affect the others.
    *
-   * The calls and rounds are split into requests by the node's `maxCalls` and `maxRounds` and by the request body limit,
-   * and sent `concurrency` at a time. A request whose results are over the node's `maxResponseBytes`, or that runs over
+   * The calls and rounds are split into as few requests as the node's `maxCalls`, `maxRounds` and `maxTotalCalls` (calls
+   * times rounds) allow, and by the request body limit, and sent `concurrency` at a time. A request whose results are over the node's `maxResponseBytes`, or that runs over
    * its time limit (504), is split in halves (rounds first) and sent again; a call that is still too large or too slow
    * alone fails on its own (`kind: 'call'`). When the latest round (0) is queried in more than one request, it is
    * resolved first so every call sees the same block. A busy node (503) is retried by the HTTP client of an
