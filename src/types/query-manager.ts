@@ -13,7 +13,7 @@ import {
   QueryLimits,
   QueryResponseLike,
   Round,
-  SimulateProtocolOverride,
+  QueryProtocolOverride,
   chunk,
   getDTSdk,
   getQueryLimits,
@@ -33,7 +33,6 @@ import {
   SimulateManager,
   SimulateRoundsOptions,
   checkSimulateLimits,
-  checkValidityWindow,
 } from './simulate-manager'
 import modelsv2 = algosdk.modelsv2
 
@@ -89,9 +88,11 @@ export interface QueryParams {
   /** The rounds to query at (0 for the latest round): the state as of the end of each round. Defaults to the latest round. Duplicates are queried once. */
   rounds?: Round[]
   /**
-   * The protocol of the block after each round, as with simulate's `protocol`: by default `latest` (unlike simulate, which
-   * runs the round's own), `round` for the protocol the chain really ran, a consensus version or `vNN`, or `future` (needs
-   * the developer API). Each result's `protocolOverride` says how it applied (none with `round`).
+   * The protocol of the block after each round, as if an upgrade to it took effect right after the round: its programs,
+   * limits and other parameters apply, to programs deployed earlier too. By default `latest` (the protocol of the block
+   * after the node's latest one); `round` for the protocol the chain really ran; a consensus version string or `v24` to
+   * `v43` for a mainline one, which must be a later protocol of the chain than the one the round really ran; or `future`
+   * (vFuture, needs the developer API). Each result's `protocolOverride` says how it applied (none with `round`).
    */
   protocol?: string
   /** The opcode budget of each call, inner calls included. Defaults to, and at most, the node's `maxCallBudget`. */
@@ -190,7 +191,7 @@ export interface QueryRunResult {
    * With `protocol` (other than `round`): how it applied at this round. The notes' `hits` give the call index as `group`, and
    * the path from the call (`path[0]` is 0). Merged across the requests the calls were split into.
    */
-  protocolOverride?: SimulateProtocolOverride
+  protocolOverride?: QueryProtocolOverride
   /** The outcome of each call, in the order given. */
   calls: QueryCallOutcome[]
 }
@@ -212,18 +213,33 @@ export interface QueryRouting {
   concurrency?: number
 }
 
-/**
- * Options to query groups at one round: those of `algorand.simulate.groups` (except `parallel`: the groups never see each
- * other) and the routing. On the query path, `maxGroups` and `validityWindow` don't apply, and `allowUnnamedResources`
- * is always on.
- */
-export type QueryGroupsOptions = Omit<SimulateGroupsOptions, 'parallel'> & QueryRouting
+/** The protocol option of `groups` and `rounds`, which only the query path takes. */
+export interface QueryProtocolOption {
+  /**
+   * Run the round under a later protocol, as `QueryParams.protocol` does, but by default under the protocol the round
+   * really ran (`round`), as simulate does. Only the query path takes another one: groups that can't be queried then throw
+   * instead of going to simulate, and `via: 'simulate'` throws.
+   */
+  protocol?: string
+}
 
 /**
- * Options to query groups at several rounds: those of `algorand.simulate.rounds` (except `parallel`) and the routing. On
- * the query path, `maxRounds` (when more than 0) also caps the rounds per query request.
+ * Options to query groups at one round: those of `algorand.simulate.groups` (except `parallel`: the groups never see each
+ * other), the protocol and the routing. On the query path, `maxGroups` doesn't apply, and `allowUnnamedResources` is
+ * always on.
  */
-export type QueryRoundsOptions = Omit<SimulateRoundsOptions, 'parallel'> & QueryRouting
+export type QueryGroupsOptions = Omit<SimulateGroupsOptions, 'parallel'> & QueryProtocolOption & QueryRouting
+
+/** Options to query groups at several rounds: those of `algorand.simulate.rounds` (except `parallel`), the protocol and the routing. */
+export type QueryRoundsOptions = Omit<SimulateRoundsOptions, 'parallel'> &
+  QueryProtocolOption &
+  QueryRouting & {
+    /** On the query path, at most this many rounds per query request. The node's `maxRounds` and `maxTotalCalls` cap it. */
+    maxRounds?: number
+  }
+
+/** The options of `groups` and `rounds` that reach the query or simulate path. */
+type ComposedOptions = Omit<QueryRoundsOptions, 'via' | 'concurrency'>
 
 /** The result of a transaction of a queried group. */
 export interface QueryTxnResult {
@@ -238,7 +254,7 @@ export interface QueryTxnResult {
 
 /**
  * Why a group has no result:
- * - `round`: the whole round failed (`failureMessage` is the round's error);
+ * - `round` (query only): the whole round failed (`failureMessage` is the round's error);
  * - `group`: a transaction failed (`failedAt`, `failureMessage`);
  * - `not-simulated` (simulate only): the group wasn't run because an earlier group broke the block;
  * - `missing`: the node returned no result for the group.
@@ -318,10 +334,10 @@ export type QueryGroupOutcome = {
   /** The round of the result: the state as of the end of it. */
   round: bigint
   /**
-   * With `protocol`: how it applied at this round, the same for every group of the round. The notes' `hits` give the
-   * group index and the path in it. Undefined when the round failed.
+   * With `protocol` (query only): how it applied at this round, the same for every group of the round. The notes' `hits`
+   * give the group index and the path in it. Undefined when the round failed.
    */
-  protocolOverride?: SimulateProtocolOverride
+  protocolOverride?: QueryProtocolOverride
   /** Which way the group went. */
   via: 'query' | 'simulate'
 } & (
@@ -341,8 +357,8 @@ export interface QueryRoundOutcome {
   round: bigint
   /** The outcome of each group, in the order the composers were given. */
   groups: QueryGroupOutcome[]
-  /** With `protocol`: how it applied at this round. */
-  protocolOverride?: SimulateProtocolOverride
+  /** With `protocol` (query only): how it applied at this round. */
+  protocolOverride?: QueryProtocolOverride
 }
 
 /** What a query request goes to: a program (with its clear program and schemas) or an app, and the sender. */
@@ -374,7 +390,7 @@ interface RoundResults {
   round: bigint
   error?: string
   /** The overrides of the requests that held this round, hits offset to the job's call indexes */
-  overrides: (SimulateProtocolOverride | undefined)[]
+  overrides: (QueryProtocolOverride | undefined)[]
   calls: (CallResult | undefined)[]
 }
 
@@ -698,8 +714,8 @@ export class QueryManager {
   }
 
   /**
-   * Returns the node's query limits: how many calls, rounds and calls times rounds a request may hold, the most budget and
-   * log bytes of a call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries
+   * Returns the node's query limits: how many calls, rounds and calls times rounds a request may hold, the most budget,
+   * log bytes and state bytes of a call, and the most bytes of a response. `run` keeps to them. Undefined when the node has no queries
    * (stock algod, or dtalgod with queries disabled). The limits are asked for once per algod client, with the node's capabilities.
    *
    * @returns The node's query limits, if it has queries
@@ -786,6 +802,9 @@ export class QueryManager {
     const capabilities = await getCapabilities(this._clientManager.algod)
     const limits = capabilities?.query
     if (!limits) throw new tt.DTUnsupportedError(noQueryMessage(capabilities))
+    if (protocol === 'future' && !capabilities!.developerApi) {
+      throw new Error("protocol 'future' needs a node with the developer API (EnableDeveloperAPI), and this node has it off")
+    }
     if (budget !== undefined && (!Number.isInteger(budget) || budget < 1 || budget > limits.maxCallBudget)) {
       throw new RangeError(`budget must be a positive integer of at most the node's maxCallBudget ${limits.maxCallBudget}, not ${budget}`)
     }
@@ -809,9 +828,9 @@ export class QueryManager {
    *
    * With query, every app call runs alone, against the round's state: the calls of one group don't see each other (no
    * shared budget pool, `global GroupSize` 1, no `gtxn`), and the composers' fees, validity, notes and leases are ignored;
-   * each call gets the node's `maxCallBudget`. With simulate, the groups run as composed, each on its own (`parallel`).
-   * So use it for independent read-only calls, such as ghost calls. The protocol defaults to `round` (the round's own,
-   * as simulate does).
+   * each call gets the node's `maxCallBudget`. With simulate, the groups run as composed, each on its own (`parallel`, a
+   * request per group). So use it for independent read-only calls, such as ghost calls. The protocol defaults to `round`
+   * (the round's own, as simulate runs); another one needs the query path.
    *
    * `via: 'auto'` (the default) queries when all of these hold, and simulates otherwise:
    * - the node reports query limits (it has queries on);
@@ -884,9 +903,19 @@ export class QueryManager {
       throw new Error(`via must be 'auto', 'query' or 'simulate', not ${JSON.stringify(via)}`)
     }
     checkPositiveInteger('concurrency', concurrency)
+    checkPositiveInteger('maxRounds', simulateOptions.maxRounds)
     if (composers.length === 0) throw new Error('No transaction groups to query')
     requireDTSdk('Querying composed app calls')
-    checkValidityWindow(simulateOptions)
+    if ((simulateOptions as { validityWindow?: unknown }).validityWindow !== undefined) {
+      throw new Error('validityWindow is no longer an option: the groups are built valid at each round')
+    }
+    // Simulate no longer takes a protocol: only the query path can run another one
+    // Simulate runs the round's own protocol (`round`); any other needs the query path
+    const otherProtocol = simulateOptions.protocol !== undefined && simulateOptions.protocol !== 'round'
+    const queryOnly = via === 'query' || otherProtocol
+    if (via === 'simulate' && otherProtocol) {
+      throw new Error("protocol needs the query path, and via is 'simulate': simulate no longer takes a protocol")
+    }
     simulateOptions.signal?.throwIfAborted()
     // Both paths need dtalgod. The capabilities are cached per client and shared, so they are read without the signal
     checkSimulateLimits(
@@ -902,11 +931,16 @@ export class QueryManager {
         try {
           return await this.viaQuery(plan, at, simulateOptions, concurrency ?? DEFAULT_QUERY_CONCURRENCY)
         } catch (error) {
-          if (via === 'query' || !isDTUnsupportedError(error)) throw error
+          if (queryOnly || !isDTUnsupportedError(error)) throw error
           Config.logger.debug(`Querying through simulate: ${(error as Error).message}`)
         }
       } else {
         if (via === 'query') throw plan.error()
+        if (queryOnly) {
+          const error = plan.error()
+          error.message += ` (protocol ${simulateOptions.protocol} needs the query path: simulate no longer takes one)`
+          throw error
+        }
         Config.logger.debug(`Querying through simulate: ${plan.reason}`)
       }
     }
@@ -914,11 +948,7 @@ export class QueryManager {
   }
 
   /** Whether the groups can be queried with these options, with the built groups if so. */
-  private async queryPlan(
-    composers: TransactionComposer[],
-    options: Omit<SimulateRoundsOptions, 'parallel'>,
-    round: bigint | undefined,
-  ): Promise<QueryPlan> {
+  private async queryPlan(composers: TransactionComposer[], options: ComposedOptions, round: bigint | undefined): Promise<QueryPlan> {
     const no = (reason: string, error: () => Error = () => new Error(`Can't query these groups: ${reason}`)): QueryPlan => ({
       ok: false,
       reason,
@@ -967,7 +997,7 @@ export class QueryManager {
   private async viaQuery(
     plan: Extract<QueryPlan, { ok: true }>,
     at: { round: bigint } | { rounds: bigint[] },
-    options: Omit<SimulateRoundsOptions, 'parallel'>,
+    options: ComposedOptions,
     concurrency: number,
   ): Promise<QueryRoundOutcome[]> {
     const { tt, limits, built } = plan
@@ -985,7 +1015,7 @@ export class QueryManager {
     const requested = 'rounds' in at ? at.rounds : [at.round]
     // Simulate's default: the protocol the round really ran (which reports no override)
     const protocol = options.protocol ?? 'round'
-    const run = this.newRun(tt, limits, { signal: options.signal, concurrency, maxRounds: options.maxRounds || undefined })
+    const run = this.newRun(tt, limits, { signal: options.signal, concurrency, maxRounds: options.maxRounds })
     const results = await run.execute(parts.map((p) => ({ target: p.target, calls: p.calls, rounds: [...new Set(requested)], protocol })))
     return requested.map((r) => {
       const accs = results.map((m) => m.get(r)!)
@@ -1021,26 +1051,16 @@ export class QueryManager {
   private async viaSimulate(
     composers: TransactionComposer[],
     at: { round: bigint } | { rounds: bigint[] },
-    options: Omit<SimulateRoundsOptions, 'parallel'>,
+    options: ComposedOptions & { concurrency?: number },
   ): Promise<QueryRoundOutcome[]> {
+    // Query-only options: `protocol` sends the call to the query path, so it is unset here
+    const { maxRounds: _maxRounds, protocol: _protocol, ...rest } = options
     if ('round' in at) {
-      const { maxRounds: _maxRounds, validityWindow: _validityWindow, ...rest } = options
       const outcomes = await this._simulate.groups(composers, { ...rest, ...(at.round ? { round: at.round } : {}), parallel: true })
-      const protocolOverride = outcomes.find((o) => o.protocolOverride)?.protocolOverride
-      return [
-        {
-          round: outcomes[0]?.round ?? at.round,
-          groups: outcomes.map(fromSimulateOutcome),
-          ...(protocolOverride ? { protocolOverride } : {}),
-        },
-      ]
+      return [{ round: outcomes[0]?.round ?? at.round, groups: outcomes.map(fromSimulateOutcome) }]
     }
-    const results = await this._simulate.rounds(composers, at.rounds, { ...options, parallel: true })
-    return results.map((r) => ({
-      round: r.round,
-      groups: r.groups.map(fromSimulateOutcome),
-      ...(r.protocolOverride ? { protocolOverride: r.protocolOverride } : {}),
-    }))
+    const results = await this._simulate.rounds(composers, at.rounds, { ...rest, parallel: true })
+    return results.map((r) => ({ round: r.round, groups: r.groups.map(fromSimulateOutcome) }))
   }
 
   /** A run of query requests within the node's limits. */
@@ -1163,7 +1183,7 @@ function toQueryGroupOutcome(
   round: bigint,
   roundError: string | undefined,
   calls: (CallResult | undefined)[],
-  protocolOverride: SimulateProtocolOverride | undefined,
+  protocolOverride: QueryProtocolOverride | undefined,
 ): QueryGroupOutcome {
   const base = { groupIndex, round, via: 'query' as const, ...(protocolOverride ? { protocolOverride } : {}) }
   const fail = (error: QueryGroupError): QueryGroupOutcome => ({ ...base, ok: false, error })
@@ -1206,8 +1226,7 @@ function simulateResultsOf(response: modelsv2.SimulateResponse) {
   let results = simulateResults.get(response)
   if (!results) {
     results = new Map()
-    const rounds = (response as { roundResults?: { txnGroups: modelsv2.SimulateTransactionGroupResult[] }[] }).roundResults ?? []
-    for (const group of [...response.txnGroups, ...rounds.flatMap((r) => r.txnGroups)]) {
+    for (const group of response.txnGroups) {
       for (const t of group.txnResults) results.set(t.txnResult, t)
     }
     simulateResults.set(response, results)
@@ -1218,7 +1237,7 @@ function simulateResultsOf(response: modelsv2.SimulateResponse) {
 /** A simulate outcome as a query outcome. */
 function fromSimulateOutcome(o: SimulateGroupOutcome): QueryGroupOutcome {
   const { groupIndex, round } = o
-  const base = { groupIndex, round, via: 'simulate' as const, ...(o.protocolOverride ? { protocolOverride: o.protocolOverride } : {}) }
+  const base = { groupIndex, round, via: 'simulate' as const }
   const cost = (t: modelsv2.SimulateTransactionResult | undefined) =>
     t?.appBudgetConsumed !== undefined ? { cost: t.appBudgetConsumed } : {}
   if (o.ok) {

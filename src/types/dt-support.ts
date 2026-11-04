@@ -20,16 +20,12 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'reads-at-round',
   'versions',
   'simulate-groups',
-  'parallel-groups',
-  'simulate-rounds',
   'from',
   'group-results',
   'from-transactions',
-  'pack-rounds',
-  'validity-window',
-  'simulate-protocol',
   'capabilities',
   'query',
+  'query-total-calls',
   'versions-rounds',
   'versions-keys',
   'versions-pages',
@@ -223,9 +219,8 @@ export interface RawVersionsPage<Entry> {
   nextToken?: string
 }
 
-/** The outcome of one group at one round of an extended simulate request. */
+/** The outcome of one group of an extended simulate request. */
 export type RawSimulateGroupOutcome = {
-  roundIndex: number
   groupIndex: number
   round: bigint
 } & (
@@ -233,7 +228,7 @@ export type RawSimulateGroupOutcome = {
   | {
       ok: false
       error: Error & {
-        kind: 'round' | 'group' | 'not-simulated' | 'missing'
+        kind: 'group' | 'not-simulated' | 'missing'
         failureMessage?: string
         failedAt?: number[]
         result?: modelsv2.SimulateTransactionGroupResult
@@ -241,26 +236,26 @@ export type RawSimulateGroupOutcome = {
     }
 )
 
-/** A transaction that read data a {@link SimulateProtocolNote} is about. */
-export interface SimulateProtocolNoteHit {
-  /** The 0-based index of the transaction group. */
+/** A call or inner transaction that read data a {@link QueryProtocolNote} is about. */
+export interface QueryProtocolNoteHit {
+  /** The 0-based index of the call (of the group, in `query.groups` / `rounds` results). */
   group: number
-  /** The path of the transaction in its group, as in `failedAt`. A logic signature's hit has the path of its top-level transaction. */
+  /** The path of the transaction from the call, as in simulate's `failedAt`: `[0]` for the call, `[0, i]` for its inner transaction `i`. */
   path: number[]
 }
 
 /**
- * The codes of {@link SimulateProtocolNote}, as of this version. A newer node may send others.
+ * The codes of {@link QueryProtocolNote}, as of this version. A newer node may send others.
  * - `semantics-changed`: consensus parameters that affect transactions differ; the message lists each, old → new
  * - `no-heartbeat-challenges`: no heartbeat challenge applies, since earlier challenge rounds ran other rules
  * - `no-load-history`: a congestion tax computed from a load of 0
  * - `block-incentive-fields`: `block` read an incentive field of a round without incentives, which reads as zero
  * - `block-hash-fields`: `block` read a SHA-512 or SHA-256 header field of a round that did not compute it, which reads as zero bytes
- * - `online-stake-includes-expired`: `online_stake` included keys that expire before the simulated round
+ * - `online-stake-includes-expired`: `online_stake` included keys that expire before the queried round
  * - `account-incentive-fields`: an account incentive field read before incentives, which reads as false or 0
  * - `app-version-starts-at-upgrade`: `AppVersion` counts from the upgrade on
  */
-export type SimulateProtocolNoteCode =
+export type QueryProtocolNoteCode =
   | 'semantics-changed'
   | 'no-heartbeat-challenges'
   | 'no-load-history'
@@ -270,32 +265,32 @@ export type SimulateProtocolNoteCode =
   | 'account-incentive-fields'
   | 'app-version-starts-at-upgrade'
 
-/** A note about simulating under a later protocol: where the simulation differs from what the chain recorded, or read data the chain never produced. */
-export interface SimulateProtocolNote {
-  /** What the note is about: a {@link SimulateProtocolNoteCode}. */
-  code: SimulateProtocolNoteCode | (string & {})
+/** A note about running a round under a later protocol: where it differs from what the chain recorded, or read data the chain never produced. */
+export interface QueryProtocolNote {
+  /** What the note is about: a {@link QueryProtocolNoteCode}. */
+  code: QueryProtocolNoteCode | (string & {})
   /** The note, for people. */
   message: string
   /**
-   * The transactions that read the data the note is about: up to 16 per note from each request (more when parallel groups
-   * were split across requests). Undefined for notes about the protocol change as a whole.
+   * The calls and inner transactions that read the data the note is about: up to 16 per note from each request (more when
+   * the calls were split across requests). Undefined for notes about the protocol change as a whole.
    */
-  hits?: SimulateProtocolNoteHit[]
+  hits?: QueryProtocolNoteHit[]
 }
 
-/** How a simulate request's `protocol` applied to the simulated round. */
-export interface SimulateProtocolOverride {
-  /** The protocol the round after the simulated one really ran. */
+/** How a query's `protocol` applied to a queried round. */
+export interface QueryProtocolOverride {
+  /** The protocol the round after the queried one really ran. */
   from: string
   /** The requested protocol, with aliases (`v42`, `latest`) resolved. */
   to: string
-  /** False when `from` is already `to`: the round was simulated as it is. */
+  /** False when `from` is already `to`: the round was queried as it is. */
   applied: boolean
-  /** Where the simulation under `to` differs from what the chain recorded, or read data the chain never produced. Only set when `applied`. */
-  notes?: SimulateProtocolNote[]
+  /** Where running under `to` differs from what the chain recorded, or read data the chain never produced. Only set when `applied`. */
+  notes?: QueryProtocolNote[]
 }
 
-// Helpers shared by the simulate and query managers
+// Helpers of the simulate and query managers
 
 /** The order the node lists protocol notes in; codes it adds later go after these. */
 export const PROTOCOL_NOTE_ORDER: readonly string[] = [
@@ -311,39 +306,36 @@ export const PROTOCOL_NOTE_ORDER: readonly string[] = [
 
 /**
  * A protocol override with each note hit replaced by `map(hit)`: for results of requests that hold only part of the
- * groups or calls asked for. Notes without hits, and an override without notes, are kept as they are.
+ * calls asked for. Notes without hits, and an override without notes, are kept as they are.
  * @param override The override of one request at one round, if any
  * @param map The new hit for a hit of that request
  */
 export function mapProtocolOverrideHits(
-  override: SimulateProtocolOverride | undefined,
-  map: (hit: SimulateProtocolNoteHit) => SimulateProtocolNoteHit,
-): SimulateProtocolOverride | undefined {
+  override: QueryProtocolOverride | undefined,
+  map: (hit: QueryProtocolNoteHit) => QueryProtocolNoteHit,
+): QueryProtocolOverride | undefined {
   if (!override || !override.notes) return override
   return { ...override, notes: override.notes.map((n) => (n.hits ? { ...n, hits: n.hits.map(map) } : n)) }
 }
 
 /**
- * A protocol override with the notes' group indexes moved by `offset`: for a request whose first group (or call) is the
- * `offset`th of those asked for.
+ * A protocol override with the notes' call indexes moved by `offset`: for a request whose first call is the `offset`th of
+ * those asked for.
  */
-export function offsetProtocolOverride(
-  override: SimulateProtocolOverride | undefined,
-  offset: number,
-): SimulateProtocolOverride | undefined {
+export function offsetProtocolOverride(override: QueryProtocolOverride | undefined, offset: number): QueryProtocolOverride | undefined {
   if (offset === 0) return override
   return mapProtocolOverrideHits(override, (h) => ({ ...h, group: h.group + offset }))
 }
 
 /**
- * Merges the protocol overrides of the requests that the groups (or calls) of one round were split across: notes with the
+ * Merges the protocol overrides of the requests that the calls of one round were split across: notes with the
  * same code and message become one with all their hits, in the node's note order, and the override is `applied` if it
  * applied in any request. Undefined when no request has one.
  */
-export function mergeProtocolOverrides(overrides: (SimulateProtocolOverride | undefined)[]): SimulateProtocolOverride | undefined {
-  const present = overrides.filter((o): o is SimulateProtocolOverride => o !== undefined)
+export function mergeProtocolOverrides(overrides: (QueryProtocolOverride | undefined)[]): QueryProtocolOverride | undefined {
+  const present = overrides.filter((o): o is QueryProtocolOverride => o !== undefined)
   if (present.length <= 1) return present[0]
-  const notes: SimulateProtocolNote[] = []
+  const notes: QueryProtocolNote[] = []
   for (const n of present.flatMap((o) => o.notes ?? [])) {
     const same = notes.find((m) => m.code === n.code && m.message === n.message)
     if (!same) notes.push({ ...n, ...(n.hits ? { hits: [...n.hits] } : {}) })
@@ -374,7 +366,7 @@ export function asSentGroup(built: BuiltTransactions): BuiltTransactions {
 const builtTxIds = new WeakMap<BuiltTransactions, { groupId: string; txIds: readonly string[] }>()
 
 /**
- * The base64 group ID and the transaction IDs of a built group, hashed once per group ID. Requests with `rounds` return
+ * The base64 group ID and the transaction IDs of a built group, hashed once per group ID. Queries at several rounds return
  * the same group at every round, and hashing its transactions again for each was a large part of the time spent on the
  * response. The `txIds` array is shared: copy it before handing it out.
  */
@@ -455,7 +447,7 @@ export const chunk = <T>(items: T[], size: number): T[][] => {
 export interface Capabilities {
   /** Whether the node reported these: true on dtalgod, false on stock algod, which gets stock algod's values. */
   reported: boolean
-  /** Whether the node has time travel (`EnableTimeTravel`): reads at past rounds, versions, holders, and `round` and `rounds` back to genesis. False on stock algod. */
+  /** Whether the node has time travel (`EnableTimeTravel`): reads at past rounds, versions, holders, and simulate and query rounds back to genesis. False on stock algod. */
   timeTravel: boolean
   /** Whether requests may set `execTraceConfig` and the protocol `future` (`EnableDeveloperAPI`). False on stock algod. */
   developerApi: boolean
@@ -471,12 +463,8 @@ export interface Capabilities {
 export interface SimulateLimits {
   /** The most transaction groups a request may hold (`MaxAPISimulateGroups`). 1 on stock algod. */
   maxTxnGroups: number
-  /** The most entries a request may list in `rounds`, duplicates included (`MaxAPISimulateRounds`). 0: `rounds` is disabled, as on stock algod. */
-  maxRounds: number
   /** The most `extraOpcodeBudget`, for each top-level group of a request (`MaxAPISimulateExtraOpcodeBudget`). 320,000 on stock algod. */
   maxExtraOpcodeBudget: number
-  /** The factor on the consensus limits on unnamed resources with `allowUnnamedResources` (`SimulateResourceLimitMultiplier`). 1: the consensus limits. */
-  resourceLimitMultiplier: number
 }
 
 /** The limits a node places on read-only queries (`POST /v2/query`), as dtalgod reports them in its capabilities. */
@@ -487,6 +475,11 @@ export interface QueryLimits {
   maxCallBudget: number
   /** The most bytes each program of a call may log, in up to 2,048 logs. 0: the protocol's limits, 1,024 bytes in 32 logs (`MaxAPIQueryCallLogBytes`). */
   maxCallLogBytes: number
+  /**
+   * The most bytes of ledger state one call may read (accounts, holdings and local states, asset and app params, boxes,
+   * each counted once). A call that reads more fails on its own. 0: no limit (`MaxAPIQueryCallStateBytes`).
+   */
+  maxCallStateBytes: number
   /**
    * The most bytes of logs and errors a request may return, across its calls and rounds (a round listed twice counts
    * twice, each log 48 bytes more than its length). 0: no limit (`MaxAPIQueryResponseBytes`).
@@ -534,7 +527,7 @@ export interface QueryCallResultLike {
 /** The response of a query request: one round result per requested round, in order. */
 export interface QueryResponseLike {
   lastRound: bigint
-  rounds: { round: bigint; error?: string; protocolOverride?: SimulateProtocolOverride; calls: QueryCallResultLike[] }[]
+  rounds: { round: bigint; error?: string; protocolOverride?: QueryProtocolOverride; calls: QueryCallResultLike[] }[]
 }
 
 /** A query request (`POST /v2/query`). */
@@ -544,27 +537,28 @@ export interface RunQueryLike {
   do(...args: DoArgs): Promise<QueryResponseLike>
 }
 
-/** The response of an extended simulate request. */
+/** The response of a simulate request of several groups. */
 export interface DTSimulateResponseLike extends modelsv2.SimulateResponse {
-  roundResults?: {
-    lastRound: bigint
-    txnGroups: modelsv2.SimulateTransactionGroupResult[]
-    protocolOverride?: SimulateProtocolOverride
-    error?: string
-  }[]
-  protocolOverride?: SimulateProtocolOverride
-  groupResult(groupIndex: number, roundIndex?: number): RawSimulateGroupOutcome
-  groupResults(groupCount?: number): RawSimulateGroupOutcome[][]
+  groupResult(groupIndex: number): RawSimulateGroupOutcome
+  groupResults(groupCount?: number): RawSimulateGroupOutcome[]
 }
 
-/** An extended simulate request. */
+/** A simulate request of several groups. */
 export interface DTSimulateRequestLike {
-  parallelGroups(parallelGroups?: boolean): this
-  rounds(rounds: Round[]): this
-  skipValidityWindow(skipValidityWindow?: boolean): this
-  rewriteValidityWindow(rewriteValidityWindow?: boolean): this
-  protocol(protocol: string): this
   do(...args: DoArgs): Promise<DTSimulateResponseLike>
+}
+
+/**
+ * The node's capabilities as dt-algosdk returns them. A field can be missing when dt-algosdk is older or newer than this
+ * algokit-utils; `getCapabilities` gives it a safe default.
+ */
+export interface CapabilitiesLike {
+  reported: boolean
+  timeTravel?: boolean
+  developerApi?: boolean
+  timeLimitSeconds?: number
+  simulate?: Partial<SimulateLimits>
+  query?: Partial<QueryLimits>
 }
 
 /** The parts of the fork's `DTAlgodClient` that algokit-utils uses. */
@@ -596,16 +590,9 @@ export interface DTAlgodLike {
   getAssetHolders(assetId: Round): AssetHoldersRequestLike
   simulateTransactions(request: modelsv2.SimulateRequest): DTSimulateRequestLike
   /** The node's capabilities, cached per client; stock algod's after a 404. */
-  capabilities(): Promise<Capabilities>
+  capabilities(): Promise<CapabilitiesLike>
   /** A read-only query (`POST /v2/query`). */
   query(request: QueryRequestParamsLike): RunQueryLike
-}
-
-/** A window of rounds that one extended simulate request covers, from `packSimulateRounds`. */
-export interface SimulateRoundsWindowLike {
-  rounds: bigint[]
-  firstValid: bigint
-  lastValid: bigint
 }
 
 interface DTAlgodClass {
@@ -616,18 +603,11 @@ interface DTAlgodClass {
 interface DTSdk {
   DTAlgodClient: DTAlgodClass
   DTUnsupportedError: new (message: string, fields?: { requestedRound?: bigint; cause?: unknown }) => Error
-  packSimulateRounds(
-    rounds: Round[],
-    options?: { maxRounds?: number; maxSpan?: number | null },
-  ): { windows: SimulateRoundsWindowLike[]; positions: { window: number; roundIndex: number }[] }
   dtModels: {
     DTSimulateRequest: {
       fromTransactions(
         groups: algosdk.Transaction[][],
-        fields?: Omit<ConstructorParameters<typeof modelsv2.SimulateRequest>[0], 'txnGroups'> & {
-          parallelGroups?: boolean
-          rounds?: Round[]
-        },
+        fields?: Omit<ConstructorParameters<typeof modelsv2.SimulateRequest>[0], 'txnGroups'>,
       ): modelsv2.SimulateRequest
     }
     QueryCall: new (call: QueryCallLike) => algosdk.Encodable
@@ -675,32 +655,36 @@ export function toDTAlgod(algod: algosdk.Algodv2, feature = 'This feature'): DTA
 export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilities | undefined> {
   const tt = getDTSdk()
   if (!tt) return undefined
-  // A copy: the fork's object is shared by every caller of the client
+  // A copy: the fork's object is shared by every caller of the client. A field dt-algosdk doesn't have (an older or newer
+  // one) gets a safe default: stock algod's for simulate, the smallest for queries.
   const { reported, timeTravel, developerApi, timeLimitSeconds, simulate, query } = await tt.DTAlgodClient.from(algod).capabilities()
   return {
     reported,
-    timeTravel,
-    developerApi,
-    timeLimitSeconds,
+    timeTravel: timeTravel ?? false,
+    developerApi: developerApi ?? false,
+    timeLimitSeconds: timeLimitSeconds ?? 0,
     simulate: {
-      maxTxnGroups: simulate.maxTxnGroups,
-      maxRounds: simulate.maxRounds,
-      maxExtraOpcodeBudget: simulate.maxExtraOpcodeBudget,
-      resourceLimitMultiplier: simulate.resourceLimitMultiplier,
+      maxTxnGroups: simulate?.maxTxnGroups ?? 1,
+      maxExtraOpcodeBudget: simulate?.maxExtraOpcodeBudget ?? 320_000,
     },
     // Only when present, so the capabilities of a node without queries have no `query` key
-    ...(query
-      ? {
-          query: {
-            maxCalls: query.maxCalls,
-            maxCallBudget: query.maxCallBudget,
-            maxCallLogBytes: query.maxCallLogBytes,
-            maxResponseBytes: query.maxResponseBytes,
-            maxRounds: query.maxRounds,
-            maxTotalCalls: query.maxTotalCalls,
-          },
-        }
-      : {}),
+    ...(query ? { query: queryLimitsOf(query) } : {}),
+  }
+}
+
+/** A copy of dt-algosdk's query limits, with safe defaults for the fields it doesn't have. */
+function queryLimitsOf(query: Partial<QueryLimits>): QueryLimits {
+  const maxCalls = query.maxCalls ?? 1
+  const maxRounds = query.maxRounds ?? 1
+  return {
+    maxCalls,
+    maxCallBudget: query.maxCallBudget ?? 700,
+    maxCallLogBytes: query.maxCallLogBytes ?? 0,
+    maxCallStateBytes: query.maxCallStateBytes ?? 0,
+    maxResponseBytes: query.maxResponseBytes ?? 0,
+    maxRounds,
+    // 0 too: a node never reports it, and dt-algosdk takes it as absent
+    maxTotalCalls: query.maxTotalCalls || Math.min(maxCalls * maxRounds, Number.MAX_SAFE_INTEGER),
   }
 }
 
