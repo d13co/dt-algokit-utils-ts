@@ -5,7 +5,8 @@
 //   node scripts/ci/dt-release.mjs check [tag]   fail if the docs, package-lock.json, the dt-algosdk versions or the tag disagree
 //
 // The docs name two versions: @d13co/dt-algokit-utils@<package.json version> and
-// dt-algosdk@<the exact dt-algosdk devDependency>, in the install snippets.
+// dt-algosdk@<the exact dt-algosdk devDependency>, in the install snippets. The devDependency is
+// npm:dt-algosdk@<version>, or file:./vendor/dt-algosdk-<version>.tgz while that version isn't on npm.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,7 +28,7 @@ const [mode, tag] = process.argv.slice(2)
 const pkg = readJson('package.json')
 const { version } = pkg
 const sdkSpec = pkg.devDependencies?.algosdk ?? ''
-const sdkVersion = /^npm:dt-algosdk@(.+)$/.exec(sdkSpec)?.[1]
+const sdkVersion = (/^npm:dt-algosdk@(.+)$/.exec(sdkSpec) ?? /^file:\.\/vendor\/dt-algosdk-(.+)\.tgz$/.exec(sdkSpec))?.[1]
 
 // Compares two dt prereleases of the same x.y.z, identifier by identifier (all numeric after `dt`)
 const comparePre = (a, b) => {
@@ -45,7 +46,9 @@ if (mode === 'update') {
     process.exit(1)
   }
   if (!sdkVersion || !new RegExp(`^${DT_VERSION}$`).test(sdkVersion)) {
-    console.error(`devDependencies.algosdk is ${sdkSpec}, not npm:dt-algosdk@<exact dt version>`)
+    console.error(
+      `devDependencies.algosdk is ${sdkSpec}, not npm:dt-algosdk@<exact dt version> or file:./vendor/dt-algosdk-<exact dt version>.tgz`,
+    )
     process.exit(1)
   }
   for (const file of DOCS) {
@@ -66,7 +69,9 @@ if (mode === 'update') {
 
   // The repo builds and tests against one exact dt-algosdk, and the peer range must accept it
   if (!sdkVersion || !new RegExp(`^${DT_VERSION}$`).test(sdkVersion)) {
-    errors.push(`devDependencies.algosdk is ${sdkSpec}, not npm:dt-algosdk@<exact dt version>`)
+    errors.push(
+      `devDependencies.algosdk is ${sdkSpec}, not npm:dt-algosdk@<exact dt version> or file:./vendor/dt-algosdk-<exact dt version>.tgz`,
+    )
   } else {
     const locked = lock.packages['node_modules/algosdk']?.version
     if (locked !== sdkVersion) errors.push(`package-lock.json has dt-algosdk ${locked}, not ${sdkVersion}`)
