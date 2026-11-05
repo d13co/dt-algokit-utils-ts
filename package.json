@@ -106,7 +106,7 @@
     "@types/uuid": "^10.0.0",
     "@typescript-eslint/eslint-plugin": "^8.8.1",
     "@vitest/coverage-v8": "^4.1.11",
-    "algosdk": "file:./vendor/dt-algosdk-3.9.0-dt.5.2.0.0.tgz",
+    "algosdk": "npm:dt-algosdk@3.9.0-dt.5.2.0.0",
     "better-npm-audit": "^3.11.0",
     "cpy-cli": "^5.0.0",
     "dotenv-cli": "^7.4.2",
