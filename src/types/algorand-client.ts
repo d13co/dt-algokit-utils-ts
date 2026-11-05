@@ -236,7 +236,8 @@ export class AlgorandClient {
   }
 
   /**
-   * Extended simulate on dtalgod: several transaction groups per request, and the same groups at several rounds.
+   * Extended simulate on dtalgod: several transaction groups per request, groups in parallel, and the same groups at several
+   * rounds (a request per round).
    * Needs dt-algosdk (the time-travel fork of algosdk).
    * @returns The `SimulateManager` instance.
    * @example

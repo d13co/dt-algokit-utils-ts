@@ -1,6 +1,6 @@
 {
   "name": "@d13co/dt-algokit-utils",
-  "version": "9.2.3-dt.4.1.0.0",
+  "version": "9.2.3-dt.5.2.0.0",
   "private": false,
   "description": "Fork of @algorandfoundation/algokit-utils with dtalgod support: reads at past rounds, object versions and history, asset holders, extended simulate and read-only TEAL queries.",
   "keywords": [
@@ -94,7 +94,7 @@
     "buffer": "^6.0.3"
   },
   "peerDependencies": {
-    "algosdk": "^3.5.2 || ^3.9.0-dt.4.1.0.0"
+    "algosdk": "^3.5.2 || ^3.9.0-dt.5.2.0.0"
   },
   "devDependencies": {
     "@algorandfoundation/tealscript": "^0.106.3",
@@ -106,7 +106,7 @@
     "@types/uuid": "^10.0.0",
     "@typescript-eslint/eslint-plugin": "^8.8.1",
     "@vitest/coverage-v8": "^4.1.11",
-    "algosdk": "npm:dt-algosdk@3.9.0-dt.4.1.0.0",
+    "algosdk": "npm:dt-algosdk@3.9.0-dt.5.2.0.0",
     "better-npm-audit": "^3.11.0",
     "cpy-cli": "^5.0.0",
     "dotenv-cli": "^7.4.2",

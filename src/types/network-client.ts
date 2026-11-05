@@ -1,4 +1,5 @@
 import { TokenHeader } from 'algosdk'
+import type { RetryOptionsLike } from './retry'
 
 /** Config for an Algorand SDK client. */
 export interface AlgoClientConfig {
@@ -8,6 +9,12 @@ export interface AlgoClientConfig {
   port?: string | number
   /** The token to use for API authentication (or undefined if none needed) - can be a string, or an object with the header key => value */
   token?: string | TokenHeader
+  /**
+   * How this algod or indexer client retries failed requests: the retry policy fields to change, or `false` for no
+   * retries. Wins, field by field, over `Config.retry` (`false` counting as `{ maxTries: 1 }`). No effect on kmd clients, which don't retry, or with stock
+   * algosdk (it needs dt-algosdk's `retry-policy`). See "Retries" in docs/dt-fork.md.
+   */
+  retry?: RetryOptionsLike
 }
 
 /** Configuration for algod, indexer and kmd clients. */

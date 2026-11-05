@@ -11,28 +11,29 @@ It is a drop-in replacement: existing APIs, types and generated typed clients wo
 - **Versions**: `algorand.dt` lists the rounds at which a box, an app's boxes, an app, an asset or an account changed, with the values if asked, by page or as an async iterator; as of a list of `rounds`, with the changed state keys, or only the changes of one state `key` or box name `prefix`.
 - **Asset holders**: `algorand.dt.getAssetHolders` / `iterateAssetHolders` list an asset's holders at a round.
 - **Box listings**: `algorand.app.getBoxes` lists boxes under a prefix with their values in one paged listing; `state.box.getMap` uses it.
-- **Extended simulate**: `algorand.simulate.groups` simulates several groups in one request, and `algorand.simulate.rounds` simulates groups at many rounds, packed into as few requests as the node's limits allow, optionally with validity windows rewritten or skipped and under a later consensus protocol.
+- **Extended simulate**: `algorand.simulate.groups` simulates several groups in one request, or each on its own with `parallel`, and `algorand.simulate.rounds` simulates groups at many rounds, a request per round.
 - **Node limits**: simulate follows the limits dtalgod reports, and readonly app calls get the node's full extra opcode budget.
-- **Queries**: `algorand.query.run` runs read-only TEAL calls of a program or app at many rounds (`POST /v2/query`), split within the node's limits; `algorand.query.groups`/`rounds` query composed app calls, with simulate as the fallback.
+- **Queries**: `algorand.query.run` runs read-only TEAL calls of a program or app at many rounds (`POST /v2/query`), optionally under a later consensus protocol, split within the node's limits; `algorand.query.groups`/`rounds` query composed app calls, with simulate as the fallback.
+- **Retries**: the clients algokit-utils makes retry by dt-algosdk's retry policy (rate limits, busy nodes, `Retry-After`, no blind resubmits of transactions), changed per client or globally with `retry`, with an event for each wait.
 - **Abort signals**: `signal` on app reads, version pages, simulate and queries cancels the request and its retries.
 
 See **[the full list of differences](./docs/dt-fork.md)** for every changed method, examples and caveats.
 
 ## Installing the fork
 
-The new features also need `dt-algosdk`, the matching fork of algosdk, and a node on the current dt-algorand release (dt4, `v5.0.5-dt4`); older dtalgod releases are not supported. Install both under their upstream names and override them across your whole dependency tree, so your code, generated typed clients and other libraries (e.g. algokit-subscriber) all load the same copy. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`.
+The new features also need `dt-algosdk`, the matching fork of algosdk, and a node on the current dt-algorand release (dt5, `v5.0.5-dt5`); older dtalgod releases are not supported. Install both under their upstream names and override them across your whole dependency tree, so your code, generated typed clients and other libraries (e.g. algokit-subscriber) all load the same copy. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`.
 
 npm (`package.json`; each override must equal the dependency spec):
 
 ```json
 {
   "dependencies": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.4.1.0.0",
-    "algosdk": "npm:dt-algosdk@3.9.0-dt.4.1.0.0"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.5.2.0.0",
+    "algosdk": "npm:dt-algosdk@3.9.0-dt.5.2.0.0"
   },
   "overrides": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.4.1.0.0",
-    "algosdk": "npm:dt-algosdk@3.9.0-dt.4.1.0.0"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.5.2.0.0",
+    "algosdk": "npm:dt-algosdk@3.9.0-dt.5.2.0.0"
   }
 }
 ```
@@ -41,8 +42,8 @@ pnpm (`pnpm-workspace.yaml`, or `pnpm.overrides` in `package.json`), with the sa
 
 ```yaml
 overrides:
-  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.4.1.0.0
-  algosdk: npm:dt-algosdk@3.9.0-dt.4.1.0.0
+  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.5.2.0.0
+  algosdk: npm:dt-algosdk@3.9.0-dt.5.2.0.0
 ```
 
 yarn: the same entries under `resolutions` in `package.json` (yarn ignores `overrides`). Yarn 4 refuses versions published less than a day ago (`npmMinimalAgeGate`); to install a new release right away, add `npmPreapprovedPackages: ["@d13co/dt-algokit-utils", "dt-algosdk"]` to `.yarnrc.yml`. bun: the same entries under `overrides`.

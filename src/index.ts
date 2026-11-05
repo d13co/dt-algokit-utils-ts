@@ -20,4 +20,13 @@ export { AlgorandClient } from './types/algorand-client'
 export * from './types/debugging'
 export * from './types/lifecycle-events'
 export { DTNotAvailableError, isDTUnsupportedError } from './types/dt-support'
+export type {
+  RetryContextLike,
+  RetryDecisionLike,
+  RetryOptionsLike,
+  RetryPolicyLike,
+  RetryReason,
+  RetryWaitLike,
+  RetryWaitReason,
+} from './types/retry'
 export { QueryCallError, QueryGroupError } from './types/query-manager'

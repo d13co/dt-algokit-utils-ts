@@ -1,16 +1,40 @@
 import { IntDecoding, parseJSON, stringifyJSON } from 'algosdk'
 import { BaseHTTPClientResponse, Query, URLTokenBaseHTTPClient } from 'algosdk/client'
 import { Config } from '../config'
+import { getDTRetry } from './dt-support'
+import { EventType } from './lifecycle-events'
+import type { RetryOptionsLike, RetryPolicyLike, RetryWaitLike } from './retry'
+
+/**
+ * Marks a client that retries, so dt-algosdk's `withRetry` doesn't wrap it again (dt-algosdk's `RETRYING_CLIENT`, a
+ * registered symbol).
+ */
+export const RETRYING_CLIENT: unique symbol = Symbol.for('dt-algosdk.retrying-client') as never
+
+/** Calls `f`, ignoring what it throws or a promise it rejects: a broken listener must not break the request. */
+function callQuietly(f: () => unknown) {
+  try {
+    const result = f()
+    if (result && typeof (result as Promise<unknown>).catch === 'function') (result as Promise<unknown>).catch(() => {})
+  } catch {
+    // ignored
+  }
+}
 
 /**
  * A HTTP Client that wraps the Algorand SDK HTTP Client with retries.
  *
- * A 429 or 503 with a `Retry-After` header waits at least that long before the next try (capped at 10 s). A dtalgod 503
- * for a busy node ("node is busy", or no slot free to re-evaluate an old round's deltas) without a readable header (a
- * proxy may drop it) waits at least 1 s. A 503 for history
- * the node can't serve (an incomplete box or holders index, an untrusted history) is not retried: it lasts until the node
- * is fixed. A 504 (the node's time limit) is not retried from `POST /v2/query` or from `GET` of `/versions` and `/holders`
- * listings: a retry repeats the whole work, and the caller narrows the request instead.
+ * With dt-algosdk (feature `retry-policy`), requests (algod, indexer, simulate, query, deltas, ...) are retried by its
+ * retry policy ("Retries" in docs/dt-fork.md): up to 5 tries; 408, 429, 500, 502, 503, 504 and network errors; not a 503
+ * for history the node can't serve, nor a 504 from a request under the node's time limit, nor a transaction submit the
+ * node may have taken; waits of 0, 2, 4, 8 s, at least a 429's or 503's `Retry-After` (giving up above 30 s), and at least
+ * 1 s for a 429 or busy 503 without one, a refused connection or a browser's failed fetch. The policy can be changed per client (`retry` in the constructor or
+ * `AlgoClientConfig`) and globally (`Config.configure({ retry })`), the client's fields winning. Each wait is logged
+ * (`Config.logger.warn`), emitted as `EventType.RetryWait` on `Config.events`, passed to the policy's `onWait`, and
+ * listed in {@link waits} while it lasts (when `delayMs` is above 0).
+ *
+ * With stock algosdk, requests are retried as upstream algokit-utils does (up to 5 tries, at once and then after 2, 4,
+ * 8 s), stopping when the request's `signal` aborts; the `retry` options have no effect and no event is emitted.
  */
 export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
   private static readonly MAX_TRIES = 5
@@ -19,27 +43,6 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
   // These lists come from https://visionmedia.github.io/superagent/#retrying-requests
   // which is the underlying library used by algosdk - but the CloudFlare specific 52X status codes have been removed
   private static readonly RETRY_STATUS_CODES = [408, 413, 429, 500, 502, 503, 504]
-  /**
-   * The status codes retried for requests with a time limit on the node (`POST /v2/query`,
-   * `POST /v2/transactions/simulate`, `GET /v2/deltas/{round}`, and `GET` of `/versions` and `/holders` listings): all
-   * but 504, which is that limit. A retry would repeat the whole (up to the limit) work; the caller splits or narrows the
-   * request instead.
-   */
-  private static readonly TIME_LIMITED_RETRY_STATUS_CODES = AlgoHttpClientWithRetry.RETRY_STATUS_CODES.filter((s) => s !== 504)
-  /**
-   * dtalgod's 503s when it has no capacity left for a request (simulate, query, versions), or no slot to re-evaluate an
-   * old round's deltas: worth a retry, but not at once.
-   */
-  private static readonly BUSY = /node is busy|every slot for re-evaluating old rounds is in use/
-  /** The least wait before retrying a busy node that gave no readable `Retry-After`. */
-  private static readonly BUSY_MIN_BACKOFF_MS = 1000
-  /**
-   * dtalgod's 503s for history it can't serve until an operator fixes the node: an incomplete box or holders index, or
-   * a time-travel history marked as differing from the chain. Retrying them only delays the error.
-   */
-  private static readonly HISTORY_UNAVAILABLE = /box index is incomplete|holders index is not complete|history is not served/
-  /** The status codes whose `Retry-After` header is honored. */
-  private static readonly RETRY_AFTER_STATUS_CODES = [429, 503]
   private static readonly RETRY_ERROR_CODES = [
     'ETIMEDOUT',
     'ECONNRESET',
@@ -51,6 +54,44 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     'EAI_AGAIN',
     'EPROTO', // We get this intermittently with AlgoNode API
   ]
+
+  /** This client retries: dt-algosdk's `withRetry` returns it as is. */
+  readonly [RETRYING_CLIENT] = true
+
+  /** This client's retry policy fields, which win over `Config.retry`; `false` for no retries. Needs dt-algosdk. */
+  readonly retry?: RetryOptionsLike
+
+  private readonly active = new Set<RetryWaitLike>()
+
+  /**
+   * @param tokenHeader The token header, as for `URLTokenBaseHTTPClient`
+   * @param baseServer The server URL
+   * @param port The port
+   * @param defaultHeaders Headers sent with every request
+   * @param retry This client's retry policy fields, which win over `Config.retry`; `false` for no retries. Needs dt-algosdk
+   */
+  constructor(
+    tokenHeader: ConstructorParameters<typeof URLTokenBaseHTTPClient>[0],
+    baseServer: string,
+    port?: string | number,
+    defaultHeaders?: Record<string, string>,
+    retry?: RetryOptionsLike,
+  ) {
+    super(tokenHeader, baseServer, port, defaultHeaders)
+    this.retry = retry
+  }
+
+  /** The requests waiting to be retried now, one entry each, only those with a wait above 0 (dt-algosdk only). */
+  get waits(): readonly RetryWaitLike[] {
+    return [...this.active]
+  }
+
+  /** Of the requests waiting now, the one that waits longest, if any (dt-algosdk only). */
+  get waiting(): RetryWaitLike | undefined {
+    let latest: RetryWaitLike | undefined
+    for (const wait of this.active) if (!latest || wait.until > latest.until) latest = wait
+    return latest
+  }
 
   /** The abort signal in fetch options passed as `customOptions`, if any. */
   private static signalOf(customOptions?: Record<string, unknown>): AbortSignal | undefined {
@@ -75,59 +116,38 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     })
   }
 
-  /**
-   * How long a failed response asks to wait before retrying, from its `Retry-After` header (seconds or an HTTP date),
-   * or undefined without one. Only for 429 and 503. The header name is looked up case-insensitively.
-   */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private static retryAfterMs(err: any): number | undefined {
-    const status = Number(err?.response?.status ?? err?.status)
-    if (!AlgoHttpClientWithRetry.RETRY_AFTER_STATUS_CODES.includes(status)) return undefined
-    const headers = err?.response?.headers
-    if (!headers || typeof headers !== 'object') return undefined
-    const key = Object.keys(headers).find((k) => k.toLowerCase() === 'retry-after')
-    if (key === undefined) return undefined
-    const value = String(headers[key]).trim()
-    if (/^\d+$/.test(value)) return Number(value) * 1000
-    const date = Date.parse(value)
-    return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now())
-  }
-
-  /** The HTTP status of a failed request, or NaN. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private static statusOf(err: any): number {
-    return Number(err?.response?.status ?? err?.status)
-  }
-
-  /** The error's message, and the `message` of its JSON body if it has one (algosdk puts it in the message, other clients may not). */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private static messageOf(err: any): string {
-    const message = typeof err?.message === 'string' ? err.message : ''
-    const body = err?.response?.body
-    if (!(body instanceof Uint8Array) || body.length === 0) return message
-    try {
-      const bodyMessage = JSON.parse(new TextDecoder().decode(body))?.message
-      return typeof bodyMessage === 'string' ? `${message}\n${bodyMessage}` : message
-    } catch {
-      return message
+  /** The policy for a request: `Config.retry` with this client's fields over it, and an `onWait` that also logs and emits. */
+  private retryOptions(formatRetryWait: (wait: RetryWaitLike) => string): RetryOptionsLike {
+    // `false` is `maxTries: 1`, so a client's fields over a global `false` retry only if they set `maxTries`
+    const fieldsOf = (options: RetryOptionsLike | undefined): Partial<RetryPolicyLike> | undefined =>
+      options === false ? { maxTries: 1 } : options
+    const policy: Partial<RetryPolicyLike> = {}
+    for (const fields of [fieldsOf(Config.retry), fieldsOf(this.retry)]) {
+      for (const [key, value] of Object.entries(fields ?? {})) {
+        if (value !== undefined) (policy as Record<string, unknown>)[key] = value
+      }
     }
-  }
-
-  /** The status codes to retry for a `method` request to `relativePath`. */
-  private static retryStatusCodes(method: 'get' | 'post', relativePath: string): number[] {
-    const path = relativePath.replace(/\/+$/, '')
-    const timeLimited =
-      method === 'post'
-        ? path === '/v2/query' || path === '/v2/transactions/simulate'
-        : /\/(versions|holders)$|^\/v2\/deltas\/\d+$/.test(path)
-    return timeLimited ? AlgoHttpClientWithRetry.TIME_LIMITED_RETRY_STATUS_CODES : AlgoHttpClientWithRetry.RETRY_STATUS_CODES
+    const onWait = policy.onWait
+    policy.onWait = (wait) => {
+      callQuietly(() => Config.logger.warn(`${formatRetryWait(wait)}: ${wait.method.toUpperCase()} ${wait.path} failed: ${wait.error}`))
+      callQuietly(() => Config.events.emitAsync(EventType.RetryWait, wait))
+      if (onWait) callQuietly(() => onWait(wait))
+    }
+    return policy
   }
 
   private async callWithRetry(
+    method: 'get' | 'post' | 'delete',
+    path: string,
     func: () => Promise<BaseHTTPClientResponse>,
-    signal?: AbortSignal,
-    retryStatusCodes: number[] = AlgoHttpClientWithRetry.RETRY_STATUS_CODES,
+    customOptions?: Record<string, unknown>,
   ): Promise<BaseHTTPClientResponse> {
+    const signal = AlgoHttpClientWithRetry.signalOf(customOptions)
+    const dt = getDTRetry()
+    if (dt) {
+      return dt.callWithRetry(func, { method, path, signal }, this.retryOptions(dt.formatRetryWait), this.active)
+    }
+    // Stock algosdk: upstream algokit-utils' loop, stopping on an abort
     let response: BaseHTTPClientResponse | undefined
     let numTries = 1
     do {
@@ -144,25 +164,13 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
         // Only retry for one of the hardcoded conditions
         if (!(
           AlgoHttpClientWithRetry.RETRY_ERROR_CODES.includes(err.code) ||
-          retryStatusCodes.includes(Number(err.status)) ||
-          ('response' in err && retryStatusCodes.includes(Number(err.response.status)))
+          AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.status)) ||
+          ('response' in err && AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.response?.status)))
         )) {
           throw err
         }
-        const unavailable = AlgoHttpClientWithRetry.statusOf(err) === 503
-        const message = unavailable ? AlgoHttpClientWithRetry.messageOf(err) : ''
-        // History the node can't serve stays so until an operator fixes it
-        if (unavailable && AlgoHttpClientWithRetry.HISTORY_UNAVAILABLE.test(message)) throw err
-        // Retry immediately the first time (a busy node after at least 1 s), then exponentially backoff; wait at least as
-        // long as a Retry-After header asks (capped at the longest backoff).
-        const retryAfterMs = AlgoHttpClientWithRetry.retryAfterMs(err)
-        const busy = unavailable && retryAfterMs === undefined && AlgoHttpClientWithRetry.BUSY.test(message)
-        const backoffMs = Math.max(
-          numTries == 1 ? 0 : Math.min(1000 * Math.pow(2, numTries - 1), AlgoHttpClientWithRetry.MAX_BACKOFF_MS),
-          busy ? AlgoHttpClientWithRetry.BUSY_MIN_BACKOFF_MS : 0,
-        )
-        const delayTimeMs =
-          retryAfterMs === undefined ? backoffMs : Math.min(Math.max(backoffMs, retryAfterMs), AlgoHttpClientWithRetry.MAX_BACKOFF_MS)
+        // Retry immediately the first time, then exponentially backoff.
+        const delayTimeMs = numTries == 1 ? 0 : Math.min(1000 * Math.pow(2, numTries - 1), AlgoHttpClientWithRetry.MAX_BACKOFF_MS)
         if (delayTimeMs > 0) {
           await AlgoHttpClientWithRetry.sleep(delayTimeMs, signal)
         }
@@ -179,9 +187,10 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     customOptions?: Record<string, unknown>,
   ): Promise<BaseHTTPClientResponse> {
     const response = await this.callWithRetry(
+      'get',
+      relativePath,
       () => super.get(relativePath, query, requestHeaders, customOptions),
-      AlgoHttpClientWithRetry.signalOf(customOptions),
-      AlgoHttpClientWithRetry.retryStatusCodes('get', relativePath),
+      customOptions,
     )
     if (
       relativePath.startsWith('/v2/accounts/') &&
@@ -223,9 +232,10 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     customOptions?: Record<string, unknown>,
   ): Promise<BaseHTTPClientResponse> {
     return await this.callWithRetry(
+      'post',
+      relativePath,
       () => super.post(relativePath, data, query, requestHeaders, customOptions),
-      AlgoHttpClientWithRetry.signalOf(customOptions),
-      AlgoHttpClientWithRetry.retryStatusCodes('post', relativePath),
+      customOptions,
     )
   }
 
@@ -237,8 +247,10 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     customOptions?: Record<string, unknown>,
   ): Promise<BaseHTTPClientResponse> {
     return await this.callWithRetry(
+      'delete',
+      relativePath,
       () => super.delete(relativePath, data, query, requestHeaders, customOptions),
-      AlgoHttpClientWithRetry.signalOf(customOptions),
+      customOptions,
     )
   }
 }

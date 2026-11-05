@@ -627,9 +627,9 @@ export class ClientManager {
    * ```
    */
   public static getAlgodClient(config: AlgoClientConfig): Algodv2 {
-    const { token, server, port } = config
+    const { token, server, port, retry } = config
     const tokenHeader = typeof token === 'string' ? { 'X-Algo-API-Token': token } : (token ?? {})
-    const httpClientWithRetry = new AlgoHttpClientWithRetry(tokenHeader, server, port)
+    const httpClientWithRetry = new AlgoHttpClientWithRetry(tokenHeader, server, port, undefined, retry)
     return new algosdk.Algodv2(httpClientWithRetry, server)
   }
 
@@ -670,9 +670,9 @@ export class ClientManager {
    * ```
    */
   public static getIndexerClient(config: AlgoClientConfig): Indexer {
-    const { token, server, port } = config
+    const { token, server, port, retry } = config
     const tokenHeader = typeof token === 'string' ? { 'X-Indexer-API-Token': token } : (token ?? {})
-    const httpClientWithRetry = new AlgoHttpClientWithRetry(tokenHeader, server, port)
+    const httpClientWithRetry = new AlgoHttpClientWithRetry(tokenHeader, server, port, undefined, retry)
     return new Indexer(httpClientWithRetry)
   }
 
@@ -710,7 +710,7 @@ export class ClientManager {
   }
 
   /**
-   * Returns a KMD SDK client that automatically retries on idempotent calls loaded from environment variables (expects to be called from a Node.js environment).
+   * Returns a KMD SDK client (which doesn't retry) loaded from environment variables (expects to be called from a Node.js environment).
    *
    * @returns The KMD client
    * @example

@@ -123,9 +123,9 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     if (!parallel[1].ok) expect(parallel[1].error.failureMessage).toMatch(/overspend/)
   })
 
-  test('simulate at several rounds, packed into windows', async () => {
+  test('simulate at several rounds, one request per round, however far apart', async () => {
     const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
-    const rounds = [latest - 2_000n, latest - 10n, latest - 1_500n, latest - 5n]
+    const rounds = [latest - 2_000n, latest - 10n, latest - 200_000n, latest - 5n, latest - 10n]
     const outcomes = await algorand.simulate.rounds(pay, rounds)
     expect(outcomes.map((o) => o.round)).toEqual(rounds)
     for (const o of outcomes) {
@@ -133,26 +133,6 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(o.groups[0].round).toBe(o.round)
       expect(o.groups[0].ok).toBe(true)
     }
-  })
-
-  test('simulate at rounds far apart with the validity window rewritten', async () => {
-    const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
-    const rounds = [latest - 200_000n, latest - 5n]
-    const outcomes = await algorand.simulate.rounds(pay, rounds, { validityWindow: 'rewrite' })
-    expect(outcomes.map((o) => [o.round, o.groups[0].ok])).toEqual(rounds.map((r) => [r, true]))
-  })
-
-  test('simulate under a later protocol', async () => {
-    const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: algosdk.generateAccount().addr, amount: algo(1) })
-    const [now] = await algorand.simulate.groups([pay], { round: latest - 5n, protocol: 'latest' })
-    expect(now.protocolOverride).toMatchObject({ applied: false })
-    expect(now.protocolOverride!.from).toBe(now.protocolOverride!.to)
-
-    // Long before the latest protocol upgrade. The group may fail (the sender may not exist yet); the override is still there
-    const [old] = await algorand.simulate.groups([pay], { round: 20_000_000n, protocol: 'latest' })
-    expect(old.protocolOverride?.applied).toBe(true)
-    expect(old.protocolOverride?.from).not.toBe(old.protocolOverride?.to)
-    expect(old.protocolOverride?.to).toBe(now.protocolOverride!.to)
   })
 
   describe('query', () => {
@@ -231,7 +211,7 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       if (!supported) return ctx.skip('the node has no queries')
       const rounds = [PAST, PAST + 5_000n]
       const queried = await algorand.query.rounds(roundCall(), rounds, { via: 'query' })
-      const simulated = await algorand.query.rounds(roundCall(), rounds, { via: 'simulate', validityWindow: 'rewrite' })
+      const simulated = await algorand.query.rounds(roundCall(), rounds, { via: 'simulate' })
       expect(queried.map((r) => r.groups[0].via)).toEqual(['query', 'query'])
       expect(simulated.map((r) => r.groups[0].via)).toEqual(['simulate', 'simulate'])
       const strip = (s: ReturnType<typeof summary>) => s.map(([round, groups]) => [round, (groups as unknown[][]).map((g) => g.slice(1))])
@@ -248,10 +228,23 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
       expect(outcomes[0].round).toBeGreaterThanOrEqual(latest)
     })
 
+    test('composed calls under a later protocol', async (ctx) => {
+      if (!supported) return ctx.skip('the node has no queries')
+      const [now, old] = await algorand.query.rounds(roundCall(), [latest - 5n, 20_000_000n], { protocol: 'latest' })
+      expect(now.protocolOverride).toMatchObject({ applied: false })
+      expect(now.protocolOverride!.from).toBe(now.protocolOverride!.to)
+      // Long before the latest protocol upgrade
+      expect(old.protocolOverride?.applied).toBe(true)
+      expect(old.protocolOverride?.from).not.toBe(old.protocolOverride?.to)
+      expect(old.protocolOverride?.to).toBe(now.protocolOverride!.to)
+      expect(old.groups[0]).toMatchObject({ via: 'query', ok: true })
+      expect(old.groups[0].protocolOverride).toBe(old.protocolOverride)
+    })
+
     test('composed calls fall back to simulate on a node without queries', async (ctx) => {
       if (supported) return ctx.skip('the node has queries')
       const rounds = [PAST, PAST + 5_000n]
-      const results = await algorand.query.rounds(roundCall(), rounds, { validityWindow: 'rewrite' })
+      const results = await algorand.query.rounds(roundCall(), rounds)
       expect(results.map((r) => r.groups[0].via)).toEqual(['simulate', 'simulate'])
       for (const r of results) {
         const g = r.groups[0]
