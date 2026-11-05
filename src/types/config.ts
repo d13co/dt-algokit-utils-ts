@@ -1,5 +1,6 @@
 import { AsyncEventEmitter } from './async-event-emitter'
 import { Logger, consoleLogger, nullLogger } from './logging'
+import type { RetryOptionsLike } from './retry'
 
 /** The AlgoKit configuration type */
 export interface Config {
@@ -22,6 +23,14 @@ export interface Config {
   populateAppCallResources: boolean
 
   events: AsyncEventEmitter
+
+  /**
+   * How the algod and indexer clients that algokit-utils makes retry failed requests: the retry policy fields to change,
+   * or `false` for no retries. Read on every request, so it applies to clients made before `configure`. A client's own
+   * `retry` (`AlgoClientConfig.retry`) wins, field by field (`false` counting as `{ maxTries: 1 }`). Needs dt-algosdk (feature `retry-policy`): with stock
+   * algosdk the clients retry as upstream algokit-utils does, and this has no effect. See "Retries" in docs/dt-fork.md.
+   */
+  retry?: RetryOptionsLike
 }
 
 /** Updatable AlgoKit config */
@@ -58,6 +67,10 @@ export class UpdatableConfig implements Readonly<Config> {
 
   get events() {
     return this.config.events
+  }
+
+  get retry() {
+    return this.config.retry
   }
 
   /**

@@ -14,6 +14,7 @@ It is a drop-in replacement: existing APIs, types and generated typed clients wo
 - **Extended simulate**: `algorand.simulate.groups` simulates several groups in one request, or each on its own with `parallel`, and `algorand.simulate.rounds` simulates groups at many rounds, a request per round.
 - **Node limits**: simulate follows the limits dtalgod reports, and readonly app calls get the node's full extra opcode budget.
 - **Queries**: `algorand.query.run` runs read-only TEAL calls of a program or app at many rounds (`POST /v2/query`), optionally under a later consensus protocol, split within the node's limits; `algorand.query.groups`/`rounds` query composed app calls, with simulate as the fallback.
+- **Retries**: the clients algokit-utils makes retry by dt-algosdk's retry policy (rate limits, busy nodes, `Retry-After`, no blind resubmits of transactions), changed per client or globally with `retry`, with an event for each wait.
 - **Abort signals**: `signal` on app reads, version pages, simulate and queries cancels the request and its retries.
 
 See **[the full list of differences](./docs/dt-fork.md)** for every changed method, examples and caveats.

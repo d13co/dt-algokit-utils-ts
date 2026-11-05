@@ -1,5 +1,10 @@
+import * as algosdk from 'algosdk'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { AlgoHttpClientWithRetry } from './algo-http-client-with-retry'
+import { Config } from '../config'
+import { AlgoHttpClientWithRetry, RETRYING_CLIENT } from './algo-http-client-with-retry'
+import { ClientManager } from './client-manager'
+import { EventType } from './lifecycle-events'
+import type { RetryWaitLike } from './retry'
 
 // Offline tests of aborting requests through the retrying HTTP client, with a mocked fetch.
 
@@ -112,13 +117,34 @@ describe('AlgoHttpClientWithRetry Retry-After and query time-outs', () => {
     expect((await request).status).toBe(200)
   })
 
-  test('Retry-After is capped at the longest backoff', async () => {
-    fetchMock.mockImplementationOnce(async () => failing(503, { 'Retry-After': '3600' })()).mockImplementationOnce(async () => ok())
+  test('a Retry-After up to 30 s is honoured', async () => {
+    fetchMock.mockImplementationOnce(async () => failing(503, { 'Retry-After': '30' })()).mockImplementationOnce(async () => ok())
     const request = client().get('/v2/status')
-    await vi.advanceTimersByTimeAsync(9_999)
+    await vi.advanceTimersByTimeAsync(29_999)
     expect(fetchMock).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1)
     expect((await request).status).toBe(200)
+  })
+
+  test('a Retry-After above 30 s gives up at once', async () => {
+    fetchMock.mockImplementation(async () => failing(429, { 'Retry-After': '3600' })())
+    await expect(client().get('/v2/status')).rejects.toMatchObject({ response: { status: 429 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('a 429 without Retry-After waits 1 s', async () => {
+    fetchMock.mockImplementationOnce(async () => new Response('', { status: 429 })).mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/status')
+    await vi.advanceTimersByTimeAsync(999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect((await request).status).toBe(200)
+  })
+
+  test('a 413 is not retried', async () => {
+    fetchMock.mockImplementation(async () => failing(413)())
+    await expect(client().post('/v2/teal/dryrun', new Uint8Array([1]))).rejects.toMatchObject({ response: { status: 413 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   test('Retry-After never shortens the backoff', async () => {
@@ -319,5 +345,187 @@ describe('AlgoHttpClientWithRetry dtalgod 503s and listing time-outs', () => {
     const request = client().get('/v2/assets/1/versions')
     await vi.advanceTimersByTimeAsync(0)
     expect((await request).status).toBe(200)
+  })
+})
+
+describe('AlgoHttpClientWithRetry with dt-algosdk retry policy', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+  const client = (retry?: ConstructorParameters<typeof AlgoHttpClientWithRetry>[4]) =>
+    new AlgoHttpClientWithRetry({}, 'http://localhost', 4001, undefined, retry)
+  const failing =
+    (status: number, message = 'nope', headers: Record<string, string> = {}) =>
+    async () =>
+      new Response(JSON.stringify({ message }), { status, headers })
+  // Node's fetch rejects with a TypeError whose cause has the code
+  const networkError = (code: string) => async () => {
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error(code), { code }) })
+  }
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers()
+    vi.spyOn(Config.logger, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    Config.configure({ retry: undefined })
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  test('dt-algosdk has the retry policy', () => {
+    expect(algosdk.DTAlgodClient.features).toContain('retry-policy')
+  })
+
+  test('the client is marked as retrying, so withRetry does not wrap it again', () => {
+    const c = client()
+    expect(c[RETRYING_CLIENT]).toBe(true)
+    expect(algosdk.isRetryingClient(c)).toBe(true)
+    expect(algosdk.withRetry(c)).toBe(c)
+  })
+
+  test('a transaction submit that the node may have taken is not retried', async () => {
+    fetchMock.mockImplementation(failing(502))
+    await expect(client().post('/v2/transactions', new Uint8Array([1]))).rejects.toMatchObject({ response: { status: 502 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test.each([
+    ['a 429', failing(429, '', { 'Retry-After': '1' })],
+    ['a busy 503', failing(503, 'the node is busy')],
+    ['a refused connection', networkError('ECONNREFUSED')],
+  ])('a transaction submit is retried after %s', async (_, fail) => {
+    fetchMock.mockImplementationOnce(fail).mockImplementationOnce(async () => ok())
+    const request = client().post('/v2/transactions', new Uint8Array([1]))
+    await vi.advanceTimersByTimeAsync(999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect((await request).status).toBe(200)
+  })
+
+  test('a network error code on the cause is retried', async () => {
+    fetchMock.mockImplementationOnce(networkError('ECONNRESET')).mockImplementationOnce(async () => ok())
+    const request = client().get('/v2/status')
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await request).status).toBe(200)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('a per-client retry option limits the tries', async () => {
+    fetchMock.mockImplementation(failing(500))
+    const settled = client({ maxTries: 2 })
+      .get('/v2/status')
+      .catch((e) => e)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(await settled).toMatchObject({ response: { status: 500 } })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('retry: false turns retries off', async () => {
+    fetchMock.mockImplementation(failing(500))
+    await expect(client(false).get('/v2/status')).rejects.toMatchObject({ response: { status: 500 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test('Config.configure({ retry }) applies to clients made before it', async () => {
+    const c = client()
+    Config.configure({ retry: false })
+    fetchMock.mockImplementation(failing(500))
+    await expect(c.get('/v2/status')).rejects.toMatchObject({ response: { status: 500 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  test("the client's retry wins over Config.retry, field by field", async () => {
+    Config.configure({ retry: { maxTries: 2, backoffMs: () => 5_000 } })
+    fetchMock.mockImplementation(failing(500))
+    const settled = client({ maxTries: 3 })
+      .get('/v2/status')
+      .catch((e) => e)
+    // Config's backoff (5 s), the client's maxTries (3)
+    await vi.advanceTimersByTimeAsync(4_999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(await settled).toMatchObject({ response: { status: 500 } })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  test('Config.retry false keeps a client with other retry fields from retrying', async () => {
+    Config.configure({ retry: false })
+    const onWait = vi.fn()
+    fetchMock.mockImplementation(failing(500))
+    await expect(client({ onWait }).get('/v2/status')).rejects.toMatchObject({ response: { status: 500 } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(onWait).not.toHaveBeenCalled()
+  })
+
+  test("a client's maxTries retries even with Config.retry false", async () => {
+    Config.configure({ retry: false })
+    fetchMock.mockImplementationOnce(failing(500)).mockImplementationOnce(async () => ok())
+    const request = client({ maxTries: 2 }).get('/v2/status')
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await request).status).toBe(200)
+  })
+
+  test('the retry option flows from AlgoClientConfig through getAlgodClient and getIndexerClient', async () => {
+    fetchMock.mockImplementation(failing(500))
+    const algod = ClientManager.getAlgodClient({ server: 'http://localhost', port: 4001, retry: false })
+    const indexer = ClientManager.getIndexerClient({ server: 'http://localhost', port: 8980, retry: false })
+    await expect(algod.status().do()).rejects.toMatchObject({ response: { status: 500 } })
+    await expect(indexer.makeHealthCheck().do()).rejects.toMatchObject({ response: { status: 500 } })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test('a wait is logged, emitted, passed to onWait (global and per client chained by field) and listed in waits', async () => {
+    const globalOnWait = vi.fn()
+    const ownOnWait = vi.fn(() => {
+      throw new Error('a broken listener')
+    })
+    const emitted: RetryWaitLike[] = []
+    const listener = (wait: unknown) => {
+      emitted.push(wait as RetryWaitLike)
+    }
+    Config.events.on(EventType.RetryWait, listener)
+    Config.configure({ retry: { onWait: globalOnWait } })
+    try {
+      fetchMock.mockImplementationOnce(failing(503, 'the node is busy', { 'Retry-After': '2' })).mockImplementationOnce(async () => ok())
+      const c = client({ onWait: ownOnWait })
+      const request = c.get('/v2/accounts/A')
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(c.waits).toHaveLength(1)
+      expect(c.waiting).toMatchObject({ reason: 'node-busy', delayMs: 2_000, retryAfterMs: 2_000, retry: 1, maxRetries: 4, status: 503 })
+      // The client's onWait replaces Config's, and throwing doesn't break the request
+      expect(ownOnWait).toHaveBeenCalledTimes(1)
+      expect(globalOnWait).not.toHaveBeenCalled()
+      expect(emitted).toEqual([c.waiting])
+      expect(Config.logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(/^The node is busy: retrying in 2 s \(retry 1 of 4\): GET \/v2\/accounts\/A failed: /),
+      )
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect((await request).status).toBe(200)
+      expect(c.waits).toHaveLength(0)
+      expect(c.waiting).toBeUndefined()
+      expect(algosdk.formatRetryWait(emitted[0] as never)).toBe('The node is busy: retrying in 2 s (retry 1 of 4)')
+    } finally {
+      Config.events.off(EventType.RetryWait, listener)
+    }
+  })
+
+  test('a rejecting retry-wait listener does not break the request', async () => {
+    const listener = async () => {
+      throw new Error('listener failed')
+    }
+    Config.events.on(EventType.RetryWait, listener)
+    try {
+      fetchMock.mockImplementationOnce(failing(500)).mockImplementationOnce(async () => ok())
+      const request = client().get('/v2/status')
+      await vi.advanceTimersByTimeAsync(0)
+      expect((await request).status).toBe(200)
+    } finally {
+      Config.events.off(EventType.RetryWait, listener)
+    }
   })
 })

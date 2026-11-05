@@ -1,6 +1,7 @@
 import algosdk from 'algosdk'
 import { Buffer } from 'buffer'
 import type { BuiltTransactions } from './composer'
+import type { RetryOptionsLike, RetryWaitLike } from './retry'
 import modelsv2 = algosdk.modelsv2
 
 /**
@@ -616,7 +617,19 @@ interface DTSdk {
   isQueryResponseTooLarge(error: unknown): boolean
   /** The most bytes of a query request body, a fixed limit of dtalgod. */
   MAX_QUERY_REQUEST_BYTES: number
+  /** Runs a request under the retry policy; feature `retry-policy`, see {@link getDTRetry}. */
+  callWithRetry?: <T>(
+    send: () => Promise<T>,
+    request: { method: 'get' | 'post' | 'delete'; path: string; signal?: AbortSignal },
+    options?: RetryOptionsLike,
+    waits?: Set<RetryWaitLike>,
+  ) => Promise<T>
+  /** A message for a retry wait, to show users; feature `retry-policy`. */
+  formatRetryWait?: (wait: RetryWaitLike) => string
 }
+
+/** dt-algosdk's retry policy (`callWithRetry` and `formatRetryWait`). */
+export type DTRetry = Required<Pick<DTSdk, 'callWithRetry' | 'formatRetryWait'>>
 
 const sdk = algosdk as unknown as Partial<DTSdk>
 
@@ -625,6 +638,17 @@ export function getDTSdk(): DTSdk | undefined {
   const features = sdk.DTAlgodClient?.features
   if (!features || !REQUIRED_DT_FEATURES.every((f) => features.includes(f))) return undefined
   return sdk as DTSdk
+}
+
+/**
+ * Returns dt-algosdk's retry policy, or `undefined` with stock algosdk or a dt-algosdk without it (feature
+ * `retry-policy`). It is not in {@link REQUIRED_DT_FEATURES}, so a dt-algosdk without it still counts as dt-algosdk.
+ */
+export function getDTRetry(): DTRetry | undefined {
+  const dt = getDTSdk()
+  if (!dt?.DTAlgodClient.features.includes('retry-policy')) return undefined
+  const { callWithRetry, formatRetryWait } = dt
+  return typeof callWithRetry === 'function' && typeof formatRetryWait === 'function' ? { callWithRetry, formatRetryWait } : undefined
 }
 
 /** Returns the parts of dt-algosdk that algokit-utils uses, or throws a {@link DTNotAvailableError}. */

@@ -758,8 +758,9 @@ export class QueryManager {
    * times rounds) allow, and by the request body limit, and sent `concurrency` at a time. A request whose results are over the node's `maxResponseBytes`, or that runs over
    * its time limit (504), is split in halves (rounds first) and sent again; a call that is still too large or too slow
    * alone fails on its own (`kind: 'call'`). When the latest round (0) is queried in more than one request, it is
-   * resolved first so every call sees the same block. A busy node (503) is retried by the HTTP client of an
-   * `AlgorandClient` made from a config (`AlgoHttpClientWithRetry`, honoring `Retry-After`). Any other error (a bad
+   * resolved first so every call sees the same block. A busy node (503) or a rate limit (429) is retried by the
+   * HTTP client of an `AlgorandClient` made from a config (`AlgoHttpClientWithRetry`, by dt-algosdk's retry policy:
+   * honoring `Retry-After`), not by `run` itself. Any other error (a bad
    * request, a round after the latest one) cancels the requests in flight and is thrown.
    *
    * There is no simulate fallback here; `groups` and `rounds` have one.
