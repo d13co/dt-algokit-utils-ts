@@ -14,7 +14,6 @@ import {
   QueryResponseLike,
   Round,
   QueryProtocolOverride,
-  chunk,
   getDTSdk,
   getQueryLimits,
   getCapabilities,
@@ -500,7 +499,8 @@ class QueryRun {
   /**
    * Splits a job into requests: rounds by `maxRounds`, calls by `maxCalls`, both by `maxTotalCalls` (calls times rounds),
    * and calls by the request body limit. The rounds per request are the number that needs the fewest requests (the most
-   * rounds on a tie), spread evenly; each request then takes as many calls as fit in the total at its rounds.
+   * rounds on a tie), spread evenly; each request then takes as many calls as fit in the total at its rounds. The body
+   * limit, which can split the calls further, is left out of that count.
    */
   private plan(job: QueryJob, j: number): Piece[] {
     const { maxCalls, maxRounds, maxTotalCalls } = this.limits
@@ -513,10 +513,17 @@ class QueryRun {
       const requests = Math.ceil(roundCount / r) * Math.ceil(callCount / callsAt(r))
       if (requests < fewest) [fewest, best] = [requests, r]
     }
-    // As many requests as `best` rounds each need, with the rounds spread evenly between them
-    const roundsPerRequest = Math.ceil(roundCount / Math.ceil(roundCount / best))
+    // As many requests as `best` rounds each need, with the rounds spread evenly between them (sizes differing by at
+    // most 1, the longer ones first), so none has more rounds than `best`
+    const count = Math.ceil(roundCount / best)
+    const base = Math.floor(roundCount / count)
+    let at = 0
+    const roundChunks = Array.from({ length: count }, (_, i) => {
+      const size = base + (i < roundCount % count ? 1 : 0)
+      return job.rounds.slice(at, (at += size))
+    })
     const ranges = new Map<number, [number, number][]>()
-    return chunk(job.rounds, roundsPerRequest).flatMap((rounds) => {
+    return roundChunks.flatMap((rounds) => {
       if (!ranges.has(rounds.length)) ranges.set(rounds.length, this.callRanges(job, rounds.length, callsAt(rounds.length)))
       return ranges.get(rounds.length)!.map(([start, end]) => ({ job: j, start, end, rounds }))
     })

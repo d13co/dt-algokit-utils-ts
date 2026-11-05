@@ -1,7 +1,7 @@
 name: dt-algokit-utils
 
 # CI for the dtalgorand branch, and the npm release of @d13co/dt-algokit-utils: pushing a
-# v<version> tag (v9.2.3-dt.4.1.0.0) on dtalgorand tests, packs and publishes it.
+# v<version> tag (v9.2.3-dt.5.2.0.0) on dtalgorand tests, packs and publishes it.
 # See "Releasing" in docs/dt-fork.md.
 on:
   push:

@@ -1782,6 +1782,11 @@ describe('query', () => {
       const results1000 = await algorand.query.run({ program, rounds: seventeen, calls: many(1000) })
       expect(queries(stub).map((c) => [sentQuery(c).rounds!.length, sentQuery(c).calls.length])).toEqual(Array(17).fill([1, 1000]))
       expect(results1000.every((r) => r.calls.length === 1000 && r.calls.every((c) => c.ok))).toBe(true)
+
+      // The rounds are spread evenly: 10 rounds at most 4 a request go in 4, 3 and 3, not 4, 4 and 2
+      limited({ 'max-rounds': 4 })
+      await algorand.query.run({ program, rounds: Array.from({ length: 10 }, (_, i) => i + 1), calls: many(1) })
+      expect(queries(stub).map((c) => sentQuery(c).rounds!.length)).toEqual([4, 3, 3])
     })
 
     test("dt-algosdk sets maxTotalCalls to maxCalls times maxRounds for a node that doesn't report it", async () => {

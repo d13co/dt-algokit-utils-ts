@@ -91,6 +91,33 @@ Changed (all additions are optional):
 | `composer.simulate(options)`                                                                                                                                  | With `round`, transactions that don't set their own validity are built valid at that round; `signal`                                                                                                                                                                                                                                      |
 | `AlgoHttpClientWithRetry`, `AlgoClientConfig`, `Config`                                                                                                       | With dt-algosdk, retries by its retry policy, changed per client (`retry` in `AlgoClientConfig`) or globally (`Config.configure({ retry })`), reporting each wait (`EventType.RetryWait` event, `onWait`, `waits`); passes fetch options (`customOptions`) through and stops retrying when their `signal` aborts. See [Retries](#retries) |
 
+## From dt4
+
+dt5 nodes dropped simulate's read extensions, which `POST /v2/query` replaced, and dt-algosdk `3.9.0-dt.5.2.0.0` dropped their requests; it also brought a retry policy shared with ghostkit and the Go SDK. In this fork:
+
+| dt4                                                                                                                                                                           | dt5                                                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `parallel` sent the groups in requests of `maxGroups`                                                                                                                         | Each parallel group goes in a request of its own                                                                                                                     |
+| `simulate.rounds` packed rounds into requests (`maxRounds`)                                                                                                                   | A request per round; `maxRounds` throws                                                                                                                              |
+| `validityWindow: 'rewrite' \| 'skip'`                                                                                                                                         | Throws: the groups are built valid at each round                                                                                                                     |
+| `protocol` on simulate, `protocolOverride` on simulate outcomes                                                                                                               | Throws: use `algorand.query` (`run`, or `groups` / `rounds`, which keep `protocol` on the query path)                                                                |
+| `kind: 'round'` simulate errors                                                                                                                                               | A round the node can't simulate throws                                                                                                                               |
+| `simulate.maxRounds`, `simulate.resourceLimitMultiplier`                                                                                                                      | Removed from the capabilities and `simulate.limits()`                                                                                                                |
+| `SimulateProtocolOverride`, `SimulateProtocolNote`, `…NoteHit`, `…NoteCode`                                                                                                   | `QueryProtocolOverride`, `QueryProtocolNote`, `QueryProtocolNoteHit`, `QueryProtocolNoteCode`                                                                        |
+| —                                                                                                                                                                             | `QueryLimits.maxTotalCalls` (calls × rounds per query request) and `maxCallStateBytes`                                                                               |
+| `query.rounds` through simulate: a round that can't be simulated gave `kind: 'round'` outcomes                                                                                | Throws, as `simulate.rounds` does (the query path still gives `kind: 'round'`)                                                                                       |
+| `maxRounds: 0` on `query.rounds` sent one simulate request per round                                                                                                          | A `RangeError`: `maxRounds` caps the rounds per query request, so it is a positive integer                                                                           |
+| `checkValidityWindow` (exported from `types/simulate-manager`)                                                                                                                | Removed                                                                                                                                                              |
+| Transaction submits (`POST /v2/transactions`, `/async`) retried after a 500, 502, 503, 504 or a reset connection                                                              | Retried only when the node surely didn't take them (a 429, a busy 503, a refused connection): check for the transaction instead ([Retries](#retries))                |
+| `Retry-After` capped at 10 s, then retried                                                                                                                                    | Honoured up to 30 s; a longer one gives up at once (`maxRetryAfterMs`)                                                                                               |
+| 413 retried                                                                                                                                                                   | Not retried                                                                                                                                                          |
+| A network error from Node fetch (code on `cause`) failed at once                                                                                                              | Retried, waiting at least 1 s after a refused connection: a stopped node (LocalNet down) fails after about 15 s; `retry: { maxTries: 1 }` or `false` to fail at once |
+| Retry log: `algosdk request failed N times. Retrying in Xms: …`                                                                                                               | `<formatRetryWait>: <METHOD> <path> failed: …`, plus an `EventType.RetryWait` event                                                                                  |
+| With stock algosdk, the fork's retry handling (`Retry-After`, busy and history 503s, time-limited 504s)                                                                       | Upstream algokit-utils' loop, unchanged                                                                                                                              |
+| `types/dt-support`: `SimulateRoundsWindowLike`, `roundIndex` and `kind: 'round'` of `RawSimulateGroupOutcome`, `DTSimulateResponseLike.roundResults`, nested `groupResults()` | Removed; `groupResults()` is flat, and `QueryLimits` has the required `maxTotalCalls` and `maxCallStateBytes` (for mocks)                                            |
+
+The options that were removed throw at runtime too, naming what replaced them, for callers that don't type-check.
+
 ## Reads at a past round
 
 Pass `{ round }` to the usual reads to get the state as of the end of that round:
@@ -251,27 +278,7 @@ Stock algod has no capabilities endpoint: `algorand.client.capabilities()` then 
 
 `simulate.groups` and `simulate.rounds` send at most `concurrency` requests at once (default 4), across the rounds of `rounds` and the requests of parallel groups; after a request fails, the ones not yet sent aren't. Parallel groups at the latest round, in several requests, all run at the round looked up first. `algorand.query.groups` / `rounds` pass their `concurrency` to the simulate fallback too.
 
-Recommended, not done: a simulate request that runs over the node's time limit (504) is thrown (with dt-algosdk, `AlgoHttpClientWithRetry` doesn't retry it; with stock algosdk it retries as upstream).
-
-### From dt4
-
-dt5 nodes dropped simulate's read extensions, which `POST /v2/query` replaced, and dt-algosdk `3.9.0-dt.5.2.0.0` dropped their requests. In this fork:
-
-| dt4                                                                                            | dt5                                                                                                   |
-| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `parallel` sent the groups in requests of `maxGroups`                                          | Each parallel group goes in a request of its own                                                      |
-| `simulate.rounds` packed rounds into requests (`maxRounds`)                                    | A request per round; `maxRounds` throws                                                               |
-| `validityWindow: 'rewrite' \| 'skip'`                                                          | Throws: the groups are built valid at each round                                                      |
-| `protocol` on simulate, `protocolOverride` on simulate outcomes                                | Throws: use `algorand.query` (`run`, or `groups` / `rounds`, which keep `protocol` on the query path) |
-| `kind: 'round'` simulate errors                                                                | A round the node can't simulate throws                                                                |
-| `simulate.maxRounds`, `simulate.resourceLimitMultiplier`                                       | Removed from the capabilities and `simulate.limits()`                                                 |
-| `SimulateProtocolOverride`, `SimulateProtocolNote`, `…NoteHit`, `…NoteCode`                    | `QueryProtocolOverride`, `QueryProtocolNote`, `QueryProtocolNoteHit`, `QueryProtocolNoteCode`         |
-| —                                                                                              | `QueryLimits.maxTotalCalls` (calls × rounds per query request) and `maxCallStateBytes`                |
-| `query.rounds` through simulate: a round that can't be simulated gave `kind: 'round'` outcomes | Throws, as `simulate.rounds` does (the query path still gives `kind: 'round'`)                        |
-| `maxRounds: 0` on `query.rounds` sent one simulate request per round                           | A `RangeError`: `maxRounds` caps the rounds per query request, so it is a positive integer            |
-| `checkValidityWindow` (exported from `types/simulate-manager`)                                 | Removed                                                                                               |
-
-The options that were removed throw at runtime too, naming what replaced them, for callers that don't type-check.
+Recommended, not done: a simulate request that runs over the node's time limit (504) is thrown (`AlgoHttpClientWithRetry` doesn't retry it).
 
 ## Queries
 
@@ -375,7 +382,7 @@ Each wait before a retry (a `RetryWaitLike`: `reason`, `delayMs`, `until`, `retr
 - is passed to the policy's `onWait` (the client's, or else `Config.retry`'s);
 - is in the `AlgoHttpClientWithRetry`'s `waits` while it lasts, if it waits at all (`delayMs` above 0; `waiting` is the one that waits longest): to poll them, make the client yourself (`new AlgoHttpClientWithRetry(tokenHeader, server, port, undefined, retry)`) and pass `{ algod: new algosdk.Algodv2(client, server) }` to `AlgorandClient.fromClients` (`Algodv2` still takes a server, as `ClientManager.getAlgodClient` passes it).
 
-What listeners and `onWait` throw is ignored. The clients carry dt-algosdk's `RETRYING_CLIENT` mark, so its `withRetry` returns them as they are rather than retrying twice over.
+What `onWait` throws is ignored, and so is what a `RetryWait` listener throws, as far as the request goes; as with every `Config.events` event, the listeners run in turn, so one that throws keeps the later ones from running. The clients carry dt-algosdk's `RETRYING_CLIENT` mark, so its `withRetry` returns them as they are rather than retrying twice over.
 
 With stock algosdk, or a dt-algosdk without `retry-policy`, the clients retry as upstream algokit-utils does (up to 5 tries, at once and then after 2, 4 and 8 s, on the statuses above and 413, ignoring `Retry-After`), and stop when the request's `signal` aborts; the `retry` options have no effect and no `RetryWait` event is emitted. An `Algodv2` or `Indexer` passed to `AlgorandClient.fromClients` retries only if its HTTP client does (for example one made with dt-algosdk's `withRetry`): a plain one doesn't retry.
 
