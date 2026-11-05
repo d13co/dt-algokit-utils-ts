@@ -498,30 +498,33 @@ class QueryRun {
 
   /**
    * Splits a job into requests: rounds by `maxRounds`, calls by `maxCalls`, both by `maxTotalCalls` (calls times rounds),
-   * and calls by the request body limit. The rounds per request are the number that needs the fewest requests (the most
-   * rounds on a tie), spread evenly; each request then takes as many calls as fit in the total at its rounds. The body
-   * limit, which can split the calls further, is left out of that count.
+   * and calls by the request body limit. Of the splits of the rounds into requests of at most `r` rounds (for each `r`,
+   * spread evenly or full with a shorter last one), it takes the one that needs the fewest requests, each taking as many
+   * calls as fit in the total at its rounds. The body limit, which can split the calls further, is left out of that count.
    */
   private plan(job: QueryJob, j: number): Piece[] {
     const { maxCalls, maxRounds, maxTotalCalls } = this.limits
     const roundCount = job.rounds.length
     const callCount = job.calls.length
     const callsAt = (rounds: number) => Math.max(1, Math.min(this.config.maxCalls, maxCalls, Math.floor(maxTotalCalls / rounds)))
-    let best = Math.max(1, Math.min(this.config.maxRounds, maxRounds, maxTotalCalls, roundCount))
+    const top = Math.max(1, Math.min(this.config.maxRounds, maxRounds, maxTotalCalls, roundCount))
+    // For each rounds per request, two splits: the rounds spread evenly (sizes differing by at most 1, the longer ones
+    // first) and full requests with a shorter last one. Keep the one with the fewest requests, preferring more rounds
+    // per request and then the even split on a tie.
+    let sizes: number[] = []
     let fewest = Infinity
-    for (let r = best; r >= 1; r--) {
-      const requests = Math.ceil(roundCount / r) * Math.ceil(callCount / callsAt(r))
-      if (requests < fewest) [fewest, best] = [requests, r]
+    for (let r = top; r >= 1; r--) {
+      const count = Math.ceil(roundCount / r)
+      const base = Math.floor(roundCount / count)
+      const even = Array.from({ length: count }, (_, i) => base + (i < roundCount % count ? 1 : 0))
+      const full = Array.from({ length: count }, (_, i) => (i < count - 1 ? r : roundCount - r * (count - 1)))
+      for (const split of [even, full]) {
+        const requests = split.reduce((n, size) => n + Math.ceil(callCount / callsAt(size)), 0)
+        if (requests < fewest) [fewest, sizes] = [requests, split]
+      }
     }
-    // As many requests as `best` rounds each need, with the rounds spread evenly between them (sizes differing by at
-    // most 1, the longer ones first), so none has more rounds than `best`
-    const count = Math.ceil(roundCount / best)
-    const base = Math.floor(roundCount / count)
     let at = 0
-    const roundChunks = Array.from({ length: count }, (_, i) => {
-      const size = base + (i < roundCount % count ? 1 : 0)
-      return job.rounds.slice(at, (at += size))
-    })
+    const roundChunks = sizes.map((size) => job.rounds.slice(at, (at += size)))
     const ranges = new Map<number, [number, number][]>()
     return roundChunks.flatMap((rounds) => {
       if (!ranges.has(rounds.length)) ranges.set(rounds.length, this.callRanges(job, rounds.length, callsAt(rounds.length)))
@@ -755,17 +758,16 @@ export class QueryManager {
 
   /**
    * Runs read-only calls of one program (each call creates an app running it) or one deployed app (each call is a NoOp
-   * call of it) at each round, in as few requests as the node's limits allow.
+   * call of it) at each round, in few requests within the node's limits.
    *
    * Each call is an app call alone in its group, in the block after the round, on the state that round left: no
    * signatures, fees or minimum balances, every resource available without references, and its writes dropped. A failed
    * call doesn't affect the others.
    *
-   * The calls and rounds are split into as few requests as the node's `maxCalls`, `maxRounds` and `maxTotalCalls` (calls
-   * times rounds) allow, and by the request body limit, and sent `concurrency` at a time. A request whose results are
-   * over the node's `maxResponseBytes`, or that runs over its time limit (504), is split in halves (rounds first) and
-   * sent again; a call that is still too large or too slow
-   * alone fails on its own (`kind: 'call'`). When the latest round (0) is queried in more than one request, it is
+   * The calls and rounds are split into few requests within the node's `maxCalls`, `maxRounds` and `maxTotalCalls` (calls
+   * times rounds), and by the request body limit, and sent `concurrency` at a time. A request whose results are over
+   * the node's `maxResponseBytes`, or that runs over its time limit (504), is split in halves (rounds first) and sent
+   * again; a call that is still too large or too slow alone fails on its own (`kind: 'call'`). When the latest round (0) is queried in more than one request, it is
    * resolved first so every call sees the same block. A busy node (503) or a rate limit (429) is retried by the
    * HTTP client of an `AlgorandClient` made from a config (`AlgoHttpClientWithRetry`, by dt-algosdk's retry policy:
    * honoring `Retry-After`), not by `run` itself. Any other error (a bad

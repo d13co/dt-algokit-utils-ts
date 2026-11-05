@@ -1759,12 +1759,13 @@ describe('query', () => {
         [[3n], 'e'],
       ])
 
-      // A total below maxRounds: one round per request is fewer requests than 2 rounds with 1 call each
+      // A total below maxRounds: 2 rounds take 1 call a request, the last round both, in 3 requests (as one round per
+      // request would; more rounds per request win the tie), not 4 with 2 rounds each
       limited({ 'max-calls': 4, 'max-rounds': 4, 'max-total-calls': 2 })
       await algorand.query.run({ program, rounds: [1, 2, 3], calls: calls.slice(0, 2) })
       expect(shape()).toEqual([
-        [[1n], 'ab'],
-        [[2n], 'ab'],
+        [[1n, 2n], 'a'],
+        [[1n, 2n], 'b'],
         [[3n], 'ab'],
       ])
 
@@ -1777,16 +1778,25 @@ describe('query', () => {
         [9, 100],
         [8, 100],
       ])
-      // 17 rounds of 1,000 calls: one round per request
+      // 17 rounds of 1,000 calls: 17 requests, as with one round per request (here 9 and 8 rounds of at most 113 and 128
+      // calls), each within the total
       stub.calls = []
       const results1000 = await algorand.query.run({ program, rounds: seventeen, calls: many(1000) })
-      expect(queries(stub).map((c) => [sentQuery(c).rounds!.length, sentQuery(c).calls.length])).toEqual(Array(17).fill([1, 1000]))
+      expect(queries(stub)).toHaveLength(17)
+      expect(queries(stub).every((c) => sentQuery(c).rounds!.length * sentQuery(c).calls.length <= 1024)).toBe(true)
       expect(results1000.every((r) => r.calls.length === 1000 && r.calls.every((c) => c.ok))).toBe(true)
 
       // The rounds are spread evenly: 10 rounds at most 4 a request go in 4, 3 and 3, not 4, 4 and 2
       limited({ 'max-rounds': 4 })
       await algorand.query.run({ program, rounds: Array.from({ length: 10 }, (_, i) => i + 1), calls: many(1) })
       expect(queries(stub).map((c) => sentQuery(c).rounds!.length)).toEqual([4, 3, 3])
+
+      // Unless full requests with a shorter last one need fewer: 19 rounds of 715 calls at the node's defaults take 14
+      // requests (15 rounds of 68 calls, then 4 of 256), where 7, 6 and 6 rounds would take 15
+      limited({})
+      await algorand.query.run({ program, rounds: Array.from({ length: 19 }, (_, i) => i + 1), calls: many(715) })
+      expect(queries(stub)).toHaveLength(14)
+      expect([...new Set(queries(stub).map((c) => sentQuery(c).rounds!.length))]).toEqual([15, 4])
     })
 
     test("dt-algosdk sets maxTotalCalls to maxCalls times maxRounds for a node that doesn't report it", async () => {
