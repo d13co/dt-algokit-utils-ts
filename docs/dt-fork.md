@@ -251,7 +251,7 @@ Stock algod has no capabilities endpoint: `algorand.client.capabilities()` then 
 
 `simulate.groups` and `simulate.rounds` send at most `concurrency` requests at once (default 4), across the rounds of `rounds` and the requests of parallel groups; after a request fails, the ones not yet sent aren't. Parallel groups at the latest round, in several requests, all run at the round looked up first. `algorand.query.groups` / `rounds` pass their `concurrency` to the simulate fallback too.
 
-Recommended, not done: a simulate request that runs over the node's time limit (504) is thrown (`AlgoHttpClientWithRetry` doesn't retry it).
+Recommended, not done: a simulate request that runs over the node's time limit (504) is thrown (with dt-algosdk, `AlgoHttpClientWithRetry` doesn't retry it; with stock algosdk it retries as upstream).
 
 ### From dt4
 
@@ -317,7 +317,7 @@ for (const {
 }
 ```
 
-Each outcome is `{ ok: true, txns, returns }` (each transaction's `logs` and `cost`, and the method calls' ABI returns as in `composer.send()`) or `{ ok: false, error }` with a `QueryGroupError` (`kind`, `failureMessage`, `failedAt`, `txns`), plus `via: 'query' | 'simulate'`. A failed call's logic error is worded as simulate's (`transaction <TXID>: logic eval error: ...`, with the transaction built as `simulate.groups` builds it at a past round), so `LogicError` and other parsers of simulate's messages keep working. On the query path `cost` is the query's cost; on the simulate path it is simulate's `appBudgetConsumed`.
+Each outcome is `{ ok: true, txns, returns }` (each transaction's `logs` and `cost`, and the method calls' ABI returns as in `composer.send()`) or `{ ok: false, error }` with a `QueryGroupError` (`kind`, `failureMessage`, `failedAt`, `txns`), plus `via: 'query' | 'simulate'`. A failed call's logic error is worded as simulate's (`transaction <TXID>: logic eval error: ...`, with the transaction built as `simulate.groups` builds it; `query.rounds` builds each group once, at the latest round, so its transaction IDs differ from those of the per-round simulate fallback), so `LogicError` and other parsers of simulate's messages keep working. On the query path `cost` is the query's cost; on the simulate path it is simulate's `appBudgetConsumed`.
 
 **The contract**: with query, every app call runs alone, against the round's state: the calls of one group don't see each other (no shared budget pool, `global GroupSize` 1, no `gtxn`), and the composers' fees, validity, notes and leases are ignored. With the simulate fallback, the groups run as composed, each on its own (`parallel: true`, a request per group). So use these for independent read-only calls, such as ghost calls.
 
@@ -349,7 +349,7 @@ The algod and indexer clients that algokit-utils makes (`AlgorandClient.fromConf
 
 - Up to 5 tries, the first included.
 - Retried: 408, 429, 500, 502, 503 and 504, and network errors (also those whose code is on Node fetch's `cause`, and a browser's failed fetch). A 413 is not retried.
-- Not retried: a 503 for history the node can't serve (an incomplete box or holders index, or a time-travel history that isn't served), and a 504 from a request under the node's time limit (`POST /v2/query`, `POST /v2/transactions/simulate`, `GET /v2/deltas/{round}`, and `GET` of a `/versions` or `/holders` listing), where a retry would repeat the whole work: split the request or narrow the range instead. Other requests still retry a 504.
+- Not retried: a 503 for history the node can't serve (an incomplete box or holders index, or a time-travel history that isn't served), and a 504 from a request under the node's time limit (`POST /v2/query`, `POST /v2/transactions/simulate`, `GET /v2/deltas/{round}`, and `GET` of a `/v2/…/versions` or `/v2/…/holders` listing, not algod's own `GET /versions`), where a retry would repeat the whole work: split the request or narrow the range instead. Other requests still retry a 504.
 - A transaction submit (`POST /v2/transactions` and `/async`) is retried only when the node surely didn't take it: a 429, a busy 503, or a connection refused or never made. After a lost answer, check for the transaction instead.
 - The wait is the longest of the backoff (0, then 2, 4, 8 s, at most 10 s), the `Retry-After` of a 429 or 503 (giving up at once when it is above 30 s), and 1 s for a 429 or busy 503 without one, a refused connection, or a browser's failed fetch.
 
@@ -373,11 +373,11 @@ Each wait before a retry (a `RetryWaitLike`: `reason`, `delayMs`, `until`, `retr
 - is logged with `Config.logger.warn`;
 - is emitted as `EventType.RetryWait` (`'retry-wait'`) on `Config.events`, without waiting for the listeners: `Config.events.on(EventType.RetryWait, (wait) => setStatus(formatRetryWait(wait)))`, with `formatRetryWait` from dt-algosdk (`import { formatRetryWait } from 'algosdk'`);
 - is passed to the policy's `onWait` (the client's, or else `Config.retry`'s);
-- is in the `AlgoHttpClientWithRetry`'s `waits` while it lasts (`waiting` is the one that waits longest): to poll them, make the client yourself (`new AlgoHttpClientWithRetry(tokenHeader, server, port, undefined, retry)`) and pass `{ algod: new algosdk.Algodv2(client, server) }` to `AlgorandClient.fromClients` (`Algodv2` still takes a server, as `ClientManager.getAlgodClient` passes it).
+- is in the `AlgoHttpClientWithRetry`'s `waits` while it lasts, if it waits at all (`delayMs` above 0; `waiting` is the one that waits longest): to poll them, make the client yourself (`new AlgoHttpClientWithRetry(tokenHeader, server, port, undefined, retry)`) and pass `{ algod: new algosdk.Algodv2(client, server) }` to `AlgorandClient.fromClients` (`Algodv2` still takes a server, as `ClientManager.getAlgodClient` passes it).
 
 What listeners and `onWait` throw is ignored. The clients carry dt-algosdk's `RETRYING_CLIENT` mark, so its `withRetry` returns them as they are rather than retrying twice over.
 
-With stock algosdk, or a dt-algosdk without `retry-policy`, the clients retry as upstream algokit-utils does (up to 5 tries, at once and then after 2, 4 and 8 s, on the statuses above and 413, ignoring `Retry-After`), stop when the request's `signal` aborts, and also read a network error's code on its `cause`; the `retry` options have no effect and no `RetryWait` event is emitted. An `Algodv2` or `Indexer` passed to `AlgorandClient.fromClients` retries only if its HTTP client does (for example one made with dt-algosdk's `withRetry`): a plain one doesn't retry.
+With stock algosdk, or a dt-algosdk without `retry-policy`, the clients retry as upstream algokit-utils does (up to 5 tries, at once and then after 2, 4 and 8 s, on the statuses above and 413, ignoring `Retry-After`), and stop when the request's `signal` aborts; the `retry` options have no effect and no `RetryWait` event is emitted. An `Algodv2` or `Indexer` passed to `AlgorandClient.fromClients` retries only if its HTTP client does (for example one made with dt-algosdk's `withRetry`): a plain one doesn't retry.
 
 ## Aborting requests
 
@@ -411,7 +411,7 @@ DT_ALGOD_SERVER=https://mainnet-api-dt.d13.co npx vitest run --dir src src/types
 
 The node must run the current dt-algorand release (dt5) with time travel on. The query tests branch on whether the node has queries, and the holders test is skipped on a node without the holders index, since both are optional: run them against a dtalgod with queries and one without to cover both the query path and the simulate fallback.
 
-The repo's own build and tests use the algosdk fork as a dev dependency, `"algosdk": "npm:dt-algosdk@<version>"`, pinned to an exact version.
+The repo's own build and tests use the algosdk fork as a dev dependency, `"algosdk": "npm:dt-algosdk@<version>"`, pinned to an exact version; while that version isn't on npm yet, its tarball is vendored instead (`"algosdk": "file:./vendor/dt-algosdk-<version>.tgz"`), which a release refuses.
 
 ## Building and publishing
 
@@ -424,7 +424,7 @@ GitHub Actions tests and publishes the package with one workflow, [`.github/work
 ### Releasing
 
 1. Choose the version (see below) and set it with `npm version <version> --no-git-tag-version`, which updates `package.json` and `package-lock.json`.
-2. Set the dt-algosdk the repo builds and tests against, pinned exactly: `npm install -D -E --min-release-age=0 algosdk@npm:dt-algosdk@<version>` (publish that `dt-algosdk` first if it's new; `--min-release-age=0` overrides the repo's `.npmrc`, which makes npm 11 refuse versions less than 7 days old). Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dt-algosdk version>` with the oldest dt-algosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add any new `DTAlgodClient.features` it uses to `REQUIRED_DT_FEATURES`.
+2. Set the dt-algosdk the repo builds and tests against, pinned exactly: `npm install -D -E --min-release-age=0 algosdk@npm:dt-algosdk@<version>` (publish that `dt-algosdk` first if it's new, and replace a vendored `file:` tarball with it: `check v<version>` refuses one; `--min-release-age=0` overrides the repo's `.npmrc`, which makes npm 11 refuse versions less than 7 days old). Set the `algosdk` peer range in `package.json` to `^3.5.2 || ^<dt-algosdk version>` with the oldest dt-algosdk this release works with (a prerelease only matches a range naming the same `x.y.z`), and add the new `DTAlgodClient.features` it requires to `REQUIRED_DT_FEATURES` (not the optional ones, such as `retry-policy`, which are checked on their own: a dt-algosdk without them must still count as dt-algosdk).
 3. `node scripts/ci/dt-release.mjs update` sets both versions in the install snippets of `README.md`: `@d13co/dt-algokit-utils@<version>` and `dt-algosdk@<the devDependency's version>`.
 4. `npm run build`, `npm test`, then `npm pack ./dist --dry-run` to check the contents.
 5. Commit and push `dtalgorand`, then tag the commit and push the tag to the fork, `github.com/d13co/dt-algokit-utils-ts` (not upstream): `git tag v<version> && git push <fork remote> v<version>`.

@@ -755,8 +755,9 @@ export class QueryManager {
    * call doesn't affect the others.
    *
    * The calls and rounds are split into as few requests as the node's `maxCalls`, `maxRounds` and `maxTotalCalls` (calls
-   * times rounds) allow, and by the request body limit, and sent `concurrency` at a time. A request whose results are over the node's `maxResponseBytes`, or that runs over
-   * its time limit (504), is split in halves (rounds first) and sent again; a call that is still too large or too slow
+   * times rounds) allow, and by the request body limit, and sent `concurrency` at a time. A request whose results are
+   * over the node's `maxResponseBytes`, or that runs over its time limit (504), is split in halves (rounds first) and
+   * sent again; a call that is still too large or too slow
    * alone fails on its own (`kind: 'call'`). When the latest round (0) is queried in more than one request, it is
    * resolved first so every call sees the same block. A busy node (503) or a rate limit (429) is retried by the
    * HTTP client of an `AlgorandClient` made from a config (`AlgoHttpClientWithRetry`, by dt-algosdk's retry policy:
@@ -910,7 +911,6 @@ export class QueryManager {
     if ((simulateOptions as { validityWindow?: unknown }).validityWindow !== undefined) {
       throw new Error('validityWindow is no longer an option: the groups are built valid at each round')
     }
-    // Simulate no longer takes a protocol: only the query path can run another one
     // Simulate runs the round's own protocol (`round`); any other needs the query path
     const otherProtocol = simulateOptions.protocol !== undefined && simulateOptions.protocol !== 'round'
     const queryOnly = via === 'query' || otherProtocol

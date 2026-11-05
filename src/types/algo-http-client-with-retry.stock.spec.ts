@@ -65,15 +65,12 @@ describe('AlgoHttpClientWithRetry without the dt-algosdk retry policy', () => {
     }
   })
 
-  test('a network error code on the cause (Node fetch) is retried', async () => {
-    fetchMock
-      .mockImplementationOnce(async () => {
-        throw new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) })
-      })
-      .mockImplementationOnce(async () => ok())
-    const request = client().get('/v2/status')
-    await vi.advanceTimersByTimeAsync(0)
-    expect((await request).status).toBe(200)
+  test("as upstream, a network error code on Node fetch's cause is not retried", async () => {
+    fetchMock.mockImplementation(async () => {
+      throw new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) })
+    })
+    await expect(client().get('/v2/status')).rejects.toMatchObject({ cause: { code: 'ECONNRESET' } })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   test('an abort stops the retries', async () => {

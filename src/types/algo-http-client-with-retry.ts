@@ -31,7 +31,7 @@ function callQuietly(f: () => unknown) {
  * 1 s for a 429 or busy 503 without one, a refused connection or a browser's failed fetch. The policy can be changed per client (`retry` in the constructor or
  * `AlgoClientConfig`) and globally (`Config.configure({ retry })`), the client's fields winning. Each wait is logged
  * (`Config.logger.warn`), emitted as `EventType.RetryWait` on `Config.events`, passed to the policy's `onWait`, and
- * listed in {@link waits} while it lasts.
+ * listed in {@link waits} while it lasts (when `delayMs` is above 0).
  *
  * With stock algosdk, requests are retried as upstream algokit-utils does (up to 5 tries, at once and then after 2, 4,
  * 8 s), stopping when the request's `signal` aborts; the `retry` options have no effect and no event is emitted.
@@ -81,7 +81,7 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
     this.retry = retry
   }
 
-  /** The requests waiting to be retried now, one entry each (dt-algosdk only). */
+  /** The requests waiting to be retried now, one entry each, only those with a wait above 0 (dt-algosdk only). */
   get waits(): readonly RetryWaitLike[] {
     return [...this.active]
   }
@@ -161,9 +161,9 @@ export class AlgoHttpClientWithRetry extends URLTokenBaseHTTPClient {
         if (numTries >= AlgoHttpClientWithRetry.MAX_TRIES) {
           throw err
         }
-        // Only retry for one of the hardcoded conditions; Node's fetch puts the network error code on `cause`
+        // Only retry for one of the hardcoded conditions
         if (!(
-          AlgoHttpClientWithRetry.RETRY_ERROR_CODES.includes(err.code ?? err.cause?.code) ||
+          AlgoHttpClientWithRetry.RETRY_ERROR_CODES.includes(err.code) ||
           AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.status)) ||
           ('response' in err && AlgoHttpClientWithRetry.RETRY_STATUS_CODES.includes(Number(err.response?.status)))
         )) {

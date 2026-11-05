@@ -6,7 +6,8 @@
 //
 // The docs name two versions: @d13co/dt-algokit-utils@<package.json version> and
 // dt-algosdk@<the exact dt-algosdk devDependency>, in the install snippets. The devDependency is
-// npm:dt-algosdk@<version>, or file:./vendor/dt-algosdk-<version>.tgz while that version isn't on npm.
+// npm:dt-algosdk@<version>, or file:./vendor/dt-algosdk-<version>.tgz while that version isn't on npm (not for a release:
+// `check <tag>` needs npm:).
 import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -85,6 +86,9 @@ if (mode === 'update') {
       return min && min.split('-')[0] === sdkVersion.split('-')[0] && comparePre(min, sdkVersion) <= 0
     })
     if (!accepts) errors.push(`peerDependencies.algosdk ${peer} has no ^<dt-algosdk> range that accepts ${sdkVersion}`)
+    // A release's users install dt-algosdk from npm: a vendored one may not be there, or not be the same build
+    if (tag && !sdkSpec.startsWith('npm:'))
+      errors.push(`devDependencies.algosdk is ${sdkSpec}: a release needs npm:dt-algosdk@${sdkVersion}, published first`)
   }
 
   for (const file of DOCS) {
