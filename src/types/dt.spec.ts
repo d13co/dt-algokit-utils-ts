@@ -1403,6 +1403,39 @@ describe('time travel', () => {
       }
     })
 
+    test("capabilities: query limits that aren't valid get the safe defaults", async () => {
+      const DT = algosdk.DTAlgodClient as unknown as { prototype: { capabilities(): Promise<unknown> } }
+      const spy = vi.spyOn(DT.prototype, 'capabilities').mockResolvedValue({
+        reported: true,
+        query: {
+          maxCalls: NaN,
+          maxCallBudget: -1,
+          maxCallLogBytes: Infinity,
+          maxCallStateBytes: 1.5,
+          maxResponseBytes: NaN,
+          maxRounds: 0,
+          maxTotalCalls: NaN,
+        },
+      })
+      try {
+        expect(await algorand.query.limits()).toEqual({
+          maxCalls: 1,
+          maxCallBudget: 700,
+          maxCallLogBytes: 0,
+          maxCallStateBytes: 0,
+          maxResponseBytes: 0,
+          maxRounds: 1,
+          maxTotalCalls: 1,
+        })
+        // An invalid total alone is maxCalls times maxRounds, as on a node that doesn't report it
+        spy.mockResolvedValue({ reported: true, query: { maxCalls: 8, maxRounds: 4, maxTotalCalls: -5 } })
+        const fresh = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(new StubClient(), '') })
+        expect(await fresh.query.limits()).toMatchObject({ maxCalls: 8, maxRounds: 4, maxTotalCalls: 32 })
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
     test("capabilities: a dt4 node's removed keys are ignored, and missing keys get dt-algosdk's defaults", async () => {
       stub.on(
         'get',
@@ -1759,8 +1792,8 @@ describe('query', () => {
         [[3n], 'e'],
       ])
 
-      // A total below maxRounds: 2 rounds take 1 call a request, the last round both, in 3 requests (as one round per
-      // request would; more rounds per request win the tie), not 4 with 2 rounds each
+      // A total below maxRounds: 2 rounds take 1 call a request, the last round both. That's 3 requests, as with one round
+      // a request, but in 2 chunks of rounds rather than 3 (fewer chunks win a tie)
       limited({ 'max-calls': 4, 'max-rounds': 4, 'max-total-calls': 2 })
       await algorand.query.run({ program, rounds: [1, 2, 3], calls: calls.slice(0, 2) })
       expect(shape()).toEqual([
@@ -1778,12 +1811,16 @@ describe('query', () => {
         [9, 100],
         [8, 100],
       ])
-      // 17 rounds of 1,000 calls: 17 requests, as with one round per request (here 9 and 8 rounds of at most 113 and 128
-      // calls), each within the total
+      // 17 rounds of 1,000 calls: 17 requests, as with one round a request, in 2 chunks spread evenly (16 and 1 rounds
+      // would take 17 too): 9 rounds of at most 113 calls, and 8 of at most 128
       stub.calls = []
       const results1000 = await algorand.query.run({ program, rounds: seventeen, calls: many(1000) })
-      expect(queries(stub)).toHaveLength(17)
-      expect(queries(stub).every((c) => sentQuery(c).rounds!.length * sentQuery(c).calls.length <= 1024)).toBe(true)
+      // The rounds and calls of each request, the larger first
+      const sizes = () =>
+        queries(stub)
+          .map((c) => [sentQuery(c).rounds!.length, sentQuery(c).calls.length])
+          .sort(([a, x], [b, y]) => b - a || y - x)
+      expect(sizes()).toEqual([...new Array(8).fill([9, 113]), [9, 96], ...new Array(7).fill([8, 128]), [8, 104]])
       expect(results1000.every((r) => r.calls.length === 1000 && r.calls.every((c) => c.ok))).toBe(true)
 
       // The rounds are spread evenly: 10 rounds at most 4 a request go in 4, 3 and 3, not 4, 4 and 2
@@ -1791,12 +1828,38 @@ describe('query', () => {
       await algorand.query.run({ program, rounds: Array.from({ length: 10 }, (_, i) => i + 1), calls: many(1) })
       expect(queries(stub).map((c) => sentQuery(c).rounds!.length)).toEqual([4, 3, 3])
 
-      // Unless full requests with a shorter last one need fewer: 19 rounds of 715 calls at the node's defaults take 14
-      // requests (15 rounds of 68 calls, then 4 of 256), where 7, 6 and 6 rounds would take 15
+      // Unless uneven chunks need fewer: 19 rounds of 715 calls at the node's defaults take 14 requests (14 rounds of 73
+      // calls, then 5 of 204), where 10 and 9 rounds would take 15
       limited({})
       await algorand.query.run({ program, rounds: Array.from({ length: 19 }, (_, i) => i + 1), calls: many(715) })
-      expect(queries(stub)).toHaveLength(14)
-      expect([...new Set(queries(stub).map((c) => sentQuery(c).rounds!.length))]).toEqual([15, 4])
+      expect(sizes()).toEqual([...new Array(9).fill([14, 73]), [14, 58], ...new Array(3).fill([5, 204]), [5, 103]])
+
+      // Or chunks of mixed sizes: at a total of 7, 3 calls at 11 rounds take 5 requests in 7, 2 and 2 rounds, where 6 and 5
+      // rounds would take 6, as would any split of chunks of one size
+      limited({ 'max-calls': 3, 'max-rounds': 8, 'max-total-calls': 7 })
+      await algorand.query.run({ program, rounds: Array.from({ length: 11 }, (_, i) => i + 1), calls: calls.slice(0, 3) })
+      expect(shape()).toEqual([
+        [[1n, 2n, 3n, 4n, 5n, 6n, 7n], 'a'],
+        [[1n, 2n, 3n, 4n, 5n, 6n, 7n], 'b'],
+        [[1n, 2n, 3n, 4n, 5n, 6n, 7n], 'c'],
+        [[8n, 9n], 'abc'],
+        [[10n, 11n], 'abc'],
+      ])
+    })
+
+    test("a query runs on limits that aren't valid, one call and one round a request", async () => {
+      const DT = algosdk.DTAlgodClient as unknown as { prototype: { capabilities(): Promise<unknown> } }
+      const spy = vi
+        .spyOn(DT.prototype, 'capabilities')
+        .mockResolvedValue({ reported: true, query: { maxCalls: NaN, maxRounds: NaN, maxTotalCalls: NaN } })
+      try {
+        stub.on('post', '/v2/query', queryEcho(), true)
+        const results = await algorand.query.run({ program, rounds: [1, 2], calls: [{ args: [enc('a')] }, { args: [enc('b')] }] })
+        expect(queries(stub)).toHaveLength(4)
+        for (const r of results) expect(r.calls.map((c) => (c.ok ? dec(c.logs[0]) : undefined))).toEqual(['a', 'b'])
+      } finally {
+        spy.mockRestore()
+      }
     })
 
     test("dt-algosdk sets maxTotalCalls to maxCalls times maxRounds for a node that doesn't report it", async () => {

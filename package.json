@@ -73,6 +73,7 @@
     "lint": "eslint ./src/",
     "lint:fix": "eslint ./src/ --fix",
     "check-types": "tsc --project tsconfig.typecheck.json --noEmit",
+    "check-stock-types": "node scripts/ci/check-stock-types.mjs",
     "audit": "better-npm-audit audit",
     "format": "prettier --write .",
     "commit-lint": "commitlint --edit -o",
