@@ -33,6 +33,7 @@ import {
   SimulateRoundsOptions,
   checkSimulateLimits,
 } from './simulate-manager'
+import { planRoundChunks } from './query-plan'
 import modelsv2 = algosdk.modelsv2
 
 /** The most requests of a query in flight at once, by default. */
@@ -84,7 +85,10 @@ export interface QueryParams {
   appId?: Round
   /** The sender of every call. Defaults to the fee sink. */
   sender?: string | Address
-  /** The rounds to query at (0 for the latest round): the state as of the end of each round. Defaults to the latest round. Duplicates are queried once. */
+  /**
+   * The rounds to query at (0 for the latest round): the state as of the end of each round. Defaults to the latest round.
+   * Duplicates are queried once.
+   */
   rounds?: Round[]
   /**
    * The protocol of the block after each round, as if an upgrade to it took effect right after the round: its programs,
@@ -108,7 +112,10 @@ export interface QueryRunOptions {
   concurrency?: number
   /** At most this many calls per request. The node's `maxCalls` and `maxTotalCalls` cap it: set it lower to split more. */
   maxCalls?: number
-  /** At most this many rounds per request. The node's `maxRounds` and `maxTotalCalls` cap it: set it lower to split more. */
+  /**
+   * At most this many rounds per request. The node's `maxRounds` and `maxTotalCalls` cap it, as does 256 (the most dtalgod
+   * allows): set it lower to split more.
+   */
   maxRounds?: number
 }
 
@@ -233,7 +240,10 @@ export type QueryGroupsOptions = Omit<SimulateGroupsOptions, 'parallel'> & Query
 export type QueryRoundsOptions = Omit<SimulateRoundsOptions, 'parallel'> &
   QueryProtocolOption &
   QueryRouting & {
-    /** On the query path, at most this many rounds per query request. The node's `maxRounds` and `maxTotalCalls` cap it. */
+    /**
+     * On the query path, at most this many rounds per query request. The node's `maxRounds` and `maxTotalCalls` cap it, as
+     * does 256 (the most dtalgod allows).
+     */
     maxRounds?: number
   }
 
@@ -498,31 +508,16 @@ class QueryRun {
 
   /**
    * Splits a job into requests: rounds by `maxRounds`, calls by `maxCalls`, both by `maxTotalCalls` (calls times rounds),
-   * and calls by the request body limit. Of the splits of the rounds into requests of at most `r` rounds (for each `r`,
-   * spread evenly or full with a shorter last one), it takes the one that needs the fewest requests, each taking as many
-   * calls as fit in the total at its rounds. The body limit, which can split the calls further, is left out of that count.
+   * and calls by the request body limit. The rounds go in the chunks that need the fewest requests in all, each request of
+   * a chunk taking as many calls as fit in the total at its rounds (see `planRoundChunks`). The body limit, which can split
+   * the calls further, is left out of that count.
    */
   private plan(job: QueryJob, j: number): Piece[] {
     const { maxCalls, maxRounds, maxTotalCalls } = this.limits
-    const roundCount = job.rounds.length
     const callCount = job.calls.length
     const callsAt = (rounds: number) => Math.max(1, Math.min(this.config.maxCalls, maxCalls, Math.floor(maxTotalCalls / rounds)))
-    const top = Math.max(1, Math.min(this.config.maxRounds, maxRounds, maxTotalCalls, roundCount))
-    // For each rounds per request, two splits: the rounds spread evenly (sizes differing by at most 1, the longer ones
-    // first) and full requests with a shorter last one. Keep the one with the fewest requests, preferring more rounds
-    // per request and then the even split on a tie.
-    let sizes: number[] = []
-    let fewest = Infinity
-    for (let r = top; r >= 1; r--) {
-      const count = Math.ceil(roundCount / r)
-      const base = Math.floor(roundCount / count)
-      const even = Array.from({ length: count }, (_, i) => base + (i < roundCount % count ? 1 : 0))
-      const full = Array.from({ length: count }, (_, i) => (i < count - 1 ? r : roundCount - r * (count - 1)))
-      for (const split of [even, full]) {
-        const requests = split.reduce((n, size) => n + Math.ceil(callCount / callsAt(size)), 0)
-        if (requests < fewest) [fewest, sizes] = [requests, split]
-      }
-    }
+    const top = Math.min(this.config.maxRounds, maxRounds, maxTotalCalls)
+    const sizes = planRoundChunks(job.rounds.length, top, (rounds) => Math.ceil(callCount / callsAt(rounds)))
     let at = 0
     const roundChunks = sizes.map((size) => job.rounds.slice(at, (at += size)))
     const ranges = new Map<number, [number, number][]>()
@@ -765,13 +760,13 @@ export class QueryManager {
    * call doesn't affect the others.
    *
    * The calls and rounds are split into few requests within the node's `maxCalls`, `maxRounds` and `maxTotalCalls` (calls
-   * times rounds), and by the request body limit, and sent `concurrency` at a time. A request whose results are over
-   * the node's `maxResponseBytes`, or that runs over its time limit (504), is split in halves (rounds first) and sent
-   * again; a call that is still too large or too slow alone fails on its own (`kind: 'call'`). When the latest round (0) is queried in more than one request, it is
-   * resolved first so every call sees the same block. A busy node (503) or a rate limit (429) is retried by the
-   * HTTP client of an `AlgorandClient` made from a config (`AlgoHttpClientWithRetry`, by dt-algosdk's retry policy:
-   * honoring `Retry-After`), not by `run` itself. Any other error (a bad
-   * request, a round after the latest one) cancels the requests in flight and is thrown.
+   * times rounds), and by the request body limit, and sent `concurrency` at a time. A request whose results are over the
+   * node's `maxResponseBytes`, or that runs over its time limit (504), is split in halves (rounds first) and sent again; a
+   * call that is still too large or too slow alone fails on its own (`kind: 'call'`). When the latest round (0) is queried
+   * in more than one request, it is resolved first so every call sees the same block. A busy node (503) or a rate limit
+   * (429) is retried by the HTTP client of an `AlgorandClient` made from a config (`AlgoHttpClientWithRetry`, by
+   * dt-algosdk's retry policy: honoring `Retry-After`), not by `run` itself. Any other error (a bad request, a round after
+   * the latest one) cancels the requests in flight and is thrown.
    *
    * There is no simulate fallback here; `groups` and `rounds` have one.
    *

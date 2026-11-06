@@ -83,6 +83,10 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Type-checks dist/ again against the stock algosdk of the peer range, as a consumer without dt-algosdk sees it
+      - name: Check the published types against stock algosdk
+        run: npm run check-stock-types
+
       - name: Test
         run: npm run test -- --silent
 

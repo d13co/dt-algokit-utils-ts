@@ -696,19 +696,23 @@ export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilit
   }
 }
 
-/** A copy of dt-algosdk's query limits, with safe defaults for the fields it doesn't have. */
+/** A copy of dt-algosdk's query limits, with safe defaults for the fields it doesn't have or that aren't valid. */
 function queryLimitsOf(query: Partial<QueryLimits>): QueryLimits {
-  const maxCalls = query.maxCalls ?? 1
-  const maxRounds = query.maxRounds ?? 1
+  // A count, or the default when it isn't a positive integer (a NaN would plan no requests at all)
+  const count = (value: number | undefined, fallback: number) => (Number.isSafeInteger(value) && value! > 0 ? value! : fallback)
+  // A size in bytes, or 0 (no limit, or for maxCallLogBytes the protocol's limits) when it isn't a non-negative integer
+  const bytes = (value: number | undefined) => (Number.isSafeInteger(value) && value! >= 0 ? value! : 0)
+  const maxRounds = count(query.maxRounds, 1)
+  // 0 (or no value) too: a node never reports it, and dt-algosdk takes it as absent
+  const maxTotalCalls = count(query.maxTotalCalls, Math.min(count(query.maxCalls, 1) * maxRounds, Number.MAX_SAFE_INTEGER))
   return {
-    maxCalls,
-    maxCallBudget: query.maxCallBudget ?? 700,
-    maxCallLogBytes: query.maxCallLogBytes ?? 0,
-    maxCallStateBytes: query.maxCallStateBytes ?? 0,
-    maxResponseBytes: query.maxResponseBytes ?? 0,
+    maxCalls: count(query.maxCalls, 1),
+    maxCallBudget: count(query.maxCallBudget, 700),
+    maxCallLogBytes: bytes(query.maxCallLogBytes),
+    maxCallStateBytes: bytes(query.maxCallStateBytes),
+    maxResponseBytes: bytes(query.maxResponseBytes),
     maxRounds,
-    // 0 too: a node never reports it, and dt-algosdk takes it as absent
-    maxTotalCalls: query.maxTotalCalls || Math.min(maxCalls * maxRounds, Number.MAX_SAFE_INTEGER),
+    maxTotalCalls,
   }
 }
 
