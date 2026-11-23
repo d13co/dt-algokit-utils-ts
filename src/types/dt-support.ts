@@ -34,13 +34,41 @@ export const REQUIRED_DT_FEATURES = Object.freeze([
   'round-header',
 ] as const)
 
-/** Thrown when a time travel, extended simulate or query feature is used but the loaded algosdk is not dt-algosdk (the time-travel fork). */
+/**
+ * The `DTAlgodClient.features` that some methods need on top of {@link REQUIRED_DT_FEATURES}, with the dt-algosdk release
+ * that added each. They are not required, so an older dt-algosdk keeps working for everything else: only the methods that
+ * need them throw a {@link DTNotAvailableError}.
+ */
+export const OPTIONAL_DT_FEATURES = Object.freeze({
+  /** `getTxnStateChangesForRound` and `stateChanges` of the capabilities */
+  'state-changes': '3.9.0-dt.6.2.1.0',
+  /** The `accounts`, `assets` and `apps` includes of the state changes */
+  'full-deltas': '3.9.0-dt.6.2.1.0',
+  /** The `budget`, `reads` and `trace` includes of the state changes */
+  'dev-traces': '3.9.0-dt.6.2.1.0',
+  /** `stateChangeAppId` on simulate's `execTraceConfig`, and `simulate.execTraceConfig` of the capabilities */
+  'state-change-app-id': '3.9.0-dt.6.2.1.0',
+} as const)
+
+/** A feature of {@link OPTIONAL_DT_FEATURES}. */
+export type OptionalDTFeature = keyof typeof OPTIONAL_DT_FEATURES
+
+/**
+ * Thrown when a time travel, extended simulate or query feature is used but the loaded algosdk is not dt-algosdk (the
+ * time-travel fork), or is a dt-algosdk too old for it (see {@link OPTIONAL_DT_FEATURES}).
+ */
 export class DTNotAvailableError extends Error {
-  /** @param feature The feature that was used, for the message */
-  constructor(feature: string) {
+  /**
+   * @param feature The feature that was used, for the message
+   * @param sdkFeatures The {@link OPTIONAL_DT_FEATURES} it needs that the loaded dt-algosdk lacks, if it is dt-algosdk
+   */
+  constructor(feature: string, sdkFeatures?: readonly OptionalDTFeature[]) {
     super(
-      `${feature} needs dt-algosdk, the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
-        'but the loaded algosdk is not it. Install dt-algosdk in place of algosdk and make sure the app loads a single copy of algosdk.',
+      sdkFeatures?.length
+        ? `${feature} needs the DTAlgodClient features ${sdkFeatures.join(', ')} of dt-algosdk ` +
+            `${[...new Set(sdkFeatures.map((f) => OPTIONAL_DT_FEATURES[f]))].join(' and ')} or later, but the loaded dt-algosdk is older. Update dt-algosdk.`
+        : `${feature} needs dt-algosdk, the time-travel fork of algosdk (with DTAlgodClient features ${REQUIRED_DT_FEATURES.join(', ')}), ` +
+            'but the loaded algosdk is not it. Install dt-algosdk in place of algosdk and make sure the app loads a single copy of algosdk.',
     )
     this.name = 'DTNotAvailableError'
   }
@@ -458,6 +486,12 @@ export interface Capabilities {
   simulate: SimulateLimits
   /** The limits of read-only queries (`POST /v2/query`): present only when the node has queries on (`MaxAPIQueryCalls` above 0). */
   query?: QueryLimits
+  /**
+   * What the transaction state changes (`GET /v2/deltas/{round}/txn/state-changes`, `DTManager.getTxnStateChanges`)
+   * offer: present only when the node serves them (dtalgod dt6 or later with time travel on) and the loaded dt-algosdk
+   * reads them (feature `state-changes`).
+   */
+  stateChanges?: StateChangesLimits
 }
 
 /** The limits a node places on simulate requests, as dtalgod reports them in its capabilities. */
@@ -466,6 +500,219 @@ export interface SimulateLimits {
   maxTxnGroups: number
   /** The most `extraOpcodeBudget`, for each top-level group of a request (`MaxAPISimulateExtraOpcodeBudget`). 320,000 on stock algod. */
   maxExtraOpcodeBudget: number
+  /**
+   * The non-standard `execTraceConfig` options the node takes: `state-change-app-id` for `stateChangeAppId` (dtalgod dt6
+   * or later, with the developer API). Empty on stock algod, on older dtalgod, without the developer API, and with a
+   * dt-algosdk that doesn't read it (feature `state-change-app-id`).
+   */
+  execTraceConfig: readonly string[]
+}
+
+/** What a node's transaction state changes offer, as dtalgod reports them in its capabilities. */
+export interface StateChangesLimits {
+  /** The most bytes a response may have; a larger one is a 400 (`isStateChangesTooLarge` of dt-algosdk). 0: no limit. */
+  maxResponseBytes: number
+  /**
+   * The values the request's `include` takes: the group changes (`accounts`, `assets`, `apps`), then `budget` and
+   * `reads`, and `trace` with the developer API. Empty on a node from before them.
+   */
+  include: readonly (StateChangesInclude | (string & {}))[]
+}
+
+/**
+ * What a transaction state changes request can add (dt-algosdk's `StateChangesInclude`):
+ * - `accounts`, `assets` and `apps`: what each group changed besides app state (`groups`, and the round's `feeSink`);
+ * - `budget`: the opcode budget of each program run (`budget`);
+ * - `reads`: the app state each transaction read (`reads`);
+ * - `trace`: the execution traces of one transaction's group and the disassembly of their programs (`traces`, `programs`).
+ */
+export type StateChangesInclude = 'accounts' | 'assets' | 'apps' | 'budget' | 'reads' | 'trace'
+
+/** The encoding methods of dt-algosdk's models, which the state changes types have so that they are assignable to them. */
+export interface DTModelLike extends algosdk.Encodable {
+  toEncodingData(): Map<string, unknown>
+}
+
+/** A change of one app state key by a transaction (dt-algosdk's `AppStateChange`). */
+export interface AppStateChange extends DTModelLike {
+  appId: bigint
+  /** `g` global state, `l` local state, `b` a box */
+  appStateType: string
+  /** The account, for local state */
+  account?: algosdk.Address
+  /** The key, or the box name */
+  key: Uint8Array
+  /** The value before the transaction; undefined if the key did not exist */
+  before?: modelsv2.TealValue
+  /** The value after the transaction; undefined if the key was deleted */
+  after?: modelsv2.TealValue
+}
+
+/** The app state changes of one transaction, top-level or inner (dt-algosdk's `TxnStateChanges`). */
+export interface TxnStateChanges extends DTModelLike {
+  /** The path of the transaction: `[i]` for the round's top-level transaction `i`, `[i, j, ...]` for its inner ones */
+  path: number[]
+  /** The transaction ID, for a top-level transaction */
+  txid?: string
+  /** The net changes of the transaction and its inner transactions */
+  changes: AppStateChange[]
+}
+
+/** An account's fields, as a group's account changes list them (dt-algosdk's `AccountState`). */
+export interface AccountState extends DTModelLike {
+  amount: bigint
+  minBalance: bigint
+  status: string
+  totalAppsOptedIn: number
+  totalAssetsOptedIn: number
+  totalCreatedApps: number
+  totalCreatedAssets: number
+  appsTotalExtraPages?: number
+  appsTotalSchema?: modelsv2.ApplicationStateSchema
+  authAddr?: algosdk.Address
+  incentiveEligible?: boolean
+  lastHeartbeat?: number
+  lastProposed?: number
+  participation?: modelsv2.AccountParticipation
+  rewardBase?: bigint
+  rewards?: bigint
+  totalBoxBytes?: number
+  totalBoxes?: number
+}
+
+/** A change of an account's fields by a group; `before` or `after` undefined for an account created or closed. */
+export interface AccountStateChange extends DTModelLike {
+  address: algosdk.Address
+  before?: AccountState
+  after?: AccountState
+}
+
+/** A change of an asset holding by a group; `before` undefined for an opt-in, `after` for an opt-out. */
+export interface AssetHoldingChange extends DTModelLike {
+  address: algosdk.Address
+  assetId: bigint
+  before?: modelsv2.AssetHolding
+  after?: modelsv2.AssetHolding
+}
+
+/** A change of an asset's params by a group; `before` undefined for a creation, `after` for a destruction. */
+export interface AssetParamsChange extends DTModelLike {
+  assetId: bigint
+  before?: modelsv2.AssetParams
+  after?: modelsv2.AssetParams
+}
+
+/** A change of an app's params by a group; `before` undefined for a creation, `after` for a deletion. */
+export interface AppParamsChange extends DTModelLike {
+  appId: bigint
+  before?: modelsv2.ApplicationParams
+  after?: modelsv2.ApplicationParams
+}
+
+/** A change of an account's local state in an app by a group; `before` undefined for an opt-in, `after` for an opt-out. */
+export interface LocalStateChange extends DTModelLike {
+  address: algosdk.Address
+  appId: bigint
+  before?: modelsv2.ApplicationLocalState
+  after?: modelsv2.ApplicationLocalState
+}
+
+/** What a top-level group changed besides app state, with the values before and after it (dt-algosdk's `GroupStateChanges`). */
+export interface GroupStateChanges extends DTModelLike {
+  /** The payset index of the group's first transaction: `path[0]` of its transactions in `txns` */
+  first: number
+  /** The number of top-level transactions of the group */
+  count: number
+  groupId?: Uint8Array
+  txids: string[]
+  accounts: AccountStateChange[]
+  holdings: AssetHoldingChange[]
+  assets: AssetParamsChange[]
+  apps: AppParamsChange[]
+  localStates: LocalStateChange[]
+}
+
+/** The opcode budget of one program run (dt-algosdk's `ProgramBudget`). */
+export interface ProgramBudget extends DTModelLike {
+  path: number[]
+  txid?: string
+  /** `approval`, `clear` or `logic-sig` */
+  kind: string
+  appId?: bigint
+  cost: number
+  budgetBefore: number
+  budgetAfter: number
+  failed?: boolean
+}
+
+/** A read of one app state key (dt-algosdk's `AppStateRead`). */
+export interface AppStateRead extends DTModelLike {
+  appId: bigint
+  appStateType: string
+  account?: algosdk.Address
+  key: Uint8Array
+  exists: boolean
+  /** The value, for global and local state */
+  value?: modelsv2.TealValue
+  /** For a box, its length in bytes (its value is not given); undefined for global and local state */
+  length?: number
+}
+
+/** The app state one transaction read (dt-algosdk's `TxnStateReads`). */
+export interface TxnStateReads extends DTModelLike {
+  path: number[]
+  txid?: string
+  reads: AppStateRead[]
+}
+
+/** The execution trace of one top-level transaction, as simulate gives it (dt-algosdk's `TxnExecTrace`). */
+export interface TxnExecTrace extends DTModelLike {
+  txid: string
+  execTrace: modelsv2.SimulationTransactionExecTrace
+}
+
+/** A line of a program's disassembly; `pc` is undefined for a line without an opcode, such as `#pragma version` or a label. */
+export interface DisassemblyLine extends DTModelLike {
+  pc?: number
+  text: string
+}
+
+/** The disassembly of a traced program, by the program's hash (dt-algosdk's `ProgramDisassembly`). */
+export interface ProgramDisassembly extends DTModelLike {
+  hash: Uint8Array
+  lines: DisassemblyLine[]
+}
+
+/**
+ * The transaction state changes of a round (dt-algosdk's `TxnStateChangesResponse`). It is dt-algosdk's object, so
+ * dt-algosdk's helpers take it: `groupOf`, `txnsOf`, `changedFields`, `withoutFeeSink`, `programLine` and `budgetOf`.
+ * Like the types it holds, it is `Encodable` as dt-algosdk's models are, so that it is assignable to them.
+ */
+export interface TxnStateChangesResponse extends DTModelLike {
+  round: bigint
+  /** The transactions that changed app state, top-level and inner, in execution order */
+  txns: TxnStateChanges[]
+  /** With `accounts`, `assets` or `apps`: what each group changed besides app state */
+  groups?: GroupStateChanges[]
+  /** With `accounts`, `assets` or `apps`: the round's fee sink, whose balance changes with every group */
+  feeSink?: algosdk.Address
+  /** With `budget` */
+  budget?: ProgramBudget[]
+  /** With `reads` */
+  reads?: TxnStateReads[]
+  /** With `trace` */
+  traces?: TxnExecTrace[]
+  /** With `trace` */
+  programs?: ProgramDisassembly[]
+}
+
+/** A transaction state changes request (`GET /v2/deltas/{round}/txn/state-changes`). */
+export interface TxnStateChangesRequestLike {
+  app(appId: Round): this
+  txid(txid: string): this
+  txids(txids: readonly string[]): this
+  include(parts: readonly StateChangesInclude[]): this
+  do(...args: DoArgs): Promise<TxnStateChangesResponse>
 }
 
 /** The limits a node places on read-only queries (`POST /v2/query`), as dtalgod reports them in its capabilities. */
@@ -560,6 +807,7 @@ export interface CapabilitiesLike {
   timeLimitSeconds?: number
   simulate?: Partial<SimulateLimits>
   query?: Partial<QueryLimits>
+  stateChanges?: Partial<StateChangesLimits>
 }
 
 /** The parts of the fork's `DTAlgodClient` that algokit-utils uses. */
@@ -594,6 +842,8 @@ export interface DTAlgodLike {
   capabilities(): Promise<CapabilitiesLike>
   /** A read-only query (`POST /v2/query`). */
   query(request: QueryRequestParamsLike): RunQueryLike
+  /** The app state changes of each transaction of a round; feature `state-changes`. */
+  getTxnStateChangesForRound?(round: Round): TxnStateChangesRequestLike
 }
 
 interface DTAlgodClass {
@@ -658,6 +908,25 @@ export function requireDTSdk(feature: string): DTSdk {
   return tt
 }
 
+/** Returns whether the loaded algosdk is dt-algosdk with all of these {@link OPTIONAL_DT_FEATURES}. */
+export function hasDTFeatures(...sdkFeatures: OptionalDTFeature[]): boolean {
+  const features = getDTSdk()?.DTAlgodClient.features
+  return features !== undefined && sdkFeatures.every((f) => features.includes(f))
+}
+
+/**
+ * Returns the parts of dt-algosdk that algokit-utils uses after checking that it has these {@link OPTIONAL_DT_FEATURES},
+ * or throws a {@link DTNotAvailableError} that says whether algosdk is not dt-algosdk or a dt-algosdk too old.
+ * @param feature The feature that needs them, for the error message
+ * @param sdkFeatures The optional features it needs
+ */
+export function requireDTFeatures(feature: string, ...sdkFeatures: OptionalDTFeature[]): DTSdk {
+  const tt = requireDTSdk(feature)
+  const missing = sdkFeatures.filter((f) => !tt.DTAlgodClient.features.includes(f))
+  if (missing.length > 0) throw new DTNotAvailableError(feature, missing)
+  return tt
+}
+
 /**
  * Returns a time-travel algod client that shares the connection (server, token, headers and HTTP client) of the given
  * algod client. The same client is returned for the same `algod`, so what it caches (the node's capabilities) is kept.
@@ -681,7 +950,8 @@ export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilit
   if (!tt) return undefined
   // A copy: the fork's object is shared by every caller of the client. A field dt-algosdk doesn't have (an older or newer
   // one) gets a safe default: stock algod's for simulate, the smallest for queries.
-  const { reported, timeTravel, developerApi, timeLimitSeconds, simulate, query } = await tt.DTAlgodClient.from(algod).capabilities()
+  const { reported, timeTravel, developerApi, timeLimitSeconds, simulate, query, stateChanges } =
+    await tt.DTAlgodClient.from(algod).capabilities()
   return {
     reported,
     timeTravel: timeTravel ?? false,
@@ -690,9 +960,19 @@ export async function getCapabilities(algod: algosdk.Algodv2): Promise<Capabilit
     simulate: {
       maxTxnGroups: simulate?.maxTxnGroups ?? 1,
       maxExtraOpcodeBudget: simulate?.maxExtraOpcodeBudget ?? 320_000,
+      execTraceConfig: Object.freeze([...(simulate?.execTraceConfig ?? [])]),
     },
     // Only when present, so the capabilities of a node without queries have no `query` key
     ...(query ? { query: queryLimitsOf(query) } : {}),
+    // Likewise for a node without state changes (and a dt-algosdk that doesn't read them)
+    ...(stateChanges
+      ? {
+          stateChanges: {
+            maxResponseBytes: stateChanges.maxResponseBytes ?? 0,
+            include: Object.freeze([...(stateChanges.include ?? [])]),
+          },
+        }
+      : {}),
   }
 }
 
@@ -720,6 +1000,31 @@ function queryLimitsOf(query: Partial<QueryLimits>): QueryLimits {
  */
 export async function getQueryLimits(algod: algosdk.Algodv2): Promise<QueryLimits | undefined> {
   return (await getCapabilities(algod))?.query
+}
+
+/**
+ * Whether a simulate `execTraceConfig` asks for `stateChangeAppId` (an `appId` on each trace state change): read
+ * structurally, since stock algosdk's `SimulateTraceConfig` has no such field.
+ */
+export const asksStateChangeAppId = (execTraceConfig: unknown): boolean =>
+  (execTraceConfig as { stateChangeAppId?: unknown } | undefined)?.stateChangeAppId === true
+
+/**
+ * Throws a `DTUnsupportedError` unless the node takes `stateChangeAppId` in simulate's `execTraceConfig`: dtalgod dt6 or
+ * later with the developer API lists `state-change-app-id` in `simulate.execTraceConfig` of its capabilities. Another
+ * node would reject the request (stock algod and older dtalgod with a 400 for the unknown field) or ignore it.
+ * @throws DTNotAvailableError if the loaded algosdk is not dt-algosdk, or a dt-algosdk without `state-change-app-id`
+ */
+export function checkStateChangeAppId(capabilities: Capabilities): void {
+  const tt = requireDTFeatures('execTraceConfig.stateChangeAppId', 'state-change-app-id')
+  if (!capabilities.simulate.execTraceConfig.includes('state-change-app-id')) {
+    const why = !capabilities.reported
+      ? 'the node is stock algod'
+      : !capabilities.developerApi
+        ? 'the node has the developer API off (EnableDeveloperAPI)'
+        : 'the node does not take it (dtalgod before dt6)'
+    throw new tt.DTUnsupportedError(`execTraceConfig.stateChangeAppId needs dtalgod dt6 or later with the developer API, but ${why}`)
+  }
 }
 
 /** The message of the error for a node without queries, from its capabilities. */

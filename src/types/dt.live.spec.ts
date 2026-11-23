@@ -135,6 +135,73 @@ describe.skipIf(!server)('time travel against a live dtalgod', { timeout: 60_000
     }
   })
 
+  test('simulate takes stateChangeAppId on a node that lists it', async (ctx) => {
+    const { simulate } = await algorand.client.capabilities()
+    if (!simulate.execTraceConfig.includes('state-change-app-id')) return ctx.skip('the node does not take stateChangeAppId')
+    const pay = algorand.newGroup().addPayment({ sender: XGOV_CREATOR, receiver: XGOV_CREATOR, amount: algo(0) })
+    const execTraceConfig = new algosdk.modelsv2.SimulateTraceConfig({
+      enable: true,
+      stateChange: true,
+      stateChangeAppId: true,
+    } as ConstructorParameters<typeof algosdk.modelsv2.SimulateTraceConfig>[0])
+    const [outcome] = await algorand.simulate.groups([pay], { execTraceConfig })
+    expect(outcome.ok).toBe(true)
+  })
+
+  describe('transaction state changes', () => {
+    /** The last round the xGov app's params or global state changed in, and its global state then. */
+    let round: bigint
+    let globalState: Awaited<ReturnType<AlgorandClient['app']['getGlobalState']>>
+
+    beforeAll(async () => {
+      const { versions } = await algorand.dt.getAppVersions(XGOV, { order: 'desc', limit: 1, includeValues: true })
+      round = versions[0].round
+      globalState = versions[0].app!.globalState
+    })
+
+    test('the changes of an app in a round end with its global state at that round', async (ctx) => {
+      if (!(await algorand.dt.supportsStateChanges())) return ctx.skip('the node does not serve state changes')
+      const { txns } = await algorand.dt.getTxnStateChanges(round, { appId: XGOV })
+      expect(txns.length).toBeGreaterThan(0)
+      const last = new Map<string, { type: number; uint: bigint; bytes: Uint8Array } | undefined>()
+      for (const t of txns) {
+        for (const c of t.changes) {
+          expect(c.appId).toBe(XGOV)
+          if (c.appStateType === 'g') last.set(Buffer.from(c.key).toString('base64'), c.after)
+        }
+      }
+      expect(last.size).toBeGreaterThan(0)
+      for (const [keyBase64, after] of last) {
+        const state = Object.values(globalState).find((v) => v.keyBase64 === keyBase64)
+        if (!after) expect(state).toBeUndefined()
+        else if (after.type === 2) expect(state?.value).toBe(after.uint)
+        else expect(state && 'valueRaw' in state ? Buffer.from(state.valueRaw).equals(Buffer.from(after.bytes)) : false).toBe(true)
+      }
+    })
+
+    test('a transaction with its group changes, budget, reads and trace', async (ctx) => {
+      if (!(await algorand.dt.supportsStateChanges())) return ctx.skip('the node does not serve state changes')
+      const { include } = (await algorand.client.capabilities()).stateChanges!
+      const { txns } = await algorand.dt.getTxnStateChanges(round, { appId: XGOV })
+      const txid = txns.find((t) => t.txid)?.txid
+      if (!txid) return ctx.skip('no top-level transaction had net changes to the app in that round')
+      const wanted = (['accounts', 'assets', 'apps', 'budget', 'reads', 'trace'] as const).filter((p) => include.includes(p))
+      const res = await algorand.dt.getTxnStateChanges(round, { txIds: txid, include: wanted })
+      expect(res.txns.every((t) => t.path.length > 0)).toBe(true)
+      if (include.includes('accounts')) {
+        expect(res.groups!.length).toBe(1)
+        expect(res.groups![0].txids).toContain(txid)
+        expect(res.feeSink).toBeDefined()
+      }
+      if (include.includes('budget')) expect(res.budget!.some((b) => b.appId === XGOV)).toBe(true)
+      if (include.includes('reads')) expect(res.reads!.length).toBeGreaterThan(0)
+      if (include.includes('trace')) {
+        expect(res.traces!.some((t) => t.txid === txid)).toBe(true)
+        expect(res.programs!.length).toBeGreaterThan(0)
+      }
+    })
+  })
+
   describe('query', () => {
     /** `#pragma version 10; global Round; itob; log; txn ApplicationArgs 0; log; int 1`, compiled by dtalgod's /v2/teal/compile */
     const ECHO = new Uint8Array(Buffer.from('CjIGFrA2GgCwgQE=', 'base64'))
