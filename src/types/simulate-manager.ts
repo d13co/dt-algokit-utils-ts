@@ -14,6 +14,8 @@ import {
   requireDTNode,
   requireDTSdk,
   txIdsOf,
+  asksStateChangeAppId,
+  checkStateChangeAppId,
 } from './dt-support'
 import { SendAtomicTransactionComposerResults } from './transaction'
 import modelsv2 = algosdk.modelsv2
@@ -128,6 +130,7 @@ export function checkSimulateLimits(
       throw new Error('execTraceConfig needs a node with the developer API (EnableDeveloperAPI), and this node has it off')
     }
   }
+  if (asksStateChangeAppId(raw.execTraceConfig)) checkStateChangeAppId(capabilities)
   const { extraOpcodeBudget } = raw
   const { maxExtraOpcodeBudget } = capabilities.simulate
   if (extraOpcodeBudget !== undefined && BigInt(extraOpcodeBudget) > BigInt(maxExtraOpcodeBudget)) {
@@ -238,8 +241,8 @@ export class SimulateManager {
   }
 
   /**
-   * Returns the node's simulate limits: how many groups a request may hold, and the most `extraOpcodeBudget`. `groups`
-   * and `rounds` keep to them.
+   * Returns the node's simulate limits: how many groups a request may hold, the most `extraOpcodeBudget`, and the
+   * non-standard `execTraceConfig` options the node takes (`state-change-app-id`). `groups` and `rounds` keep to them.
    *
    * They are the `simulate` part of the node's capabilities (`algorand.client.capabilities()`, which also says whether the
    * node is dtalgod at all, and which features it has on), asked for once per algod client. Stock algod, which has no

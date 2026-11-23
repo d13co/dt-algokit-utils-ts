@@ -6,6 +6,7 @@ import { asJson, calculateExtraProgramPages } from '../util'
 import { TransactionSignerAccount } from './account'
 import { AlgoAmount } from './amount'
 import { AppManager, BoxIdentifier, BoxReference, HoldingReference, LocalsReference, ResourceReference } from './app-manager'
+import { asksStateChangeAppId, checkStateChangeAppId, getCapabilities, requireDTFeatures } from './dt-support'
 import { Expand } from './expand'
 import { EventType } from './lifecycle-events'
 import { genesisIdIsLocalNet } from './network-client'
@@ -2184,6 +2185,15 @@ export class TransactionComposer {
   async simulate(options?: SimulateOptions): Promise<SendAtomicTransactionComposerResults & { simulateResponse: SimulateResponse }> {
     const { skipSignatures = false, signal, ...rawOptions } = options ?? {}
     signal?.throwIfAborted()
+    // A node that doesn't take it rejects the request or ignores it: check before building, which may ask signers to sign
+    // (the capabilities are cached per client, and read without the signal as they are shared). Config.debug sends its
+    // own execTraceConfig, without it.
+    if (!Config.debug && asksStateChangeAppId(rawOptions.execTraceConfig)) {
+      // Before the capabilities, which getCapabilities returns only with dt-algosdk (checkStateChangeAppId checks it again)
+      requireDTFeatures('execTraceConfig.stateChangeAppId', 'state-change-app-id')
+      checkStateChangeAppId((await getCapabilities(this.algod))!)
+      signal?.throwIfAborted()
+    }
     const validity = this.validityForSimulateRound(rawOptions.round)
     // At a past round, the group is built in a separate ATC, so its past validity never reaches this composer's group
     const atc = skipSignatures || validity ? new AtomicTransactionComposer() : this.atc

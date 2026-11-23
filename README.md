@@ -10,6 +10,7 @@ It is a drop-in replacement: existing APIs, types and generated typed clients wo
 - **App clients pinned to a round**: `appClient.atRound(round)` reads state and simulates readonly ABI calls at that round, for generated typed clients too.
 - **Versions**: `algorand.dt` lists the rounds at which a box, an app's boxes, an app, an asset or an account changed, with the values if asked, by page or as an async iterator; as of a list of `rounds`, with the changed state keys, or only the changes of one state `key` or box name `prefix`.
 - **Asset holders**: `algorand.dt.getAssetHolders` / `iterateAssetHolders` list an asset's holders at a round.
+- **Transaction state changes**: `algorand.dt.getTxnStateChanges` lists the app state each transaction of a round changed, before and after, and optionally what each group changed besides, the opcode budget of each program, the state each transaction read and an execution trace.
 - **Box listings**: `algorand.app.getBoxes` lists boxes under a prefix with their values in one paged listing; `state.box.getMap` uses it.
 - **Extended simulate**: `algorand.simulate.groups` simulates several groups in one request, or each on its own with `parallel`, and `algorand.simulate.rounds` simulates groups at many rounds, a request per round.
 - **Node limits**: simulate follows the limits dtalgod reports, and readonly app calls get the node's full extra opcode budget.
@@ -21,19 +22,19 @@ See **[the full list of differences](./docs/dt-fork.md)** for every changed meth
 
 ## Installing the fork
 
-The new features also need `dt-algosdk`, the matching fork of algosdk, and a node on the current dt-algorand release (dt5, `v5.0.5-dt5`); older dtalgod releases are not supported. Install both under their upstream names and override them across your whole dependency tree, so your code, generated typed clients and other libraries (e.g. algokit-subscriber) all load the same copy. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`.
+The new features also need `dt-algosdk`, the matching fork of algosdk, and a node on the current dt-algorand release (dt6, `v5.1.1-dt6`); dt5 nodes work for everything but the dt6 features, and older dtalgod releases are not supported. Install both under their upstream names and override them across your whole dependency tree, so your code, generated typed clients and other libraries (e.g. algokit-subscriber) all load the same copy. Imports stay `@algorandfoundation/algokit-utils` and `algosdk`.
 
 npm (`package.json`; each override must equal the dependency spec):
 
 ```json
 {
   "dependencies": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.5.2.0.0",
-    "algosdk": "npm:dt-algosdk@3.9.0-dt.5.2.0.0"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.6.2.1.0",
+    "algosdk": "npm:dt-algosdk@3.9.0-dt.6.2.1.0"
   },
   "overrides": {
-    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.5.2.0.0",
-    "algosdk": "npm:dt-algosdk@3.9.0-dt.5.2.0.0"
+    "@algorandfoundation/algokit-utils": "npm:@d13co/dt-algokit-utils@9.2.3-dt.6.2.1.0",
+    "algosdk": "npm:dt-algosdk@3.9.0-dt.6.2.1.0"
   }
 }
 ```
@@ -42,8 +43,8 @@ pnpm (`pnpm-workspace.yaml`, or `pnpm.overrides` in `package.json`), with the sa
 
 ```yaml
 overrides:
-  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.5.2.0.0
-  algosdk: npm:dt-algosdk@3.9.0-dt.5.2.0.0
+  '@algorandfoundation/algokit-utils': npm:@d13co/dt-algokit-utils@9.2.3-dt.6.2.1.0
+  algosdk: npm:dt-algosdk@3.9.0-dt.6.2.1.0
 ```
 
 yarn: the same entries under `resolutions` in `package.json` (yarn ignores `overrides`). Yarn 4 refuses versions published less than a day ago (`npmMinimalAgeGate`); to install a new release right away, add `npmPreapprovedPackages: ["@d13co/dt-algokit-utils", "dt-algosdk"]` to `.yarnrc.yml`. bun: the same entries under `overrides`.

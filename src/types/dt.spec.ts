@@ -5,7 +5,8 @@ import stateArc56 from '../../tests/example-contracts/state/State.arc56.json'
 import boxMapArc56 from '../../tests/example-contracts/box_map/artifacts/BoxMapTest.arc56.json'
 import { AlgorandClient } from './algorand-client'
 import { AppClient } from './app-client'
-import { DTAlgodLike, DTNotAvailableError, isDTUnsupportedError } from './dt-support'
+import { Config } from '../config'
+import { DTAlgodLike, DTNotAvailableError, getDTRetry, isDTUnsupportedError } from './dt-support'
 import { QueryCallError, QueryCallOutcome, QueryGroupError, QueryGroupOutcome, QueryGroupsOptions } from './query-manager'
 import { TransactionComposer } from './composer'
 import modelsv2 = algosdk.modelsv2
@@ -143,8 +144,11 @@ const LIMITS = {
   'max-extra-opcode-budget': 320_000,
 }
 
-/** The capabilities endpoint's answer for these flat values (see `LIMITS`) and query limits, if any. */
-const capabilitiesJson = (limits: Partial<typeof LIMITS>, query?: Record<string, number>) => {
+/** What dt6 adds to the capabilities: simulate's `exec-trace-config`, and `state-changes`. */
+type Dt6Capabilities = { execTraceConfig?: string[]; stateChanges?: { 'max-response-bytes'?: number; include?: string[] } }
+
+/** The capabilities endpoint's answer for these flat values (see `LIMITS`), query limits and dt6 fields, if any. */
+const capabilitiesJson = (limits: Partial<typeof LIMITS>, query?: Record<string, number>, dt6: Dt6Capabilities = {}) => {
   const all = { ...LIMITS, ...limits }
   return {
     'time-travel': all['time-travel'],
@@ -153,8 +157,10 @@ const capabilitiesJson = (limits: Partial<typeof LIMITS>, query?: Record<string,
     simulate: {
       'max-txn-groups': all['max-txn-groups'],
       'max-extra-opcode-budget': all['max-extra-opcode-budget'],
+      ...(dt6.execTraceConfig ? { 'exec-trace-config': dt6.execTraceConfig } : {}),
     },
     ...(query ? { query } : {}),
+    ...(dt6.stateChanges ? { 'state-changes': dt6.stateChanges } : {}),
   }
 }
 
@@ -975,6 +981,161 @@ describe('time travel', () => {
     })
   })
 
+  describe('transaction state changes', () => {
+    const dtModels = (algosdk as unknown as { dtModels: Record<string, new (fields: object) => object> }).dtModels
+    const TXID = 'A'.repeat(52)
+    const TXID2 = 'B'.repeat(52)
+    const STATE_CHANGES = /^\/v2\/deltas\/\d+\/txn\/state-changes$/
+    /** dtalgod dt6 with time travel, offering these includes. */
+    const dt6 = (include: string[] = ['accounts', 'assets', 'apps', 'budget', 'reads'], limits: Partial<typeof LIMITS> = {}) =>
+      stub.on(
+        'get',
+        CAPABILITIES_PATH,
+        json(capabilitiesJson(limits, undefined, { stateChanges: { 'max-response-bytes': 0, include } })),
+        true,
+      )
+    /** A state changes answer, in msgpack as the node sends it, of one global state change of app 7 at `round`. */
+    const changesOf =
+      (round: number, more: Record<string, unknown> = {}) =>
+      () => ({
+        status: 200,
+        body: algosdk.encodeMsgpack(
+          new dtModels.TxnStateChangesResponse({
+            round,
+            txns: [
+              new dtModels.TxnStateChanges({
+                path: [0],
+                txid: TXID,
+                changes: [
+                  new dtModels.AppStateChange({
+                    appId: 7n,
+                    appStateType: 'g',
+                    key: new TextEncoder().encode('counter'),
+                    before: new modelsv2.TealValue({ type: 2, uint: 1n, bytes: new Uint8Array() }),
+                    after: new modelsv2.TealValue({ type: 2, uint: 2n, bytes: new Uint8Array() }),
+                  }),
+                ],
+              }),
+            ],
+            ...more,
+          }) as algosdk.Encodable,
+        ),
+      })
+
+    test('lists the changes of a round, narrowed to an app and transactions, with what include adds', async () => {
+      dt6()
+      // With a group include, the node always sends feeSink
+      stub.on('get', STATE_CHANGES, changesOf(900, { budget: [], groups: [], feeSink: sender }))
+      const controller = new AbortController()
+      const res = await algorand.dt.getTxnStateChanges(900, {
+        appId: 7n,
+        txIds: [TXID2, TXID],
+        include: ['budget', 'accounts'],
+        signal: controller.signal,
+      })
+      expect(stub.calls[0].path).toBe('/v2/deltas/900/txn/state-changes')
+      expect(stub.calls[0].query).toMatchObject({ format: 'msgpack', app: '7', txids: `${TXID2},${TXID}`, include: 'accounts,budget' })
+      expect(stub.calls[0].options?.signal).toBe(controller.signal)
+      expect(res.round).toBe(900n)
+      expect(res.feeSink?.toString()).toBe(address)
+      expect(res.groups).toEqual([])
+      expect(res.txns).toHaveLength(1)
+      expect(res.txns[0]).toMatchObject({ path: [0], txid: TXID })
+      const [change] = res.txns[0].changes
+      expect(change).toMatchObject({ appId: 7n, appStateType: 'g', before: { uint: 1n }, after: { uint: 2n } })
+      expect(new TextDecoder().decode(change.key)).toBe('counter')
+      // dt-algosdk's object, so its helpers take it, with no cast
+      expect(res).toBeInstanceOf(dtModels.TxnStateChangesResponse)
+      expect(algosdk.budgetOf(res, TXID)).toEqual([])
+      expect(algosdk.groupOf(res, TXID)).toBeUndefined()
+      expect(algosdk.changedFields(change.before, change.after)).toEqual(['uint'])
+    })
+
+    test('a single transaction ID, and no filters', async () => {
+      dt6()
+      stub.on('get', STATE_CHANGES, changesOf(901)).on('get', STATE_CHANGES, changesOf(902))
+      await algorand.dt.getTxnStateChanges(901n, { txIds: TXID })
+      await algorand.dt.getTxnStateChanges(902)
+      expect(stub.calls[0].query).toMatchObject({ txids: TXID })
+      expect(stub.calls[1].query).toEqual({ format: 'msgpack' })
+    })
+
+    test('a node without state changes throws a DTUnsupportedError that says why, without sending the request', async () => {
+      for (const [answer, why] of [
+        [() => stockAlgod(stub), /the node is stock algod/],
+        [() => limitsOk(stub, { 'time-travel': false }), /time travel off \(EnableTimeTravel\)/],
+        [() => limitsOk(stub), /does not serve them \(dtalgod before dt6\)/],
+      ] as const) {
+        stub = new StubClient()
+        algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+        answer()
+        const error = await algorand.dt.getTxnStateChanges(900).catch((e) => e)
+        expect(isDTUnsupportedError(error)).toBe(true)
+        expect(error.message).toMatch(why)
+        expect(error.message).toMatch(/at round 900 needs dtalgod dt6/)
+        expect(stub.calls).toHaveLength(0)
+      }
+    })
+
+    test('an include the node does not offer throws a DTUnsupportedError, without sending the request', async () => {
+      dt6(['accounts', 'assets', 'apps'])
+      const error = await algorand.dt.getTxnStateChanges(900, { include: ['reads'] }).catch((e) => e)
+      expect(isDTUnsupportedError(error)).toBe(true)
+      expect(error.message).toMatch(/include=reads/)
+      await expect(algorand.dt.getTxnStateChanges(900, { include: ['trace'], txIds: TXID })).rejects.toThrow(/EnableDeveloperAPI/)
+      expect(stub.calls).toHaveLength(0)
+    })
+
+    test('an empty txIds throws before asking the node', async () => {
+      dt6()
+      await expect(algorand.dt.getTxnStateChanges(900, { txIds: [] })).rejects.toThrow(/txIds is empty/)
+      expect(limitsCalls(stub)).toHaveLength(0)
+      expect(stub.calls).toHaveLength(0)
+    })
+
+    test('trace needs exactly one transaction', async () => {
+      dt6(['accounts', 'assets', 'apps', 'budget', 'reads', 'trace'], { 'developer-api': true })
+      await expect(algorand.dt.getTxnStateChanges(900, { include: ['trace'] })).rejects.toThrow(/exactly one transaction/)
+      await expect(algorand.dt.getTxnStateChanges(900, { include: ['trace'], txIds: [TXID, TXID2] })).rejects.toThrow(
+        /exactly one transaction/,
+      )
+      expect(stub.calls).toHaveLength(0)
+    })
+
+    test("a too large answer is the node's 400, which isStateChangesTooLarge recognizes", async () => {
+      dt6()
+      stub.on('get', STATE_CHANGES, () => ({
+        status: 400,
+        json: {
+          message: 'the state changes take more than MaxAPIStateChangesResponseBytes (4000000 bytes): narrow them with app or txids',
+        },
+      }))
+      const error = await algorand.dt.getTxnStateChanges(900).catch((e) => e)
+      expect((algosdk as unknown as { isStateChangesTooLarge(e: unknown): boolean }).isStateChangesTooLarge(error)).toBe(true)
+    })
+
+    test('a dt-algosdk without the dt6 features throws a DTNotAvailableError naming the release that has them', async () => {
+      dt6()
+      await withoutFeatures(['state-changes'], async () => {
+        await expect(algorand.dt.getTxnStateChanges(900)).rejects.toThrow(DTNotAvailableError)
+        await expect(algorand.dt.getTxnStateChanges(900)).rejects.toThrow(
+          /needs the DTAlgodClient features state-changes of dt-algosdk 3\.9\.0-dt\.6\.2\.1\.0 or later, but the loaded dt-algosdk is older/,
+        )
+      })
+      await withoutFeatures(['dev-traces'], async () => {
+        await expect(algorand.dt.getTxnStateChanges(900, { include: ['budget'] })).rejects.toThrow(/features dev-traces of/)
+      })
+      await withoutFeatures(['full-deltas'], async () => {
+        await expect(algorand.dt.getTxnStateChanges(900, { include: ['accounts', 'reads'] })).rejects.toThrow(/features full-deltas of/)
+      })
+      // Stock algosdk: the usual message
+      await withoutFeatures(['holders', 'state-changes'], async () => {
+        await expect(algorand.dt.getTxnStateChanges(900)).rejects.toThrow(/but the loaded algosdk is not it/)
+      })
+      expect(stub.calls).toHaveLength(0)
+    })
+  })
+
   describe('app client at a round', () => {
     const appClient = () => new AppClient({ appId: 123n, appSpec: JSON.stringify(stateArc56), algorand, defaultSender: address })
 
@@ -1357,9 +1518,9 @@ describe('time travel', () => {
         timeTravel: true,
         developerApi: true,
         timeLimitSeconds: 108,
-        simulate: { maxTxnGroups: 8, maxExtraOpcodeBudget: 320_000 },
+        simulate: { maxTxnGroups: 8, maxExtraOpcodeBudget: 320_000, execTraceConfig: [] },
       })
-      expect(await algorand.simulate.limits()).toEqual({ maxTxnGroups: 8, maxExtraOpcodeBudget: 320_000 })
+      expect(await algorand.simulate.limits()).toEqual({ maxTxnGroups: 8, maxExtraOpcodeBudget: 320_000, execTraceConfig: [] })
       expect(limitsCalls(stub)).toHaveLength(1)
       expect(stub.calls).toHaveLength(0)
     })
@@ -1371,9 +1532,9 @@ describe('time travel', () => {
         timeTravel: false,
         developerApi: false,
         timeLimitSeconds: 0,
-        simulate: { maxTxnGroups: 1, maxExtraOpcodeBudget: 320_000 },
+        simulate: { maxTxnGroups: 1, maxExtraOpcodeBudget: 320_000, execTraceConfig: [] },
       })
-      expect(await algorand.simulate.limits()).toEqual({ maxTxnGroups: 1, maxExtraOpcodeBudget: 320_000 })
+      expect(await algorand.simulate.limits()).toEqual({ maxTxnGroups: 1, maxExtraOpcodeBudget: 320_000, execTraceConfig: [] })
     })
 
     test("capabilities: fields dt-algosdk doesn't have get safe defaults in utils' copy", async () => {
@@ -1387,7 +1548,7 @@ describe('time travel', () => {
           timeTravel: false,
           developerApi: false,
           timeLimitSeconds: 0,
-          simulate: { maxTxnGroups: 1, maxExtraOpcodeBudget: 320_000 },
+          simulate: { maxTxnGroups: 1, maxExtraOpcodeBudget: 320_000, execTraceConfig: [] },
           query: {
             maxCalls: 4,
             maxCallBudget: 700,
@@ -1419,7 +1580,7 @@ describe('time travel', () => {
         timeTravel: true,
         developerApi: false,
         timeLimitSeconds: 108,
-        simulate: { maxTxnGroups: 16, maxExtraOpcodeBudget: 320_000 },
+        simulate: { maxTxnGroups: 16, maxExtraOpcodeBudget: 320_000, execTraceConfig: [] },
         query: {
           maxCalls: 64,
           maxCallBudget: 700,
@@ -1429,6 +1590,42 @@ describe('time travel', () => {
           maxRounds: 1,
           maxTotalCalls: 64,
         },
+      })
+    })
+
+    test('capabilities: a dt6 node reports the state changes and the simulate trace options; the copy is frozen', async () => {
+      stub.on(
+        'get',
+        CAPABILITIES_PATH,
+        json(
+          capabilitiesJson({ 'developer-api': true }, undefined, {
+            execTraceConfig: ['state-change-app-id'],
+            stateChanges: { 'max-response-bytes': 4_000_000, include: ['accounts', 'assets', 'apps', 'budget', 'reads', 'trace'] },
+          }),
+        ),
+        true,
+      )
+      const capabilities = await algorand.client.capabilities()
+      expect(capabilities.simulate.execTraceConfig).toEqual(['state-change-app-id'])
+      expect(capabilities.stateChanges).toEqual({
+        maxResponseBytes: 4_000_000,
+        include: ['accounts', 'assets', 'apps', 'budget', 'reads', 'trace'],
+      })
+      expect(Object.isFrozen(capabilities.simulate.execTraceConfig)).toBe(true)
+      expect(Object.isFrozen(capabilities.stateChanges!.include)).toBe(true)
+      expect(await algorand.dt.supportsStateChanges()).toBe(true)
+    })
+
+    test('capabilities: without state changes there is no stateChanges key, and supportsStateChanges is false', async () => {
+      expect(await algorand.client.capabilities()).not.toHaveProperty('stateChanges')
+      expect(await algorand.dt.supportsStateChanges()).toBe(false)
+    })
+
+    test('supportsStateChanges is false with a dt-algosdk without state-changes, whatever the node reports', async () => {
+      stub.on('get', CAPABILITIES_PATH, json(capabilitiesJson({}, undefined, { stateChanges: { 'max-response-bytes': 0 } })), true)
+      expect(await algorand.dt.supportsStateChanges()).toBe(true)
+      await withoutFeatures(['state-changes'], async () => {
+        expect(await algorand.dt.supportsStateChanges()).toBe(false)
       })
     })
 
@@ -1478,6 +1675,122 @@ describe('time travel', () => {
         .on('post', '/v2/transactions/simulate', echoSimulate(), true)
       await algorand.simulate.groups([payment(1)], trace)
       expect(posts().at(-1)).toMatchObject({ execTraceConfig: { enable: true } })
+    })
+
+    describe('stateChangeAppId', () => {
+      const trace = {
+        execTraceConfig: new modelsv2.SimulateTraceConfig({
+          enable: true,
+          stateChange: true,
+          stateChangeAppId: true,
+        } as ConstructorParameters<typeof modelsv2.SimulateTraceConfig>[0]),
+      }
+      /** A fresh client of a node with these capabilities, answering simulate. */
+      const node = (limits: Partial<typeof LIMITS>, execTraceConfig?: string[]) => {
+        stub = new StubClient()
+        algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+        stub
+          .on('get', CAPABILITIES_PATH, json(capabilitiesJson(limits, undefined, { execTraceConfig })), true)
+          .on('get', '/v2/transactions/params', suggestedParams, true)
+          .on('post', '/v2/transactions/simulate', echoSimulate(), true)
+      }
+
+      test('is refused, before sending, by a node that does not list state-change-app-id', async () => {
+        for (const [limits, why] of [
+          [{ 'developer-api': true }, /the node does not take it \(dtalgod before dt6\)/],
+          [{ 'developer-api': false }, /EnableDeveloperAPI/],
+        ] as const) {
+          node(limits)
+          // A node without the developer API is refused by the existing developer API check (a plain Error) in simulate
+          if (limits['developer-api']) {
+            expect(isDTUnsupportedError(await algorand.simulate.groups([payment(1)], trace).catch((e) => e))).toBe(true)
+          }
+          expect(
+            isDTUnsupportedError(
+              await payment(1)
+                .simulate({ ...trace, skipSignatures: true })
+                .catch((e) => e),
+            ),
+          ).toBe(true)
+          await expect(algorand.simulate.groups([payment(1)], trace)).rejects.toThrow(why)
+          await expect(algorand.simulate.rounds(payment(1), [1000n], trace)).rejects.toThrow(why)
+          await expect(payment(1).simulate({ ...trace, skipSignatures: true })).rejects.toThrow(why)
+          expect(posts()).toHaveLength(0)
+        }
+        stub = new StubClient()
+        algorand = AlgorandClient.fromClients({ algod: new algosdk.Algodv2(stub, '') })
+        stockAlgod(stub).on('get', '/v2/transactions/params', suggestedParams, true)
+        await expect(payment(1).simulate({ ...trace, skipSignatures: true })).rejects.toThrow(/the node is stock algod/)
+        expect(posts()).toHaveLength(0)
+      })
+
+      test('is sent to a node that lists it, by simulate and the composer', async () => {
+        node({ 'developer-api': true }, ['state-change-app-id'])
+        await algorand.simulate.groups([payment(1)], trace)
+        await payment(1).simulate({ ...trace, skipSignatures: true })
+        expect(posts().map((r) => (r.execTraceConfig as { stateChangeAppId?: boolean }).stateChangeAppId)).toEqual([true, true])
+      })
+
+      test('the composer asks for no capabilities without it', async () => {
+        node({})
+        await payment(1).simulate({ skipSignatures: true })
+        expect(limitsCalls(stub)).toHaveLength(0)
+        expect(posts()).toHaveLength(1)
+      })
+
+      test('needs a dt-algosdk with state-change-app-id, when set on the config after constructing it', async () => {
+        // An older dt-algosdk's SimulateTraceConfig drops stateChangeAppId when constructed with it (its type rejects it):
+        // only a field set afterwards reaches the request, which is refused
+        node({ 'developer-api': true }, ['state-change-app-id'])
+        const late = new modelsv2.SimulateTraceConfig({ enable: true, stateChange: true })
+        Object.assign(late, { stateChangeAppId: true })
+        await withoutFeatures(['state-change-app-id'], async () => {
+          await expect(payment(1).simulate({ execTraceConfig: late, skipSignatures: true })).rejects.toThrow(
+            /features state-change-app-id of dt-algosdk/,
+          )
+          await expect(algorand.simulate.groups([payment(1)], { execTraceConfig: late })).rejects.toThrow(DTNotAvailableError)
+        })
+        expect(posts()).toHaveLength(0)
+      })
+
+      test('the composer does not check it under Config.debug, which sends its own trace config', async () => {
+        node({ 'developer-api': true })
+        const prior = Config.debug
+        Config.configure({ debug: true })
+        try {
+          await payment(1).simulate({ ...trace, skipSignatures: true })
+        } finally {
+          Config.configure({ debug: prior })
+        }
+        expect(limitsCalls(stub)).toHaveLength(0)
+        expect((posts()[0].execTraceConfig as { stateChangeAppId?: boolean }).stateChangeAppId).toBeFalsy()
+      })
+    })
+
+    test("a round after the latest is the node's 400 on dt6, which the retry policy doesn't retry (dt5's 500 it did)", async () => {
+      limitsOk(stub)
+        .on('get', '/v2/transactions/params', suggestedParams, true)
+        .on('post', '/v2/transactions/simulate', () => ({
+          status: 400,
+          json: { message: `round ${LAST_ROUND + 10} is after the latest round ${LAST_ROUND}` },
+        }))
+      await expect(algorand.simulate.rounds(payment(1), [BigInt(LAST_ROUND + 10)])).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringMatching(/is after the latest round/),
+      })
+      // The policy that AlgoHttpClientWithRetry retries simulate requests by (the stub client here doesn't retry)
+      const { callWithRetry } = getDTRetry()!
+      const tries = async (status: number) => {
+        let sent = 0
+        const send = async () => {
+          sent++
+          throw Object.assign(new Error(`status ${status}`), { status, response: { status, body: new Uint8Array(), headers: {} } })
+        }
+        await callWithRetry(send, { method: 'post', path: '/v2/transactions/simulate' }, { sleep: async () => {} }).catch(() => {})
+        return sent
+      }
+      expect(await tries(400)).toBe(1)
+      expect(await tries(500)).toBe(5)
     })
 
     test('on stock algod, groups and rounds throw before sending anything', async () => {

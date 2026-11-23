@@ -23,6 +23,12 @@ import {
   requireTimeTravel,
   VersionsOrder,
   VersionsRequestLike,
+  OptionalDTFeature,
+  StateChangesInclude,
+  TxnStateChangesResponse,
+  getCapabilities,
+  hasDTFeatures,
+  requireDTFeatures,
 } from './dt-support'
 
 /**
@@ -412,9 +418,33 @@ const sortedRounds = (rounds: readonly Round[], order: VersionsOrder | undefined
   return distinct.sort((a, b) => (a === b ? 0 : a < b === (order !== 'desc') ? -1 : 1))
 }
 
+/** Options of {@link DTManager.getTxnStateChanges}. */
+export interface TxnStateChangesOptions {
+  /** Only the changes to this app's state. It narrows `txns`, not what `include` adds. */
+  appId?: bigint
+  /**
+   * Only these top-level transactions and their inner transactions, such as a group's (listed in execution order
+   * whatever the order here). A transaction not in the round is the node's 404. Ask for a group in one request rather
+   * than one request per transaction: each request costs the node about a block's evaluation, whatever the filters.
+   */
+  txIds?: string | readonly string[]
+  /**
+   * What else to list (see {@link StateChangesInclude}); a node that doesn't offer a value (the `include` of
+   * `stateChanges` in `algorand.client.capabilities()`) is a `DTUnsupportedError`, without sending the request. `trace`
+   * needs exactly one transaction in `txIds`, and the developer API.
+   */
+  include?: readonly StateChangesInclude[]
+  /** Aborts the request. */
+  signal?: AbortSignal
+}
+
+/** The `include` values that list group changes, which need the dt-algosdk feature `full-deltas`. */
+const GROUP_INCLUDE: readonly StateChangesInclude[] = ['accounts', 'assets', 'apps']
+
 /**
  * Time travel on a time-travel algod (dtalgod with `EnableTimeTravel`): the rounds at which boxes, apps, assets and
- * accounts changed, with their values.
+ * accounts changed, with their values, the holders of an asset at a round, and the app state each transaction of a
+ * round changed.
  *
  * Needs dt-algosdk (the time-travel fork of algosdk); without it every method throws a `DTNotAvailableError`. A node
  * without time travel (stock algod, or dtalgod with `EnableTimeTravel` off) throws dt-algosdk's `DTUnsupportedError`
@@ -826,6 +856,77 @@ export class DTManager {
       yield mapAssetHolder(holder)
       signal?.throwIfAborted()
     }
+  }
+
+  /**
+   * Returns whether {@link getTxnStateChanges} can be used: the loaded dt-algosdk has it (`3.9.0-dt.6.2.1.0` or later)
+   * and the node serves it (dtalgod dt6 or later with time travel on). It is read from the node's capabilities, asked for
+   * once per algod client; their `stateChanges` tells what the node can add (`include`).
+   * @returns Whether transaction state changes are supported
+   * @example
+   * ```typescript
+   * if (await algorand.dt.supportsStateChanges()) { ... }
+   * ```
+   */
+  public async supportsStateChanges(): Promise<boolean> {
+    if (!hasDTFeatures('state-changes')) return false
+    return (await getCapabilities(this._clientManager.algod))?.stateChanges !== undefined
+  }
+
+  /**
+   * Returns the app state changes of each transaction of a round (`GET /v2/deltas/{round}/txn/state-changes`): globals,
+   * local states and boxes, each with its value before and after the transaction, for the transactions that changed
+   * any, top-level and inner, in execution order. A transaction's changes are the net over it and its inner
+   * transactions. With `include`, also what each group changed besides app state, the opcode budget of each program
+   * run, the app state each transaction read, or one transaction group's execution traces.
+   *
+   * Needs dt-algosdk `3.9.0-dt.6.2.1.0` or later (a `DTNotAvailableError` otherwise) and dtalgod dt6 or later with
+   * time travel (dt-algosdk's `DTUnsupportedError` otherwise; see {@link supportsStateChanges}). A round whose block the
+   * node doesn't have, or a transaction not in the round, is the node's 404; a response over the node's
+   * `stateChanges.maxResponseBytes` is a 400 that dt-algosdk's `isStateChangesTooLarge` recognizes: narrow it with
+   * `appId` or `txIds`.
+   *
+   * The result is dt-algosdk's object, so its helpers take it: `groupOf`, `txnsOf`, `changedFields`,
+   * `withoutFeeSink`, `programLine` and `budgetOf` (import them from `algosdk`, which is dt-algosdk).
+   * @param round The round
+   * @param options The app and transactions to narrow the changes to, what else to list and an abort signal
+   * @returns The state changes of the round
+   * @example
+   * ```typescript
+   * const sent = await algorand.newGroup().addAppCallMethodCall(call).send()
+   * const { txns } = await algorand.dt.getTxnStateChanges(sent.confirmations[0].confirmedRound!, { txIds: sent.txIds })
+   * for (const t of txns) for (const c of t.changes) console.log(t.path, c.appId, c.appStateType, c.key, c.before, c.after)
+   * ```
+   */
+  public async getTxnStateChanges(round: Round, options?: TxnStateChangesOptions): Promise<TxnStateChangesResponse> {
+    const feature = 'Listing transaction state changes'
+    const include = options?.include ?? []
+    const sdkFeatures: OptionalDTFeature[] = ['state-changes']
+    if (include.some((p) => GROUP_INCLUDE.includes(p))) sdkFeatures.push('full-deltas')
+    if (include.some((p) => !GROUP_INCLUDE.includes(p))) sdkFeatures.push('dev-traces')
+    const tt = requireDTFeatures(feature, ...sdkFeatures)
+    if (options?.txIds !== undefined && options.txIds.length === 0) {
+      throw new Error('txIds is empty: pass at least one transaction ID, or leave txIds out for every transaction of the round')
+    }
+    options?.signal?.throwIfAborted()
+    // Stock algod and nodes without them would answer with a 404 of their own: say why instead
+    const capabilities = (await getCapabilities(this._clientManager.algod))!
+    if (!capabilities.stateChanges) {
+      const why = !capabilities.reported
+        ? 'the node is stock algod'
+        : !capabilities.timeTravel
+          ? 'the node has time travel off (EnableTimeTravel)'
+          : 'the node does not serve them (dtalgod before dt6)'
+      throw new tt.DTUnsupportedError(`${feature} at round ${round} needs dtalgod dt6 or later with time travel, but ${why}`, {
+        requestedRound: BigInt(round),
+      })
+    }
+    options?.signal?.throwIfAborted()
+    const request = this.algod.getTxnStateChangesForRound!(round)
+    if (options?.appId !== undefined) request.app(options.appId)
+    if (options?.txIds !== undefined) request.txids(typeof options.txIds === 'string' ? [options.txIds] : options.txIds)
+    if (include.length > 0) request.include(include)
+    return await request.do(undefined, fetchOptions(options))
   }
 
   /**
